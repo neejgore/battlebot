@@ -351,9 +351,9 @@ class KalshiBattleBot:
             
             eligible.append(m)
         
-        # Take top 10 by volume
+        # Take top 15 by volume
         eligible.sort(key=lambda x: x.get('volume_24h', 0), reverse=True)
-        self._monitored = {m['id']: m for m in eligible[:10]}
+        self._monitored = {m['id']: m for m in eligible[:15]}
         
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Market eligibility: {len(eligible)} eligible / {len(self._markets)} total")
         
