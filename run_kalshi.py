@@ -407,11 +407,10 @@ class KalshiBattleBot:
         # Get AI signal
         try:
             result = await self._ai_generator.generate_signal(
-                question=market.get('question', ''),
-                description=market.get('description', ''),
-                rules=market.get('rules', ''),
+                market_question=market.get('question', ''),
                 current_price=market.get('price', 0.5),
                 spread=market.get('spread', 0.02),
+                resolution_rules=market.get('rules', '') or market.get('description', ''),
                 volume_24h=market.get('volume_24h', 0),
             )
             
