@@ -39,3 +39,4 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+data/bot_state.json

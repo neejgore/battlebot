@@ -37,6 +37,9 @@ class BattleBot:
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 50))
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.1))
         
+        # TESTING ONLY: Simulate price movement (set to true for testing)
+        self.simulate_prices = os.getenv('SIMULATE_PRICES', 'false').lower() == 'true'
+        
         # Market data
         self._markets: dict[str, dict] = {}
         self._monitored: dict[str, dict] = {}
@@ -72,15 +75,16 @@ class BattleBot:
         self._calibration: CalibrationEngine = None
         
         # Risk Engine (full V2.1 risk management)
+        # TESTING MODE: Aggressive exits to see trades close faster
         self._risk_limits = RiskLimits(
             max_daily_drawdown=0.15,
             max_position_size=self.max_position_size,
             max_percent_bankroll_per_market=0.10,
             max_total_open_risk=0.30,
             max_positions=5,
-            profit_take_pct=0.15,
-            stop_loss_pct=0.10,
-            time_stop_hours=72.0,
+            profit_take_pct=0.03,   # 3% profit target (was 15%)
+            stop_loss_pct=0.03,     # 3% stop loss (was 10%)
+            time_stop_hours=720,    # Disabled (30 days) - exit on performance only
             edge_scale=0.10,
             min_edge=self.min_edge,
         )
@@ -238,6 +242,9 @@ class BattleBot:
         print(f"Bankroll: ${self.initial_bankroll:,.2f}")
         print(f"Min Edge: {self.min_edge*100:.1f}%")
         print(f"Max Position: ${self.max_position_size:,.2f}")
+        if self.simulate_prices:
+            print(f"\n⚠️  SIMULATE_PRICES=true (testing mode)")
+            print(f"   Set SIMULATE_PRICES=false for production!")
         print(f"\nDashboard: http://localhost:{self.port}")
         print("Press Ctrl+C to stop\n")
         
@@ -456,6 +463,7 @@ class BattleBot:
     
     async def _position_monitor_loop(self):
         """Monitor positions for exit conditions with V2.1 rules."""
+        import random
         while self._running:
             try:
                 for pos_id, pos in list(self._positions.items()):
@@ -466,6 +474,13 @@ class BattleBot:
                     current_price = market['price']
                     entry_price = pos['entry_price']
                     side = pos['side']
+                    
+                    # TESTING: Simulate price movement (disable with SIMULATE_PRICES=false)
+                    if self.simulate_prices:
+                        drift = random.gauss(0, 0.02)  # ~2% std deviation
+                        simulated_price = max(0.05, min(0.95, entry_price + drift))
+                        current_price = simulated_price
+                        market['price'] = simulated_price  # Update market too
                     
                     # Calculate P&L based on position side
                     if side == 'YES':
@@ -1626,7 +1641,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
 
 async def main():
-    bot = BattleBot(port=8080)
+    port = int(os.getenv('PORT', 8080))
+    bot = BattleBot(port=port)
     await bot.start()
     
     try:
