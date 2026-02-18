@@ -560,10 +560,14 @@ class KalshiBattleBot:
         if self._db_connected:
             try:
                 db_trade_id = await self._db.log_trade_entry(
+                    decision_id=0,  # We don't track this linking yet
                     market_id=market_id,
-                    side=side,
+                    token_id=market.get('token_id', market_id),
                     entry_price=market['price'],
+                    entry_side=side,
                     size=size,
+                    raw_prob=prob,
+                    adjusted_prob=prob,
                     edge=edge,
                     confidence=confidence,
                 )
