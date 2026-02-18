@@ -34,19 +34,19 @@ class AISignalOutput(BaseModel):
     key_reasons: list[str] = Field(
         ..., 
         min_length=1, 
-        max_length=5,
+        max_length=10,
         description="Top reasons supporting the probability estimate"
     )
     disconfirming_evidence: list[str] = Field(
         ..., 
         min_length=1, 
-        max_length=3,
+        max_length=10,
         description="Evidence that could make this estimate wrong"
     )
     what_would_change_mind: list[str] = Field(
         ..., 
         min_length=1, 
-        max_length=3,
+        max_length=10,
         description="What information would significantly change the estimate"
     )
     
@@ -57,7 +57,7 @@ class AISignalOutput(BaseModel):
     failure_modes: list[str] = Field(
         ..., 
         min_length=1, 
-        max_length=3,
+        max_length=10,
         description="Ways this prediction could fail"
     )
     
