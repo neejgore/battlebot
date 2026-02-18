@@ -400,6 +400,7 @@ class KalshiBattleBot:
         """Analyze market with AI and decide whether to trade."""
         market_id = market['id']
         question = market.get('question', '')[:50]
+        current_price = market.get('price', 0.5)
         
         print(f"[AI] Analyzing: {question}...")
         self._ai_calls += 1
@@ -408,31 +409,57 @@ class KalshiBattleBot:
         try:
             result = await self._ai_generator.generate_signal(
                 market_question=market.get('question', ''),
-                current_price=market.get('price', 0.5),
+                current_price=current_price,
                 spread=market.get('spread', 0.02),
                 resolution_rules=market.get('rules', '') or market.get('description', ''),
                 volume_24h=market.get('volume_24h', 0),
             )
             
-            if not result or not result.raw_prob:
-                print(f"[AI] FAILED: No signal generated")
+            # Check if AI call succeeded (result is AISignalResult with success flag)
+            if not result or not result.success or not result.signal:
+                error_msg = result.error if result else "No response"
+                print(f"[AI] FAILED: {error_msg}")
+                # Store failed analysis
+                self._analyses.insert(0, {
+                    'market_id': market_id,
+                    'question': market.get('question', ''),
+                    'market_price': current_price,
+                    'ai_probability': None,
+                    'confidence': None,
+                    'edge': 0,
+                    'side': None,
+                    'decision': 'NO_TRADE',
+                    'reason': f"AI failed: {error_msg}",
+                    'timestamp': datetime.utcnow().isoformat(),
+                })
+                self._analyses = self._analyses[:50]
+                await self._broadcast_update()
                 return
             
+            # Extract signal data from result
+            signal = result.signal
             self._ai_successes += 1
             
         except Exception as e:
             print(f"[AI] FAILED: {e}")
             return
         
-        # Calibrate probability
-        cal_result = self._calibration.calibrate(
-            raw_prob=result.raw_prob,
-            confidence=result.confidence,
-            market_price=market.get('price', 0.5),
-        )
-        
-        adjusted_prob = cal_result.adjusted_prob
-        current_price = market.get('price', 0.5)
+        # Calibrate probability (async call)
+        try:
+            cal_result = await self._calibration.calibrate(
+                raw_prob=signal.raw_prob,
+                market_price=current_price,
+                confidence=signal.confidence,
+                category=market.get('category'),
+            )
+            calibrated_prob = cal_result.calibrated_prob
+            adjusted_prob = cal_result.adjusted_prob
+            calibration_method = cal_result.method
+        except Exception as e:
+            print(f"[Calibration] Error: {e} - using raw probability")
+            calibrated_prob = signal.raw_prob
+            adjusted_prob = signal.raw_prob
+            calibration_method = "error"
         
         # Determine trade side and edge
         if adjusted_prob > current_price:
@@ -451,18 +478,18 @@ class KalshiBattleBot:
             'market_id': market_id,
             'question': market.get('question', ''),
             'market_price': current_price,
-            'ai_probability': result.raw_prob,
-            'calibrated_probability': cal_result.calibrated_prob,
+            'ai_probability': signal.raw_prob,
+            'calibrated_probability': calibrated_prob,
             'adjusted_probability': adjusted_prob,
-            'confidence': result.confidence,
+            'confidence': signal.confidence,
             'edge': edge,
             'side': side,
             'decision': 'PENDING',
             'timestamp': datetime.utcnow().isoformat(),
-            'key_reasons': result.key_reasons[:3] if result.key_reasons else [],
-            'info_quality': result.information_quality,
+            'key_reasons': signal.key_reasons[:3] if signal.key_reasons else [],
+            'info_quality': signal.information_quality,
             'latency_ms': result.latency_ms,
-            'calibration_method': cal_result.method,
+            'calibration_method': calibration_method,
         })
         self._analyses = self._analyses[:50]
         
@@ -474,7 +501,7 @@ class KalshiBattleBot:
             should_trade = False
             reasons.append('LOW_EDGE')
         
-        if result.confidence < self.min_confidence:
+        if signal.confidence < self.min_confidence:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
         
@@ -500,8 +527,8 @@ class KalshiBattleBot:
             )
             
             if position_size > 0:
-                await self._enter_position(market, side, position_size, adjusted_prob, edge, result.confidence)
-                print(f"[AI] {question}... | ✓ TRADE | Edge: +{edge*100:.1f}% | Conf: {result.confidence*100:.0f}%")
+                await self._enter_position(market, side, position_size, adjusted_prob, edge, signal.confidence)
+                print(f"[AI] {question}... | ✓ TRADE | Edge: +{edge*100:.1f}% | Conf: {signal.confidence*100:.0f}%")
             else:
                 print(f"[AI] {question}... | ✗ SKIP | Size: $0")
         else:
