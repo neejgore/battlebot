@@ -214,10 +214,10 @@ class KalshiBattleBot:
             'min_confidence': self.min_confidence,
             'max_position_size': self.max_position_size,
             'kelly_fraction': self.kelly_fraction,
-            'kill_switch': self._risk_engine._kill_switch_triggered,
-            'daily_drawdown': self._risk_engine._daily_pnl / self.initial_bankroll if self._risk_engine._daily_pnl < 0 else 0,
+            'kill_switch': self._risk_engine.daily_stats.kill_switch_triggered,
+            'daily_drawdown': self._risk_engine.daily_stats.current_drawdown_pct,
             'exposure_ratio': at_risk / self.initial_bankroll,
-            'trading_allowed': self._risk_engine._trading_allowed,
+            'trading_allowed': self._risk_engine.is_trading_allowed,
         }
     
     async def start(self):
@@ -368,7 +368,7 @@ class KalshiBattleBot:
         
         while self._running:
             try:
-                if not self._risk_engine._trading_allowed:
+                if not self._risk_engine.is_trading_allowed:
                     await asyncio.sleep(60)
                     continue
                 
