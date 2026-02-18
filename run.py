@@ -106,21 +106,49 @@ class BattleBot:
                     self._positions = state.get('positions', {})
                     self._trades = state.get('trades', [])
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._trades)} trades")
+            elif os.path.exists(self._state_file + '.backup'):
+                print(f"[State] Main file missing, loading from backup...")
+                with open(self._state_file + '.backup', 'r') as f:
+                    state = json.load(f)
+                    self._positions = state.get('positions', {})
+                    self._trades = state.get('trades', [])
+                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._trades)} trades from backup")
+        except json.JSONDecodeError as e:
+            print(f"[State] WARNING: Corrupted state file, starting fresh: {e}")
+            self._positions = {}
+            self._trades = []
         except Exception as e:
             print(f"[State] Failed to load: {e}")
+            self._positions = {}
+            self._trades = []
     
     def _save_state(self):
-        """Save positions and trades to disk."""
+        """Save positions and trades to disk with atomic write."""
         try:
-            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
-            with open(self._state_file, 'w') as f:
-                json.dump({
-                    'positions': self._positions,
-                    'trades': self._trades[-100:],  # Keep last 100 trades
-                    'saved_at': datetime.utcnow().isoformat(),
-                }, f, indent=2)
+            os.makedirs(os.path.dirname(self._state_file) or '.', exist_ok=True)
+            
+            state_data = {
+                'positions': self._positions,
+                'trades': self._trades[-100:],
+                'saved_at': datetime.utcnow().isoformat(),
+            }
+            
+            temp_file = self._state_file + '.tmp'
+            with open(temp_file, 'w') as f:
+                json.dump(state_data, f, indent=2)
+            
+            if os.path.exists(self._state_file):
+                backup_file = self._state_file + '.backup'
+                if os.path.exists(backup_file):
+                    os.remove(backup_file)
+                os.rename(self._state_file, backup_file)
+            
+            os.rename(temp_file, self._state_file)
+            
         except Exception as e:
-            print(f"[State] Failed to save: {e}")
+            print(f"[State] CRITICAL: Failed to save state: {e}")
+            if self._positions:
+                print(f"[State] WARNING: {len(self._positions)} positions may not be persisted!")
         
     def _get_stats(self) -> dict:
         """Calculate all stats from current state."""
