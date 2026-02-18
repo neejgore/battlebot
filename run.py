@@ -541,8 +541,8 @@ class BattleBot:
                             else:
                                 current_edge = (1 - original_prob) - (1 - current_price)
                             
-                            # If edge has flipped significantly negative
-                            if current_edge < -0.02:
+                            # If edge has flipped significantly negative (10% threshold)
+                            if current_edge < -0.10:
                                 should_exit = True
                                 exit_reason = "SIGNAL_FLIP"
                             
