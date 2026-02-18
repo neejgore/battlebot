@@ -29,6 +29,9 @@ class BattleBot:
         self._runner = None
         self._websockets: set[web.WebSocketResponse] = set()
         
+        # Ensure data directory exists (for Railway persistent volume)
+        os.makedirs("data", exist_ok=True)
+        
         # Config from env
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 1000))
