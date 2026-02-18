@@ -557,31 +557,10 @@ class BattleBot:
                                 should_exit = True
                                 exit_reason = "TIME_STOP"
                     
-                    # 4. Signal flip check (every 10 minutes per position)
-                    if not should_exit and pos.get('last_signal_check'):
-                        last_check = pos.get('last_signal_check')
-                        if isinstance(last_check, str):
-                            last_check = datetime.fromisoformat(last_check)
-                        
-                        # Re-check signal every 10 minutes
-                        if (datetime.utcnow() - last_check).total_seconds() > 600:
-                            original_edge = pos.get('edge', 0)
-                            original_prob = pos.get('ai_probability', current_price)
-                            
-                            # Compute current edge based on original probability and new price
-                            if side == 'YES':
-                                current_edge = original_prob - current_price
-                            else:
-                                current_edge = (1 - original_prob) - (1 - current_price)
-                            
-                            # If edge has flipped significantly negative (10% threshold)
-                            if current_edge < -0.10:
-                                should_exit = True
-                                exit_reason = "SIGNAL_FLIP"
-                            
-                            pos['last_signal_check'] = datetime.utcnow().isoformat()
-                    elif not pos.get('last_signal_check'):
-                        pos['last_signal_check'] = datetime.utcnow().isoformat()
+                    # 4. Signal flip check - DISABLED
+                    # Was causing premature $0 exits due to probability calculation issues
+                    # Positions now exit only on PROFIT_TARGET or STOP_LOSS
+                    # TODO: Fix probability storage to re-enable signal flip
                     
                     if should_exit:
                         await self._exit_position(pos_id, current_price, unrealized_pnl, exit_reason)
