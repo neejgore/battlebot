@@ -1,0 +1,86 @@
+# Polymarket Battle-Bot V2.0 Development Rules
+
+## Core Principles
+
+### 1. Async-First Development
+- Use `asyncio` and `aiosqlite` for ALL I/O operations
+- Never use blocking calls in async functions
+- Use `asyncio.Lock()` for shared state access
+- Prefer `asyncio.create_task()` for background operations
+
+### 2. Risk Management (CRITICAL)
+- Maintain strict 15% Maximum Daily Drawdown kill-switch
+- All position sizes calculated via Fractional Kelly Criterion
+- Never bypass risk checks - they exist to protect capital
+- Kill-switch must immediately halt ALL trading when triggered
+
+### 3. Security Requirements
+- NEVER hardcode private keys or API secrets
+- Always use environment variables via `.env` file
+- Validate all external inputs before processing
+- Log sensitive operations without exposing credentials
+
+### 4. Order Execution Rules
+- Enforce 500ms minimum delay between ALL order placements
+- Always validate orders against risk limits before submission
+- Track all orders through their complete lifecycle
+- Implement proper error handling for failed orders
+
+## Code Style Guidelines
+
+### Type Hints
+- Use type hints for all function parameters and return values
+- Use `Optional[T]` for nullable values
+- Import types from `typing` module
+
+### Error Handling
+- Use try/except blocks around external API calls
+- Log all errors with `loguru` logger
+- Never silently swallow exceptions
+- Return appropriate error states, don't just raise
+
+### Logging Standards
+- Use `loguru` for all logging
+- Include context in log messages (trade ID, market, amounts)
+- Log at appropriate levels:
+  - DEBUG: Internal state changes, calculations
+  - INFO: Normal operations, trades, connections
+  - WARNING: Recoverable issues, rate limits
+  - ERROR: Failed operations requiring attention
+  - CRITICAL: Kill-switch triggers, security issues
+
+### Documentation
+- Docstrings for all public functions and classes
+- Include Args, Returns, and Raises sections
+- Document complex algorithms with inline comments
+- Keep docstrings concise but complete
+
+## Testing Requirements
+- Write unit tests for all risk calculations
+- Test edge cases for Kelly Criterion (zero edge, negative edge)
+- Mock external APIs in tests
+- Test kill-switch triggers correctly
+
+## File Organization
+```
+battlebot/
+├── main.py              # Entry point
+├── data/
+│   └── models.py        # Pydantic V2 models
+├── logic/
+│   ├── risk_engine.py   # Risk management
+│   └── strategy_v2.py   # Trading strategy
+├── services/
+│   ├── websocket_client.py  # Real-time data
+│   └── execution_engine.py  # Order execution
+├── tests/
+│   └── ...              # Test files
+└── .env                 # Environment variables (gitignored)
+```
+
+## Deployment Checklist
+- [ ] All environment variables configured
+- [ ] Kill-switch tested and verified
+- [ ] Initial bankroll set correctly
+- [ ] Log rotation configured
+- [ ] Monitoring/alerting in place
