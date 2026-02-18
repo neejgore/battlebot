@@ -1376,7 +1376,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         let data = { stats: {}, positions: [], trades: [], analyses: [], monitored: [] };
         
         function connect() {
-            ws = new WebSocket(`ws://${location.host}/ws`);
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
             
             ws.onopen = () => {
                 document.getElementById('dot').className = 'dot live';
