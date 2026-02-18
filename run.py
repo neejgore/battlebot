@@ -58,7 +58,9 @@ class BattleBot:
         
         self._running = False
         self._last_analysis: dict[str, datetime] = {}
-        self._analysis_cooldown = 300
+        self._last_analysis_price: dict[str, float] = {}  # Track price at last analysis
+        self._analysis_cooldown = 1800  # 30 minutes (was 5 min)
+        self._price_change_threshold = 0.02  # Re-analyze if price moved 2%+
         self._start_time = None
         
         # Real-time price feed
@@ -483,11 +485,20 @@ class BattleBot:
                         break
                     
                     last = self._last_analysis.get(market_id)
-                    if last and (datetime.utcnow() - last).total_seconds() < self._analysis_cooldown:
-                        continue
+                    last_price = self._last_analysis_price.get(market_id, 0)
+                    current_price = market.get('price', 0.5)
+                    
+                    # Check if price moved significantly (bypass cooldown)
+                    price_moved = abs(current_price - last_price) >= self._price_change_threshold if last_price else False
+                    
+                    # Skip if recently analyzed AND price hasn't moved
+                    if last and not price_moved:
+                        if (datetime.utcnow() - last).total_seconds() < self._analysis_cooldown:
+                            continue
                     
                     await self._analyze_market(market)
                     self._last_analysis[market_id] = datetime.utcnow()
+                    self._last_analysis_price[market_id] = current_price
                     await asyncio.sleep(2)
                     
             except Exception as e:
