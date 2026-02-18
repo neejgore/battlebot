@@ -29,8 +29,10 @@ class BattleBot:
         self._runner = None
         self._websockets: set[web.WebSocketResponse] = set()
         
-        # Ensure data directory exists (for Railway persistent volume)
-        os.makedirs("data", exist_ok=True)
+        # Ensure storage directory exists (for Railway persistent volume)
+        # Use 'storage' not 'data' to avoid overwriting code modules
+        self._storage_dir = os.getenv('STORAGE_DIR', 'storage')
+        os.makedirs(self._storage_dir, exist_ok=True)
         
         # Config from env
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
@@ -48,7 +50,7 @@ class BattleBot:
         self._monitored: dict[str, dict] = {}
         
         # Trading state (persisted to disk)
-        self._state_file = "data/bot_state.json"
+        self._state_file = f"{self._storage_dir}/bot_state.json"
         self._positions: dict[str, dict] = {}
         self._trades: list[dict] = []
         self._analyses: list[dict] = []
@@ -71,7 +73,7 @@ class BattleBot:
         self._ai_successes = 0
         
         # Telemetry Database
-        self._db = TelemetryDB("data/battlebot.db")
+        self._db = TelemetryDB(f"{self._storage_dir}/battlebot.db")
         self._db_connected = False
         
         # Calibration Engine
