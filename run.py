@@ -41,10 +41,12 @@ class BattleBot:
         self._markets: dict[str, dict] = {}
         self._monitored: dict[str, dict] = {}
         
-        # Trading state
+        # Trading state (persisted to disk)
+        self._state_file = "data/bot_state.json"
         self._positions: dict[str, dict] = {}
         self._trades: list[dict] = []
         self._analyses: list[dict] = []
+        self._load_state()  # Load previous positions on startup
         
         self._running = False
         self._last_analysis: dict[str, datetime] = {}
@@ -87,6 +89,31 @@ class BattleBot:
             fractional_kelly=self.kelly_fraction,
             limits=self._risk_limits,
         )
+    
+    def _load_state(self):
+        """Load positions and trades from disk."""
+        try:
+            if os.path.exists(self._state_file):
+                with open(self._state_file, 'r') as f:
+                    state = json.load(f)
+                    self._positions = state.get('positions', {})
+                    self._trades = state.get('trades', [])
+                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._trades)} trades")
+        except Exception as e:
+            print(f"[State] Failed to load: {e}")
+    
+    def _save_state(self):
+        """Save positions and trades to disk."""
+        try:
+            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+            with open(self._state_file, 'w') as f:
+                json.dump({
+                    'positions': self._positions,
+                    'trades': self._trades[-100:],  # Keep last 100 trades
+                    'saved_at': datetime.utcnow().isoformat(),
+                }, f, indent=2)
+        except Exception as e:
+            print(f"[State] Failed to save: {e}")
         
     def _get_stats(self) -> dict:
         """Calculate all stats from current state."""
@@ -915,6 +942,7 @@ class BattleBot:
         mode = "[DRY RUN] " if self.dry_run else ""
         print(f"{mode}ENTERED: {side} ${size:.2f} @ {market['price']*100:.0f}¢ | {market['question'][:40]}...")
         
+        self._save_state()  # Persist positions to disk
         await self._broadcast_update()
     
     async def _exit_position(self, pos_id: str, exit_price: float, pnl: float, reason: str):
@@ -957,6 +985,7 @@ class BattleBot:
         pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         print(f"{mode}EXITED: {pnl_str} ({reason}) | {position['question'][:40]}...")
         
+        self._save_state()  # Persist positions to disk
         await self._broadcast_update()
     
     def _parse_market(self, m: dict) -> dict:
