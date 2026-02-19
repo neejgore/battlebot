@@ -436,15 +436,24 @@ class KalshiBattleBot:
             # Sort ALL markets by volume (most liquid first)
             all_markets.sort(key=lambda x: x.get('volume', 0) or 0, reverse=True)
             
-            # Log top volume markets to see where liquidity is
+            # Log top volume markets - check both volume and open_interest
             top_5 = all_markets[:5]
             if top_5:
                 print(f"[Top Volume Markets]")
                 for m in top_5:
                     vol = m.get('volume', 0)
-                    ticker = m.get('ticker', '')[:50]
-                    title = m.get('title', '')[:40]
-                    print(f"  ${vol:,} | {ticker} | {title}")
+                    oi = m.get('open_interest', 0)
+                    ticker = m.get('ticker', '')[:40]
+                    print(f"  vol=${vol:,} oi=${oi:,} | {ticker}")
+            
+            # Also sort by open_interest and show those
+            by_oi = sorted(all_markets, key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:5]
+            print(f"[Top Open Interest]")
+            for m in by_oi:
+                vol = m.get('volume', 0)
+                oi = m.get('open_interest', 0)
+                ticker = m.get('ticker', '')[:40]
+                print(f"  vol=${vol:,} oi=${oi:,} | {ticker}")
             
             # Process markets - NO category filtering, let volume/spread filters decide
             category_counts = {}
