@@ -399,37 +399,48 @@ class KalshiBattleBot:
             await asyncio.sleep(60)  # Refresh every minute
     
     async def _fetch_markets(self):
-        """Fetch open markets from Kalshi - get highest volume markets.
-        
-        Strategy: Fetch ALL markets (limit 1000), sort by volume, trade the liquid ones.
-        Sports = 85% of volume, so don't filter them out.
+        """Fetch open markets from Kalshi - target political/economic events with volume.
         """
         try:
             all_markets = []
-            cursor = None
-            pages_fetched = 0
-            max_pages = 3  # 3 pages x 1000 = 3000 markets
             
-            while pages_fetched < max_pages:
+            # First: Try fetching from known high-volume event tickers
+            target_events = [
+                'SOTU',           # State of the Union
+                'SOTUATTEND',     # SOTU attendance
+                'FEDCHAIR',       # Fed Chair
+                'TRUMPMENTION',   # Trump mentions
+                'SHUTDOWN',       # Government shutdown
+                'INXD',           # Economic index
+            ]
+            
+            for event in target_events:
                 try:
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.2)
                     result = await self._kalshi.get_markets(
                         status='open',
-                        limit=1000,  # Max allowed
-                        cursor=cursor
+                        series_ticker=event,
+                        limit=100
                     )
                     markets = result.get('markets', [])
-                    if not markets:
-                        break
-                    all_markets.extend(markets)
-                    cursor = result.get('cursor')
-                    pages_fetched += 1
-                    if not cursor:
-                        break
+                    if markets:
+                        print(f"[Event {event}] Found {len(markets)} markets")
+                        all_markets.extend(markets)
                 except Exception as e:
-                    if '429' in str(e):
-                        await asyncio.sleep(2)
-                    break
+                    continue
+            
+            # Also fetch general markets excluding MVE
+            try:
+                result = await self._kalshi.get_markets(
+                    status='open',
+                    limit=500,
+                    exclude_mve=True
+                )
+                general = result.get('markets', [])
+                print(f"[General non-MVE] Found {len(general)} markets")
+                all_markets.extend(general)
+            except:
+                pass
             
             print(f"[Fetched] {len(all_markets)} total markets")
             
