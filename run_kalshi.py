@@ -416,7 +416,7 @@ class KalshiBattleBot:
             all_markets = []
             series_fetched = 0
             
-            for series_ticker in list(target_series)[:20]:  # Limit to 20 series
+            for series_ticker in list(target_series)[:50]:  # Fetch from up to 50 series
                 try:
                     await asyncio.sleep(0.2)  # Rate limit: 5 req/sec
                     result = await self._kalshi.get_markets(
@@ -529,8 +529,9 @@ class KalshiBattleBot:
                 rejection_counts['low_volume'] += 1
                 continue
             
-            # Spread check (≤4 cents)
-            if m.get('spread', 0.04) > 0.04:
+            # Spread check - configurable, default 6 cents
+            max_spread = float(os.getenv('MAX_SPREAD', '0.06'))
+            if m.get('spread', max_spread) > max_spread:
                 rejection_counts['wide_spread'] += 1
                 continue
             
