@@ -445,14 +445,15 @@ def parse_kalshi_market(market: dict) -> dict:
     yes_ask = market.get('yes_ask', 0) / 100 if market.get('yes_ask') else yes_price + 0.01
     spread = yes_ask - yes_bid
     
-    # Parse close time
-    close_time = market.get('close_time', '')
-    end_date = None
-    if close_time:
-        try:
-            end_date = close_time
-        except:
-            pass
+    # Parse resolution/expiration time - prefer expiration over close time
+    # expected_expiration_time = when market resolves (what we want)
+    # close_time = when trading stops (often earlier than resolution)
+    end_date = (
+        market.get('expected_expiration_time') or
+        market.get('expiration_time') or
+        market.get('close_time') or
+        None
+    )
     
     # Volume - Kalshi reports in contracts
     volume = market.get('volume', 0) or 0

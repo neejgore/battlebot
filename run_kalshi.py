@@ -548,6 +548,28 @@ class KalshiBattleBot:
             # Process markets - NO category filtering, let volume/spread filters decide
             category_counts = {}
             
+            # Debug: Sample first few markets to see available time fields
+            if all_markets:
+                sample = all_markets[0]
+                print(f"[Debug] Sample market time fields:")
+                print(f"  close_time: {sample.get('close_time')}")
+                print(f"  expected_expiration_time: {sample.get('expected_expiration_time')}")
+                print(f"  expiration_time: {sample.get('expiration_time')}")
+                print(f"  settlement_time: {sample.get('settlement_time')}")
+            
+            # Count markets by time field availability
+            time_field_stats = {'close_time': 0, 'expected_exp': 0, 'expiration': 0, 'none': 0}
+            for m in all_markets:
+                if m.get('expected_expiration_time'):
+                    time_field_stats['expected_exp'] += 1
+                elif m.get('expiration_time'):
+                    time_field_stats['expiration'] += 1
+                elif m.get('close_time'):
+                    time_field_stats['close_time'] += 1
+                else:
+                    time_field_stats['none'] += 1
+            print(f"[Time Fields] expected_exp={time_field_stats['expected_exp']}, expiration={time_field_stats['expiration']}, close_time={time_field_stats['close_time']}, none={time_field_stats['none']}")
+            
             for m in all_markets:
                 try:
                     market = parse_kalshi_market(m)
@@ -593,9 +615,49 @@ class KalshiBattleBot:
             'wide_spread': 0, 'extreme_price': 0, 'low_liquidity': 0,
             'combo_market': 0,
         }
+        ultra_short_rejected = {'low_oi': 0, 'wide_spread': 0, 'extreme_price': 0, 'too_close': 0}
         
         max_days = int(os.getenv('MAX_DAYS_TO_RESOLUTION', '365'))
         now = datetime.utcnow()
+        
+        # Pre-scan to understand what's available
+        pre_scan = {'ultra': 0, 'short': 0, 'medium': 0, 'no_end': 0, 'past': 0}
+        ultra_examples = []
+        for m in self._markets.values():
+            end_date_str = m.get('end_date')
+            if not end_date_str:
+                pre_scan['no_end'] += 1
+                continue
+            try:
+                end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                hours = (end_date.replace(tzinfo=None) - now).total_seconds() / 3600
+                if hours < 0:
+                    pre_scan['past'] += 1
+                elif hours <= 24:
+                    pre_scan['ultra'] += 1
+                    if len(ultra_examples) < 5:
+                        ultra_examples.append({
+                            'ticker': m.get('id', '')[:30],
+                            'hours': hours,
+                            'question': m.get('question', '')[:40],
+                            'oi': m.get('open_interest', 0),
+                            'spread': m.get('spread', 0),
+                            'price': m.get('price', 0.5),
+                        })
+                elif hours <= 168:  # 7 days
+                    pre_scan['short'] += 1
+                else:
+                    pre_scan['medium'] += 1
+            except Exception as e:
+                if pre_scan['no_end'] < 3:
+                    print(f"[Debug] Failed to parse end_date '{end_date_str}': {e}")
+        print(f"[Pre-Filter] Total markets by time: ultra(≤24h)={pre_scan['ultra']}, short(1-7d)={pre_scan['short']}, medium(8+d)={pre_scan['medium']}, no_end={pre_scan['no_end']}, past={pre_scan['past']}")
+        
+        # Show examples of ultra-short markets BEFORE filtering
+        if ultra_examples:
+            print(f"[Ultra-Short Examples (pre-filter)]")
+            for ex in ultra_examples:
+                print(f"  {ex['hours']:.1f}h | oi={ex['oi']} | spread={ex['spread']:.2%} | price={ex['price']:.0%} | {ex['question']}...")
         
         for m in self._markets.values():
             if not m.get('end_date'):
@@ -613,6 +675,8 @@ class KalshiBattleBot:
                     rejection_counts['too_far_out'] += 1
                     continue
                 if hours_to_resolution < 1:  # Less than 1 hour - too close
+                    if hours_to_resolution > 0:
+                        ultra_short_rejected['too_close'] += 1
                     continue
             except:
                 continue
@@ -620,25 +684,44 @@ class KalshiBattleBot:
             # Minimum open interest - lower bar for ultra-short (more forgiving)
             oi = m.get('open_interest', 0) or 0
             min_oi = int(os.getenv('MIN_OPEN_INTEREST', '10'))
-            # Lower OI requirement for ultra-short markets
-            effective_min_oi = min_oi // 2 if hours_to_resolution <= 24 else min_oi
+            # Lower OI requirement for ultra-short markets (1/4 of normal)
+            effective_min_oi = max(1, min_oi // 4) if hours_to_resolution <= 24 else min_oi
             if oi < effective_min_oi:
                 rejection_counts['low_oi'] += 1
+                if hours_to_resolution <= 24:
+                    ultra_short_rejected['low_oi'] += 1
                 if rejection_counts['low_oi'] <= 3:
-                    print(f"[Debug] Rejected for low_oi: {m.get('ticker', '')[:30]} oi={oi}")
+                    print(f"[Debug] Rejected for low_oi: {m.get('ticker', '')[:30]} oi={oi} (need {effective_min_oi})")
                 continue
             
-            # Spread check
+            # Spread check - more lenient for ultra-short (daily markets have wider spreads)
             max_spread = float(os.getenv('MAX_SPREAD', '0.06'))
-            if m.get('spread', max_spread) > max_spread:
+            # Allow 2x wider spread for ultra-short markets (daily events)
+            effective_max_spread = max_spread * 2 if hours_to_resolution <= 24 else max_spread
+            actual_spread = m.get('spread', max_spread)
+            if actual_spread > effective_max_spread:
                 rejection_counts['wide_spread'] += 1
+                if hours_to_resolution <= 24:
+                    ultra_short_rejected['wide_spread'] += 1
+                    if ultra_short_rejected['wide_spread'] <= 3:
+                        print(f"[Debug] Ultra-short rejected for spread: {m.get('ticker', '')[:30]} spread={actual_spread:.2%} (max {effective_max_spread:.2%})")
                 continue
             
-            # Price range
+            # Price range - more lenient for ultra-short (daily events can trade near extremes)
             price = m.get('price', 0.5)
-            if price < 0.05 or price > 0.95:
-                rejection_counts['extreme_price'] += 1
-                continue
+            if hours_to_resolution <= 24:
+                # Ultra-short: allow 3-97¢ range
+                if price < 0.03 or price > 0.97:
+                    rejection_counts['extreme_price'] += 1
+                    ultra_short_rejected['extreme_price'] += 1
+                    if ultra_short_rejected['extreme_price'] <= 3:
+                        print(f"[Debug] Ultra-short rejected for price: {m.get('ticker', '')[:30]} price={price:.0%}")
+                    continue
+            else:
+                # Standard: 5-95¢ range
+                if price < 0.05 or price > 0.95:
+                    rejection_counts['extreme_price'] += 1
+                    continue
             
             # Store time info
             m['hours_to_resolution'] = hours_to_resolution
@@ -690,6 +773,11 @@ class KalshiBattleBot:
             reasons = [f"{k}={v}" for k, v in rejection_counts.items() if v > 0]
             if reasons:
                 print(f"[Filter] Rejected: {', '.join(reasons)}")
+        
+        # Log ultra-short specific rejections to help debug
+        ultra_rejected = [f"{k}={v}" for k, v in ultra_short_rejected.items() if v > 0]
+        if ultra_rejected:
+            print(f"[Ultra-Short Debug] Rejected: {', '.join(ultra_rejected)}")
     
     async def _trading_loop(self):
         """Main trading loop - analyze markets and enter positions.
