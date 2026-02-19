@@ -788,7 +788,7 @@ class KalshiBattleBot:
     
     async def _exit_position(self, pos_id: str, exit_price: float, pnl: float, reason: str):
         """Exit a position."""
-        position = self._positions.pop(pos_id, None)
+        position = self._positions.get(pos_id)
         if not position:
             return
         
@@ -805,12 +805,24 @@ class KalshiBattleBot:
                         price=price_cents,
                     )
                     exit_order_id = result.get('order', {}).get('order_id')
-                    print(f"[LIVE ORDER] Sold: {contracts} {position['side']} contracts @ {price_cents}¢ | Order ID: {exit_order_id}")
+                    print(f"[LIVE SELL ORDER] Placed: {contracts} {position['side']} @ {price_cents}¢ | Order ID: {exit_order_id}")
+                    
+                    # Track as pending exit - don't remove position until sell fills
+                    position['pending_exit'] = {
+                        'order_id': exit_order_id,
+                        'exit_price': exit_price,
+                        'reason': reason,
+                        'placed_time': datetime.utcnow().isoformat(),
+                    }
+                    self._save_state()
+                    return  # Don't record exit yet - wait for fill confirmation
+                    
             except Exception as e:
-                print(f"[Order Error] Failed to sell position on Kalshi: {e}")
-                # Re-add position if sell failed
-                self._positions[pos_id] = position
-                return
+                print(f"[Order Error] Failed to place sell order on Kalshi: {e}")
+                return  # Keep position, don't exit
+        
+        # For dry run mode, or after sell is confirmed (called from sync loop)
+        self._positions.pop(pos_id, None)
         
         await self._risk_engine.record_trade_result(pnl)
         
@@ -866,12 +878,109 @@ class KalshiBattleBot:
                 print(f"[Price Refresh Error] {e}")
             await asyncio.sleep(30)  # Refresh every 30 seconds
     
+    async def _check_pending_exits(self):
+        """Check status of pending sell/exit orders."""
+        positions_with_pending_exit = [
+            (pos_id, pos) for pos_id, pos in self._positions.items() 
+            if pos.get('pending_exit')
+        ]
+        
+        if not positions_with_pending_exit:
+            return
+        
+        for pos_id, position in positions_with_pending_exit:
+            pending_exit = position.get('pending_exit', {})
+            exit_order_id = pending_exit.get('order_id')
+            if not exit_order_id:
+                continue
+            
+            try:
+                result = await self._kalshi.get_order(exit_order_id)
+                order_data = result.get('order', {})
+                status = order_data.get('status', '').lower()
+                
+                if status == 'executed':
+                    # Sell order filled - finalize the exit
+                    fill_price = order_data.get('average_fill_price', pending_exit.get('exit_price', 0.5) * 100) / 100
+                    reason = pending_exit.get('reason', 'UNKNOWN')
+                    
+                    # Calculate final PnL
+                    entry_price = position['entry_price']
+                    side = position['side']
+                    size = position['size']
+                    
+                    if side.upper() == 'YES':
+                        price_change = fill_price - entry_price
+                    else:
+                        price_change = entry_price - fill_price
+                    
+                    pnl = price_change * size
+                    
+                    # Now actually remove the position and record exit
+                    self._positions.pop(pos_id, None)
+                    
+                    await self._risk_engine.record_trade_result(pnl)
+                    
+                    # Log to database
+                    if self._db_connected and position.get('db_trade_id'):
+                        try:
+                            await self._db.log_trade_exit(
+                                trade_id=position['db_trade_id'],
+                                exit_price=fill_price,
+                                exit_reason=reason,
+                                pnl=pnl,
+                                fees_estimate=0.0,
+                            )
+                        except Exception as e:
+                            print(f"[DB] Failed to log trade exit: {e}")
+                    
+                    # Record trade
+                    trade = {
+                        'id': pos_id,
+                        'market_id': position['market_id'],
+                        'question': position.get('question', ''),
+                        'action': 'EXIT',
+                        'side': position['side'],
+                        'price': fill_price,
+                        'size': size,
+                        'pnl': pnl,
+                        'reason': reason,
+                        'timestamp': datetime.utcnow().isoformat(),
+                    }
+                    self._trades.insert(0, trade)
+                    
+                    print(f"[EXIT CONFIRMED] ${pnl:+.2f} ({reason}) | {position.get('question', '')[:50]}...")
+                    self._save_state()
+                    await self._broadcast_update()
+                    
+                elif status in ('canceled', 'cancelled'):
+                    # Sell order was canceled - remove pending exit flag, position still open
+                    position.pop('pending_exit', None)
+                    print(f"[EXIT CANCELED] Position {pos_id} still open - sell order was canceled")
+                    self._save_state()
+                
+                # If still 'resting', do nothing - wait for fill
+                
+                await asyncio.sleep(0.5)  # Rate limit
+                
+            except Exception as e:
+                if '404' in str(e).lower():
+                    # Order not found - might have been filled, check positions
+                    position.pop('pending_exit', None)
+                    print(f"[EXIT ORDER] {exit_order_id} not found - checking actual positions...")
+                else:
+                    print(f"[Exit Check Error] {pos_id}: {e}")
+    
     async def _position_sync_loop(self):
         """Sync positions with Kalshi API to detect filled orders."""
         await asyncio.sleep(5)  # Wait for startup
         
         while self._running:
             try:
+                # First, check pending EXIT orders (sells on existing positions)
+                await self._check_pending_exits()
+                
+                # Then check pending BUY orders
                 if not self._pending_orders:
                     await asyncio.sleep(10)
                     continue
