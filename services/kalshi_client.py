@@ -26,8 +26,8 @@ except ImportError:
 class KalshiClient:
     """Client for Kalshi prediction market API."""
     
-    # API endpoints (updated 2024/2025)
-    PROD_URL = "https://api.kalshi.com/trade-api/v2"
+    # API endpoints - elections subdomain serves ALL Kalshi markets
+    PROD_URL = "https://api.elections.kalshi.com/trade-api/v2"
     DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
     
     def __init__(self, 
