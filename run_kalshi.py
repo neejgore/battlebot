@@ -405,6 +405,15 @@ class KalshiBattleBot:
         Volume is the best proxy for liquidity - let it decide, not category filters.
         """
         try:
+            # First, log available events/series to see what categories exist
+            try:
+                events_result = await self._kalshi.get_events(status='open', limit=50)
+                events = events_result.get('events', [])
+                event_tickers = [e.get('event_ticker', '')[:30] for e in events[:10]]
+                print(f"[Events Sample] {event_tickers}")
+            except Exception as e:
+                print(f"[Events Error] {e}")
+            
             all_markets = []
             cursor = None
             pages_fetched = 0
@@ -432,6 +441,10 @@ class KalshiBattleBot:
                         await asyncio.sleep(2)
                     break
             
+            # Log sample of market tickers to see what we're getting
+            sample_tickers = [m.get('ticker', '')[:50] for m in all_markets[:20]]
+            print(f"[Sample Tickers] {sample_tickers[:10]}")
+            
             # Sort ALL markets by volume (most liquid first)
             all_markets.sort(key=lambda x: x.get('volume', 0) or 0, reverse=True)
             
@@ -441,8 +454,9 @@ class KalshiBattleBot:
                 print(f"[Top Volume Markets]")
                 for m in top_5:
                     vol = m.get('volume', 0)
-                    ticker = m.get('ticker', '')[:40]
-                    print(f"  ${vol:,} - {ticker}")
+                    ticker = m.get('ticker', '')[:50]
+                    title = m.get('title', '')[:40]
+                    print(f"  ${vol:,} | {ticker} | {title}")
             
             # Process markets - NO category filtering, let volume/spread filters decide
             category_counts = {}
