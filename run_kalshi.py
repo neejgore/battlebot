@@ -455,6 +455,18 @@ class KalshiBattleBot:
                 ticker = m.get('ticker', '')[:40]
                 print(f"  vol=${vol:,} oi=${oi:,} | {ticker}")
             
+            # Group by event and show event-level volume
+            event_volumes = {}
+            for m in all_markets:
+                event = m.get('event_ticker', 'unknown')
+                vol = m.get('volume', 0) or 0
+                event_volumes[event] = event_volumes.get(event, 0) + vol
+            
+            top_events = sorted(event_volumes.items(), key=lambda x: x[1], reverse=True)[:5]
+            print(f"[Top Events by Volume]")
+            for event, vol in top_events:
+                print(f"  ${vol:,} | {event}")
+            
             # Process markets - NO category filtering, let volume/spread filters decide
             category_counts = {}
             
