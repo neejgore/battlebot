@@ -399,72 +399,157 @@ class KalshiBattleBot:
             await asyncio.sleep(60)  # Refresh every minute
     
     async def _fetch_markets(self):
-        """Fetch open markets from Kalshi - target political/economic events with volume.
+        """Fetch ALL useful markets from Kalshi - no artificial limits.
+        
+        Strategy:
+        1. Discover all series and identify target categories
+        2. Fetch ALL markets from ALL target series (politics, economics, etc.)
+        3. Also fetch general non-MVE markets with full pagination
+        4. Deduplicate and sort by liquidity
         """
         try:
             all_markets = []
             
-            # First: Try fetching from known high-volume event tickers
-            target_events = [
-                'SOTU',           # State of the Union
-                'SOTUATTEND',     # SOTU attendance
-                'FEDCHAIR',       # Fed Chair
-                'TRUMPMENTION',   # Trump mentions
-                'SHUTDOWN',       # Government shutdown
-                'INXD',           # Economic index
+            # Categories we want (excludes Sports, Entertainment, Mentions, Social)
+            target_categories = [
+                'Politics', 'Economics', 'Financials', 'Elections', 
+                'Climate and Weather', 'Science and Technology', 
+                'Health', 'World', 'Companies', 'Crypto', 'Transportation', 'Education'
             ]
             
-            for event in target_events:
+            # STEP 1: Discover all available series
+            target_series_tickers = []
+            try:
+                series_response = await self._kalshi.get_series_list()
+                all_series = series_response.get('series', [])
+                print(f"[Discovery] Found {len(all_series)} total series on Kalshi")
+                
+                # Count by category
+                by_category = {}
+                for s in all_series:
+                    cat = s.get('category', 'Unknown')
+                    by_category[cat] = by_category.get(cat, 0) + 1
+                    
+                    # Collect target series tickers
+                    if cat in target_categories:
+                        ticker = s.get('ticker')
+                        if ticker:
+                            target_series_tickers.append(ticker)
+                
+                print(f"[Categories]")
+                for cat, count in sorted(by_category.items(), key=lambda x: -x[1]):
+                    marker = " <-- TARGET" if cat in target_categories else ""
+                    print(f"  {cat}: {count}{marker}")
+                
+                print(f"[Target Series] {len(target_series_tickers)} series in target categories")
+                
+            except Exception as e:
+                print(f"[Discovery Error] {e}")
+            
+            # STEP 2: Fetch markets from ALL target series
+            if target_series_tickers:
+                print(f"[Fetching] Markets from {len(target_series_tickers)} target series...")
+                series_with_markets = 0
+                total_from_series = 0
+                
+                for i, series_ticker in enumerate(target_series_tickers):
+                    try:
+                        # Rate limiting - brief pause between calls
+                        if i > 0 and i % 10 == 0:
+                            await asyncio.sleep(0.5)
+                        else:
+                            await asyncio.sleep(0.1)
+                        
+                        result = await self._kalshi.get_markets(
+                            status='open',
+                            series_ticker=series_ticker,
+                            limit=200
+                        )
+                        markets = result.get('markets', [])
+                        if markets:
+                            series_with_markets += 1
+                            total_from_series += len(markets)
+                            all_markets.extend(markets)
+                            
+                    except Exception as e:
+                        if '429' in str(e):
+                            print(f"[Rate Limited] Pausing for 3 seconds...")
+                            await asyncio.sleep(3)
+                        continue
+                    
+                    # Progress update every 100 series
+                    if (i + 1) % 100 == 0:
+                        print(f"[Progress] {i + 1}/{len(target_series_tickers)} series checked, {total_from_series} markets found")
+                
+                print(f"[Series Fetch Complete] {series_with_markets} series had open markets, {total_from_series} total")
+            
+            # STEP 3: Paginated general fetch - get ALL non-MVE markets
+            print(f"[General Fetch] Fetching all non-MVE markets with pagination...")
+            cursor = None
+            pages_fetched = 0
+            total_general = 0
+            
+            while True:
                 try:
                     await asyncio.sleep(0.2)
                     result = await self._kalshi.get_markets(
                         status='open',
-                        series_ticker=event,
-                        limit=100
+                        limit=1000,  # Max per page
+                        cursor=cursor,
+                        exclude_mve=True
                     )
-                    markets = result.get('markets', [])
-                    if markets:
-                        print(f"[Event {event}] Found {len(markets)} markets")
-                        all_markets.extend(markets)
+                    general = result.get('markets', [])
+                    if not general:
+                        break
+                        
+                    all_markets.extend(general)
+                    total_general += len(general)
+                    pages_fetched += 1
+                    
+                    cursor = result.get('cursor')
+                    if not cursor:
+                        break
+                        
+                    # Safety limit - don't fetch forever
+                    if pages_fetched >= 20:
+                        print(f"[General Fetch] Reached page limit")
+                        break
+                        
                 except Exception as e:
-                    continue
+                    if '429' in str(e):
+                        print(f"[Rate Limited] Pausing for 3 seconds...")
+                        await asyncio.sleep(3)
+                        continue
+                    print(f"[General fetch error] {e}")
+                    break
             
-            # Also fetch general markets excluding MVE
-            try:
-                result = await self._kalshi.get_markets(
-                    status='open',
-                    limit=500,
-                    exclude_mve=True
-                )
-                general = result.get('markets', [])
-                print(f"[General non-MVE] Found {len(general)} markets")
-                all_markets.extend(general)
-            except:
-                pass
+            print(f"[General Fetch Complete] {total_general} markets from {pages_fetched} pages")
             
-            print(f"[Fetched] {len(all_markets)} total markets")
+            # STEP 4: Deduplicate by ticker
+            seen = set()
+            unique_markets = []
+            for m in all_markets:
+                ticker = m.get('ticker')
+                if ticker and ticker not in seen:
+                    seen.add(ticker)
+                    unique_markets.append(m)
+            all_markets = unique_markets
+            
+            print(f"[Total] {len(all_markets)} unique markets after deduplication")
             
             # Sort by open interest (better for holding positions to resolution)
             all_markets.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
             
-            # Log top volume markets - check both volume and open_interest
-            top_5 = all_markets[:5]
-            if top_5:
-                print(f"[Top Volume Markets]")
-                for m in top_5:
+            # Log top markets by open interest
+            top_10 = all_markets[:10]
+            if top_10:
+                print(f"[Top 10 by Open Interest]")
+                for m in top_10:
                     vol = m.get('volume', 0)
                     oi = m.get('open_interest', 0)
-                    ticker = m.get('ticker', '')[:40]
-                    print(f"  vol=${vol:,} oi=${oi:,} | {ticker}")
-            
-            # Also sort by open_interest and show those
-            by_oi = sorted(all_markets, key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:5]
-            print(f"[Top Open Interest]")
-            for m in by_oi:
-                vol = m.get('volume', 0)
-                oi = m.get('open_interest', 0)
-                ticker = m.get('ticker', '')[:40]
-                print(f"  vol=${vol:,} oi=${oi:,} | {ticker}")
+                    ticker = m.get('ticker', '')[:50]
+                    cat = m.get('category', '')
+                    print(f"  oi=${oi:,} vol=${vol:,} [{cat}] {ticker}")
             
             # Group by event and show event-level volume
             event_volumes = {}

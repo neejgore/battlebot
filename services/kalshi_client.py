@@ -130,6 +130,7 @@ class KalshiClient:
     async def get_markets(self, 
                          status: str = "open",
                          series_ticker: Optional[str] = None,
+                         event_ticker: Optional[str] = None,
                          limit: int = 100,
                          cursor: Optional[str] = None,
                          exclude_mve: bool = False) -> dict:
@@ -137,7 +138,8 @@ class KalshiClient:
         
         Args:
             status: Market status filter (open, closed, settled)
-            series_ticker: Filter by series/event ticker
+            series_ticker: Filter by series ticker (category)
+            event_ticker: Filter by specific event ticker
             limit: Max results to return
             cursor: Pagination cursor
             exclude_mve: If True, exclude multivariate (sports combo) markets
@@ -149,6 +151,8 @@ class KalshiClient:
         params = {'status': status, 'limit': limit}
         if series_ticker:
             params['series_ticker'] = series_ticker
+        if event_ticker:
+            params['event_ticker'] = event_ticker
         if cursor:
             params['cursor'] = cursor
         if exclude_mve:
@@ -166,6 +170,22 @@ class KalshiClient:
     async def get_market(self, ticker: str) -> dict:
         """Get single market by ticker."""
         path = f"/markets/{ticker}"
+        
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{self.base_url}{path}",
+                headers={'Accept': 'application/json'}
+            )
+            response.raise_for_status()
+            return response.json()
+    
+    async def get_series_list(self) -> dict:
+        """Fetch all available series (categories of markets).
+        
+        Returns:
+            Dict with 'series' list containing all series tickers and metadata
+        """
+        path = "/series"
         
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
