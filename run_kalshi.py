@@ -401,21 +401,22 @@ class KalshiBattleBot:
         These are markets like "Team A AND Team B AND Team C all win"
         which have very few traders.
         """
-        title = market.get('question', '') or market.get('id', '')
-        
-        # Count commas - combo markets list multiple teams/events
-        comma_count = title.count(',')
-        if comma_count >= 3:  # 4+ items = likely combo
-            return True
-        
-        # Check for multi-game indicators in the ticker
+        # Check for multi-game indicators in the ticker - most reliable signal
         ticker = market.get('id', '').upper()
-        if 'MULTIGAME' in ticker or 'MULTI' in ticker:
+        if 'MULTIGAME' in ticker:
             return True
         
-        # Check for "and" patterns suggesting multiple conditions
-        title_lower = title.lower()
-        if title_lower.count(' and ') >= 2:
+        # Check the title for patterns like "yes TeamA,yes TeamB,yes TeamC"
+        title = market.get('question', '') or ''
+        
+        # Count "yes " prefixes - combo markets list multiple "yes X" items
+        yes_count = title.lower().count('yes ')
+        if yes_count >= 3:
+            return True
+        
+        # Count "no " prefixes similarly
+        no_count = title.lower().count('no ')
+        if no_count >= 3:
             return True
         
         return False
