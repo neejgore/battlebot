@@ -168,6 +168,67 @@ class KalshiBattleBot:
             if self._positions:
                 print(f"[State] WARNING: {len(self._positions)} positions may not be persisted!")
     
+    async def _sync_pending_orders_on_startup(self):
+        """Check status of pending orders from previous session."""
+        filled = 0
+        canceled = 0
+        still_pending = 0
+        
+        for order_id, order in list(self._pending_orders.items()):
+            try:
+                result = await self._kalshi.get_order(order_id)
+                order_data = result.get('order', {})
+                status = order_data.get('status', '').lower()
+                
+                if status == 'executed':
+                    # Order filled while bot was down - create position
+                    fill_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
+                    fill_count = order_data.get('filled_count', order['contracts'])
+                    
+                    pos_id = order.get('id', f"pos_{order_id}")
+                    pos = {
+                        'id': pos_id,
+                        'order_id': order_id,
+                        'market_id': order['market_id'],
+                        'question': order.get('question', ''),
+                        'side': order['side'],
+                        'size': order['size'],
+                        'entry_price': fill_price,
+                        'current_price': fill_price,
+                        'contracts': fill_count,
+                        'ai_probability': order.get('ai_probability', 0.5),
+                        'edge': order.get('edge', 0),
+                        'confidence': order.get('confidence', 0),
+                        'entry_time': order.get('placed_time', datetime.utcnow().isoformat()),
+                        'unrealized_pnl': 0.0,
+                    }
+                    self._positions[pos_id] = pos
+                    self._pending_orders.pop(order_id)
+                    filled += 1
+                    print(f"[Startup] Order {order_id[:8]}... was FILLED @ {fill_price*100:.0f}¢")
+                    
+                elif status in ('canceled', 'cancelled'):
+                    self._pending_orders.pop(order_id)
+                    canceled += 1
+                    print(f"[Startup] Order {order_id[:8]}... was CANCELED")
+                    
+                else:  # still resting
+                    still_pending += 1
+                    print(f"[Startup] Order {order_id[:8]}... still PENDING")
+                
+                await asyncio.sleep(0.5)  # Rate limit
+                
+            except Exception as e:
+                if '404' in str(e).lower():
+                    # Order doesn't exist - remove it
+                    self._pending_orders.pop(order_id, None)
+                    print(f"[Startup] Order {order_id[:8]}... NOT FOUND (removed)")
+                else:
+                    print(f"[Startup] Error checking order {order_id[:8]}...: {e}")
+        
+        self._save_state()
+        print(f"[Startup] Sync complete: {filled} filled, {canceled} canceled, {still_pending} still pending")
+    
     def _get_stats(self) -> dict:
         """Calculate all stats from current state."""
         at_risk = sum(p['size'] for p in self._positions.values())
@@ -273,6 +334,11 @@ class KalshiBattleBot:
             print(f"\n⚠️  SIMULATE_PRICES=true (testing mode)")
         print(f"\nDashboard: http://localhost:{self.port}")
         print("Press Ctrl+C to stop\n")
+        
+        # Sync pending orders from previous session (LIVE mode only)
+        if not self.dry_run and self._pending_orders:
+            print(f"[Startup] Checking {len(self._pending_orders)} pending orders from previous session...")
+            await self._sync_pending_orders_on_startup()
         
         # Start background tasks
         asyncio.create_task(self._market_loop())
@@ -803,74 +869,152 @@ class KalshiBattleBot:
     async def _position_sync_loop(self):
         """Sync positions with Kalshi API to detect filled orders."""
         await asyncio.sleep(5)  # Wait for startup
+        
         while self._running:
             try:
-                # Fetch actual positions from Kalshi
-                result = await self._kalshi.get_positions()
-                kalshi_positions = result.get('market_positions', [])
+                if not self._pending_orders:
+                    await asyncio.sleep(10)
+                    continue
                 
-                # Build a map of ticker -> position data
-                kalshi_by_ticker = {}
-                for kp in kalshi_positions:
-                    ticker = kp.get('ticker')
-                    if ticker:
-                        kalshi_by_ticker[ticker] = kp
-                
-                # Check pending orders against actual positions
+                # Check each pending order's status directly
                 filled_orders = []
-                for order_id, order in list(self._pending_orders.items()):
-                    market_id = order.get('market_id')
-                    if market_id in kalshi_by_ticker:
-                        kp = kalshi_by_ticker[market_id]
-                        # Check if we have contracts on the side we ordered
-                        side = order.get('side', '').lower()
-                        if side == 'yes':
-                            filled_count = kp.get('position', 0)
-                        else:  # no
-                            filled_count = kp.get('position', 0)  # Kalshi uses negative for NO? Check API
-                        
-                        # For now, if there's any position on this ticker, assume our order filled
-                        total_position = kp.get('total_traded', 0) or abs(kp.get('position', 0))
-                        if total_position > 0:
-                            filled_orders.append(order_id)
-                            print(f"[FILLED] Order {order_id} filled! Position: {kp}")
+                canceled_orders = []
                 
-                # Move filled orders to positions
-                for order_id in filled_orders:
+                for order_id, order in list(self._pending_orders.items()):
+                    try:
+                        # Get order status from Kalshi API
+                        result = await self._kalshi.get_order(order_id)
+                        order_data = result.get('order', {})
+                        status = order_data.get('status', '').lower()
+                        
+                        if status == 'executed':
+                            # Order fully filled
+                            fill_count = order_data.get('filled_count', order['contracts'])
+                            fill_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
+                            filled_orders.append({
+                                'order_id': order_id,
+                                'order': order,
+                                'fill_count': fill_count,
+                                'fill_price': fill_price,
+                            })
+                            print(f"[ORDER FILLED] {order_id} | {fill_count} contracts @ {fill_price*100:.0f}¢")
+                        
+                        elif status == 'canceled' or status == 'cancelled':
+                            canceled_orders.append(order_id)
+                            print(f"[ORDER CANCELED] {order_id}")
+                        
+                        elif status == 'resting':
+                            # Still waiting to fill - check for partial fills
+                            filled_count = order_data.get('filled_count', 0)
+                            if filled_count > 0:
+                                print(f"[PARTIAL FILL] {order_id} | {filled_count}/{order['contracts']} contracts filled")
+                        
+                        await asyncio.sleep(0.5)  # Rate limit between API calls
+                        
+                    except Exception as e:
+                        # Order might not exist anymore (already executed/canceled)
+                        error_str = str(e).lower()
+                        if '404' in error_str or 'not found' in error_str:
+                            # Order not found - likely already executed, check fills
+                            print(f"[Order {order_id}] Not found, checking fills...")
+                            try:
+                                fills = await self._kalshi.get_fills(ticker=order['market_id'])
+                                for fill in fills.get('fills', []):
+                                    if fill.get('order_id') == order_id:
+                                        filled_orders.append({
+                                            'order_id': order_id,
+                                            'order': order,
+                                            'fill_count': fill.get('count', order['contracts']),
+                                            'fill_price': fill.get('price', order['entry_price'] * 100) / 100,
+                                        })
+                                        print(f"[FILL FOUND] {order_id} from fills API")
+                                        break
+                            except:
+                                pass
+                        else:
+                            print(f"[Order Status Error] {order_id}: {e}")
+                
+                # Process filled orders - move to positions
+                for filled in filled_orders:
+                    order_id = filled['order_id']
+                    order = self._pending_orders.pop(order_id, None)
+                    if not order:
+                        continue
+                    
+                    pos_id = order.get('id', f"pos_{order_id}")
+                    fill_price = filled.get('fill_price', order['entry_price'])
+                    
+                    pos = {
+                        'id': pos_id,
+                        'order_id': order_id,
+                        'market_id': order['market_id'],
+                        'question': order.get('question', ''),
+                        'side': order['side'],
+                        'size': order['size'],
+                        'entry_price': fill_price,
+                        'current_price': fill_price,
+                        'contracts': filled.get('fill_count', order['contracts']),
+                        'ai_probability': order.get('ai_probability', 0.5),
+                        'edge': order.get('edge', 0),
+                        'confidence': order.get('confidence', 0),
+                        'entry_time': datetime.utcnow().isoformat(),
+                        'unrealized_pnl': 0.0,
+                    }
+                    self._positions[pos_id] = pos
+                    
+                    # Log to database
+                    if self._db_connected:
+                        try:
+                            db_trade_id = await self._db.log_trade_entry(
+                                decision_id=0,
+                                market_id=order['market_id'],
+                                token_id=order['market_id'],
+                                entry_price=fill_price,
+                                entry_side=order['side'],
+                                size=order['size'],
+                                raw_prob=order.get('ai_probability', 0.5),
+                                adjusted_prob=order.get('ai_probability', 0.5),
+                                edge=order.get('edge', 0),
+                                confidence=order.get('confidence', 0),
+                            )
+                            pos['db_trade_id'] = db_trade_id
+                        except Exception as e:
+                            print(f"[DB] Failed to log filled trade: {e}")
+                    
+                    print(f"[POSITION OPENED] {order['side']} ${order['size']:.2f} @ {fill_price*100:.0f}¢ | {order.get('question', '')[:50]}...")
+                    
+                    # Update trade record
+                    for trade in self._trades:
+                        if trade.get('order_id') == order_id:
+                            trade['action'] = 'ENTRY'
+                            trade['status'] = 'filled'
+                            trade['fill_price'] = fill_price
+                            break
+                
+                # Remove canceled orders
+                for order_id in canceled_orders:
                     order = self._pending_orders.pop(order_id, None)
                     if order:
-                        pos_id = order.get('id', f"pos_{order_id}")
-                        pos = {
-                            'id': pos_id,
-                            'order_id': order_id,
-                            'market_id': order['market_id'],
-                            'question': order.get('question', ''),
-                            'side': order['side'],
-                            'size': order['size'],
-                            'entry_price': order['entry_price'],
-                            'current_price': order['entry_price'],
-                            'contracts': order['contracts'],
-                            'ai_probability': order.get('ai_probability', 0.5),
-                            'edge': order.get('edge', 0),
-                            'confidence': order.get('confidence', 0),
-                            'entry_time': datetime.utcnow().isoformat(),
-                            'unrealized_pnl': 0.0,
-                        }
-                        self._positions[pos_id] = pos
-                        self._save_state()
-                        
-                        # Log entry
-                        mode = "[LIVE]"
-                        print(f"{mode} ENTERED: {order['side']} ${order['size']:.2f} @ {order['entry_price']*100:.0f}¢ | {order.get('question', '')[:50]}...")
+                        print(f"[REMOVED] Canceled order {order_id}")
+                        # Update trade record
+                        for trade in self._trades:
+                            if trade.get('order_id') == order_id:
+                                trade['status'] = 'canceled'
+                                break
+                
+                # Save state if anything changed
+                if filled_orders or canceled_orders:
+                    self._save_state()
+                    await self._broadcast_update()
                 
                 # Log sync status
                 if self._pending_orders:
-                    print(f"[Sync] {len(self._pending_orders)} orders pending, {len(self._positions)} positions filled")
+                    print(f"[Sync] {len(self._pending_orders)} orders pending, {len(self._positions)} positions active")
                 
             except Exception as e:
                 print(f"[Position Sync Error] {e}")
             
-            await asyncio.sleep(15)  # Check every 15 seconds
+            await asyncio.sleep(10)  # Check every 10 seconds
     
     async def _broadcast_update(self):
         """Send update to all connected WebSocket clients."""

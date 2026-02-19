@@ -333,6 +333,58 @@ class KalshiClient:
             )
             response.raise_for_status()
             return response.json()
+    
+    async def get_order(self, order_id: str) -> dict:
+        """Get status of a specific order (requires auth)."""
+        path = f"/portfolio/orders/{order_id}"
+        headers = self._get_auth_headers('GET', path)
+        headers['Accept'] = 'application/json'
+        
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{self.base_url}{path}",
+                headers=headers
+            )
+            response.raise_for_status()
+            return response.json()
+    
+    async def get_fills(self, ticker: Optional[str] = None, limit: int = 100) -> dict:
+        """Get recent fills/trades for the account (requires auth)."""
+        path = "/portfolio/fills"
+        headers = self._get_auth_headers('GET', path)
+        headers['Accept'] = 'application/json'
+        
+        params = {'limit': limit}
+        if ticker:
+            params['ticker'] = ticker
+        
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{self.base_url}{path}",
+                headers=headers,
+                params=params
+            )
+            response.raise_for_status()
+            return response.json()
+    
+    async def get_orders(self, status: str = "resting") -> dict:
+        """Get orders by status (requires auth).
+        
+        Args:
+            status: 'resting' (open), 'canceled', or 'executed'
+        """
+        path = "/portfolio/orders"
+        headers = self._get_auth_headers('GET', path)
+        headers['Accept'] = 'application/json'
+        
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{self.base_url}{path}",
+                headers=headers,
+                params={'status': status}
+            )
+            response.raise_for_status()
+            return response.json()
 
 
 def parse_kalshi_market(market: dict) -> dict:
