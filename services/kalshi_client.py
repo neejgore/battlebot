@@ -117,7 +117,9 @@ class KalshiClient:
             return {}
         
         timestamp = int(time.time() * 1000)
-        signature = self._sign_request(method, path, timestamp)
+        # Signature must include the FULL path (including /trade-api/v2 prefix)
+        full_path = f"/trade-api/v2{path}"
+        signature = self._sign_request(method, full_path, timestamp)
         
         return {
             'KALSHI-ACCESS-KEY': self.api_key_id,
