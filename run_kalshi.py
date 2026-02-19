@@ -397,7 +397,7 @@ class KalshiBattleBot:
                 await self._select_markets()
             except Exception as e:
                 print(f"[Market Error] {e}")
-            await asyncio.sleep(60)  # Refresh every minute
+            await asyncio.sleep(900)  # Refresh every 15 minutes (markets don't change rapidly)
     
     async def _fetch_markets(self):
         """Fetch ALL useful markets from Kalshi - no artificial limits.
