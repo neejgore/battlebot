@@ -383,15 +383,24 @@ class KalshiBattleBot:
             result = await self._kalshi.get_markets(status='open', limit=100)
             markets = result.get('markets', [])
             
+            skipped_combos = 0
             for m in markets:
                 try:
+                    ticker = m.get('ticker', '').upper()
+                    
+                    # Skip sports combo/multi-game markets - they have no liquidity
+                    if 'MULTIGAME' in ticker or 'MULTILEG' in ticker:
+                        skipped_combos += 1
+                        continue
+                    
                     market = parse_kalshi_market(m)
                     if market['id']:
                         self._markets[market['id']] = market
                 except Exception as e:
                     continue
             
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetched {len(self._markets)} Kalshi markets")
+            added = len(self._markets)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetched {added} markets (skipped {skipped_combos} sports combos)")
         except Exception as e:
             print(f"[Kalshi API Error] {e}")
     
