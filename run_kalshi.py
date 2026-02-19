@@ -88,8 +88,8 @@ class KalshiBattleBot:
             max_daily_drawdown=0.15,
             max_position_size=self.max_position_size,
             max_percent_bankroll_per_market=0.10,
-            max_total_open_risk=0.75,  # 75% for dry run testing
-            max_positions=20,  # Allow more concurrent positions for tracking
+            max_total_open_risk=0.90,  # 90% for dry run testing
+            max_positions=40,  # Allow more concurrent positions for tracking
             profit_take_pct=0.03,
             stop_loss_pct=0.03,
             time_stop_hours=720,
