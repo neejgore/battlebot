@@ -736,7 +736,10 @@ class KalshiBattleBot:
                 print(f"[Filter] Rejected: {', '.join(reasons)}")
     
     async def _trading_loop(self):
-        """Main trading loop - analyze markets and enter positions."""
+        """Main trading loop - analyze markets and enter positions.
+        
+        PRIORITIZES ultra-short markets (≤24h) for immediate feedback.
+        """
         await asyncio.sleep(5)  # Wait for initial market fetch
         
         while self._running:
@@ -745,7 +748,17 @@ class KalshiBattleBot:
                     await asyncio.sleep(60)
                     continue
                 
-                for market_id, market in list(self._monitored.items()):
+                # Sort monitored markets by time to resolution (shortest first)
+                markets_by_urgency = sorted(
+                    self._monitored.values(),
+                    key=lambda m: m.get('hours_to_resolution', 9999)
+                )
+                
+                for market in markets_by_urgency:
+                    market_id = market.get('id')
+                    if not market_id:
+                        continue
+                        
                     if len(self._positions) >= self._risk_limits.max_positions:
                         break
                     
@@ -756,9 +769,17 @@ class KalshiBattleBot:
                     
                     price_moved = abs(current_price - last_price) >= self._price_change_threshold if last_price else False
                     
+                    # Shorter cooldown for ultra-short markets (analyze more frequently)
+                    hours_to_res = market.get('hours_to_resolution', 9999)
+                    cooldown = 300 if hours_to_res <= 24 else self._analysis_cooldown  # 5 min for ultra-short
+                    
                     if last and not price_moved:
-                        if (datetime.utcnow() - last).total_seconds() < self._analysis_cooldown:
+                        if (datetime.utcnow() - last).total_seconds() < cooldown:
                             continue
+                    
+                    # Log time horizon for visibility
+                    if hours_to_res <= 24:
+                        print(f"[ULTRA-SHORT] Analyzing: {hours_to_res:.1f}h to resolution")
                     
                     await self._analyze_market(market)
                     self._last_analysis[market_id] = datetime.utcnow()
