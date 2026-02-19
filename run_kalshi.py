@@ -496,6 +496,10 @@ class KalshiBattleBot:
         # Set to 0 by default to allow markets through, rely on spread filter
         min_volume = float(os.getenv('MIN_VOLUME_24H', '0'))
         
+        # Max days to resolution - political/economic markets often have longer timeframes
+        # Default 180 days (6 months) to capture most active markets
+        max_days = int(os.getenv('MAX_DAYS_TO_RESOLUTION', '180'))
+        
         for m in self._markets.values():
             # Must have end date
             if not m.get('end_date'):
@@ -506,7 +510,7 @@ class KalshiBattleBot:
             try:
                 end_date = datetime.fromisoformat(m['end_date'].replace('Z', '+00:00'))
                 days_to_resolution = (end_date.replace(tzinfo=None) - datetime.utcnow()).days
-                if days_to_resolution > 30:
+                if days_to_resolution > max_days:
                     rejection_counts['too_far_out'] += 1
                     continue
                 if days_to_resolution < 0:
