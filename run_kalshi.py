@@ -610,13 +610,27 @@ class KalshiBattleBot:
         except Exception as e:
             print(f"[Kalshi API Error] {e}")
     
-    def _is_combo_market(self, market_id: str) -> bool:
+    def _is_combo_market(self, market: dict) -> bool:
         """Detect multi-leg combo markets that have poor liquidity.
         
-        MULTIGAME and PARLAY markets are multi-leg bets with no liquidity.
+        MULTIGAME, PARLAY, COMBO, and MVE markets are multi-leg bets with no liquidity.
+        Also checks for multiple player props in the question (e.g., "yes X, yes Y").
         """
-        market_id_upper = market_id.upper()
-        return 'MULTIGAME' in market_id_upper or 'PARLAY' in market_id_upper
+        market_id_upper = (market.get('id', '') or market.get('ticker', '')).upper()
+        question = market.get('question', '') or market.get('title', '')
+        
+        # Check ticker patterns
+        if any(pattern in market_id_upper for pattern in ['MULTIGAME', 'PARLAY', 'COMBO', 'MVE']):
+            return True
+        
+        # Check for multi-player combo pattern in question: "yes X, yes Y" or multiple "15+", "25+"
+        question_lower = question.lower()
+        if question_lower.count('yes ') >= 2:  # Multiple "yes" statements = combo
+            return True
+        if question_lower.count('+,') >= 2:  # Multiple "+," patterns like "15+,yes" = combo
+            return True
+        
+        return False
     
     async def _select_markets(self):
         """Filter markets using eligibility criteria.
@@ -701,8 +715,7 @@ class KalshiBattleBot:
                 continue
             
             # Filter out MULTIGAME combo/parlay markets - they have no liquidity
-            market_id = m.get('id', '')
-            if self._is_combo_market(market_id):
+            if self._is_combo_market(m):
                 rejection_counts['combo_market'] += 1
                 if hours_to_resolution <= 24:
                     ultra_short_rejected['combo'] += 1
