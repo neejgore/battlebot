@@ -278,14 +278,16 @@ class KalshiClient:
                            ticker: str,
                            side: str,
                            count: int,
-                           price: int) -> dict:
+                           price: int = None,
+                           order_type: str = "market") -> dict:
         """Sell/close a position (requires auth).
         
         Args:
             ticker: Market ticker  
             side: 'yes' or 'no' (the side you're selling)
             count: Number of contracts to sell
-            price: Price in cents
+            price: Price in cents (only used for limit orders)
+            order_type: 'limit' or 'market'
             
         Returns:
             Order response dict
@@ -300,13 +302,14 @@ class KalshiClient:
             'action': 'sell',
             'side': side.lower(),
             'count': count,
-            'type': 'limit',
+            'type': order_type,
         }
-        # Only include the price for the side we're selling
-        if side.lower() == 'yes':
-            body['yes_price'] = price
-        else:
-            body['no_price'] = price
+        # Only include the price for limit orders
+        if order_type == 'limit' and price is not None:
+            if side.lower() == 'yes':
+                body['yes_price'] = price
+            else:
+                body['no_price'] = price
         
         logger.debug(f"Selling position: {body}")
         

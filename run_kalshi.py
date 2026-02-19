@@ -38,7 +38,7 @@ class KalshiBattleBot:
         # Config from env
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 1000))
-        self.min_edge = float(os.getenv('MIN_EDGE', 0.03))
+        self.min_edge = float(os.getenv('MIN_EDGE', 0.08))  # 8% min edge to cover market order slippage
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.5))
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 50))
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.1))
@@ -759,21 +759,19 @@ class KalshiBattleBot:
                     print(f"[Order] Size ${size:.2f} too small for 1 contract at {int(entry_price*100)}¢")
                     return
                 
-                # Aggressive pricing: pay 4¢ more than mid-market for faster fills
-                # This reduces edge slightly but dramatically improves fill rate
-                aggression_cents = int(os.getenv('LIMIT_AGGRESSION_CENTS', '4'))
+                # Use market orders for guaranteed fills
+                # Higher min edge (8%) compensates for slippage
                 base_price_cents = int(entry_price * 100)
-                aggressive_price_cents = min(base_price_cents + aggression_cents, 99)  # Cap at 99¢
                 
                 result = await self._kalshi.place_order(
                     ticker=market_id,
                     side=side.lower(),  # 'yes' or 'no'
                     count=contracts,
-                    price=aggressive_price_cents,
-                    order_type='limit',
+                    price=base_price_cents,  # Price not used for market orders but kept for logging
+                    order_type='market',
                 )
                 order_id = result.get('order', {}).get('order_id')
-                print(f"[LIVE ORDER] Placed: {contracts} {side} @ {aggressive_price_cents}¢ (mid: {base_price_cents}¢) | Order ID: {order_id}")
+                print(f"[LIVE MARKET ORDER] Placed: {contracts} {side} (mid: {base_price_cents}¢) | Order ID: {order_id}")
             except Exception as e:
                 print(f"[Order Error] Failed to place order on Kalshi: {e}")
                 return  # Don't record if order failed
@@ -928,19 +926,16 @@ class KalshiBattleBot:
             try:
                 contracts = position.get('contracts', 0)
                 if contracts > 0:
-                    # Aggressive exit: accept 4¢ less than mid-market for faster fills
-                    aggression_cents = int(os.getenv('LIMIT_AGGRESSION_CENTS', '4'))
                     base_price_cents = int(exit_price * 100)
-                    aggressive_price_cents = max(base_price_cents - aggression_cents, 1)  # Floor at 1¢
                     
                     result = await self._kalshi.sell_position(
                         ticker=position['market_id'],
                         side=position['side'].lower(),
                         count=contracts,
-                        price=aggressive_price_cents,
+                        order_type='market',
                     )
                     exit_order_id = result.get('order', {}).get('order_id')
-                    print(f"[LIVE SELL ORDER] Placed: {contracts} {position['side']} @ {aggressive_price_cents}¢ (mid: {base_price_cents}¢) | Order ID: {exit_order_id}")
+                    print(f"[LIVE MARKET SELL] Placed: {contracts} {position['side']} (mid: {base_price_cents}¢) | Order ID: {exit_order_id}")
                     
                     # Track as pending exit - don't remove position until sell fills
                     position['pending_exit'] = {
