@@ -38,7 +38,7 @@ class KalshiBattleBot:
         # Config from env
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 1000))
-        self.min_edge = float(os.getenv('MIN_EDGE', 0.08))  # 8% min edge to cover market order slippage
+        self.min_edge = float(os.getenv('MIN_EDGE', 0.05))  # 5% min edge (lower for dry run testing)
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.5))
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 50))
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.1))
