@@ -213,8 +213,29 @@ class KalshiBattleBot:
                     print(f"[Startup] Order {order_id[:8]}... was CANCELED")
                     
                 else:  # still resting
-                    still_pending += 1
-                    print(f"[Startup] Order {order_id[:8]}... still PENDING")
+                    # Cancel stale limit orders (older than 1 hour)
+                    placed_time_str = order.get('placed_time', '')
+                    is_stale = False
+                    if placed_time_str:
+                        try:
+                            placed_time = datetime.fromisoformat(placed_time_str.replace('Z', '+00:00'))
+                            age_hours = (datetime.now(placed_time.tzinfo) - placed_time).total_seconds() / 3600
+                            is_stale = age_hours > 1
+                        except:
+                            is_stale = True  # If we can't parse time, assume stale
+                    
+                    if is_stale:
+                        try:
+                            await self._kalshi.cancel_order(order_id)
+                            self._pending_orders.pop(order_id)
+                            canceled += 1
+                            print(f"[Startup] Order {order_id[:8]}... CANCELED (stale limit order)")
+                        except Exception as cancel_err:
+                            still_pending += 1
+                            print(f"[Startup] Order {order_id[:8]}... still PENDING (cancel failed: {cancel_err})")
+                    else:
+                        still_pending += 1
+                        print(f"[Startup] Order {order_id[:8]}... still PENDING")
                 
                 await asyncio.sleep(0.5)  # Rate limit
                 
