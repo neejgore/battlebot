@@ -525,9 +525,12 @@ class KalshiBattleBot:
             # Minimum open interest filter - require real liquidity
             # OI = committed capital, better than volume for holding positions
             oi = m.get('open_interest', 0) or 0
-            min_oi = int(os.getenv('MIN_OPEN_INTEREST', '100'))  # Default 100 contracts
+            min_oi = int(os.getenv('MIN_OPEN_INTEREST', '10'))  # Default 10 contracts
             if oi < min_oi:
                 rejection_counts['low_oi'] += 1
+                # Debug: log first few rejections
+                if rejection_counts['low_oi'] <= 3:
+                    print(f"[Debug] Rejected for low_oi: {m.get('ticker', '')[:30]} oi={oi}")
                 continue
             
             # Spread check - configurable, default 6 cents
