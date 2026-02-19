@@ -137,10 +137,15 @@ class KalshiClient:
         """Fetch markets from Kalshi.
         
         Args:
-            status: Market status filter (open, closed, settled)
+            status: Market status filter. Valid values:
+                    - 'open': Currently tradeable markets
+                    - 'paused': Temporarily halted (can resume)
+                    - 'unopened': Not yet open for trading
+                    - 'closed': Closed but not settled
+                    - 'settled': Final result determined
             series_ticker: Filter by series ticker (category)
             event_ticker: Filter by specific event ticker
-            limit: Max results to return
+            limit: Max results to return (max 1000)
             cursor: Pagination cursor
             exclude_mve: If True, exclude multivariate (sports combo) markets
             
@@ -436,14 +441,39 @@ def parse_kalshi_market(market: dict) -> dict:
     Returns:
         Standardized market dict for BattleBot
     """
-    # Kalshi prices are in cents (1-99), convert to decimal (0.01-0.99)
-    yes_price = market.get('yes_price', 50) / 100 if market.get('yes_price') else 0.5
-    no_price = market.get('no_price', 50) / 100 if market.get('no_price') else 0.5
+    # Kalshi API returns prices as strings in dollars (e.g., "0.5600")
+    # Use the new _dollars fields, fallback to deprecated integer fields (cents)
+    def parse_price(dollars_field: str, cents_field: str, default: float) -> float:
+        if market.get(dollars_field):
+            try:
+                return float(market[dollars_field])
+            except (ValueError, TypeError):
+                pass
+        if market.get(cents_field):
+            try:
+                return market[cents_field] / 100
+            except (ValueError, TypeError):
+                pass
+        return default
     
-    # Get best bid/ask for spread calculation
-    yes_bid = market.get('yes_bid', 0) / 100 if market.get('yes_bid') else yes_price - 0.01
-    yes_ask = market.get('yes_ask', 0) / 100 if market.get('yes_ask') else yes_price + 0.01
-    spread = yes_ask - yes_bid
+    # Last trade price (best indicator of current market price)
+    last_price = parse_price('last_price_dollars', 'last_price', 0.5)
+    
+    # Bid/ask for spread calculation
+    yes_bid = parse_price('yes_bid_dollars', 'yes_bid', last_price - 0.01)
+    yes_ask = parse_price('yes_ask_dollars', 'yes_ask', last_price + 0.01)
+    no_bid = parse_price('no_bid_dollars', 'no_bid', 1 - last_price - 0.01)
+    no_ask = parse_price('no_ask_dollars', 'no_ask', 1 - last_price + 0.01)
+    
+    # Use midpoint if we have valid bid/ask, otherwise use last_price
+    if yes_bid > 0 and yes_ask > 0 and yes_ask > yes_bid:
+        yes_price = (yes_bid + yes_ask) / 2
+        spread = yes_ask - yes_bid
+    else:
+        yes_price = last_price
+        spread = 0.02  # Default 2¢ spread if no orderbook
+    
+    no_price = 1 - yes_price
     
     # Parse resolution/expiration time - prefer expiration over close time
     # expected_expiration_time = when market resolves (what we want)

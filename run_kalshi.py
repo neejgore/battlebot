@@ -18,6 +18,7 @@ from logic.calibration import CalibrationEngine, CalibrationResult
 from logic.risk_engine import RiskEngine, RiskLimits
 from data.database import TelemetryDB
 from services.kalshi_client import KalshiClient, parse_kalshi_market
+from services.market_intelligence import get_intelligence_service, MarketIntelligence
 
 load_dotenv()
 
@@ -102,6 +103,15 @@ class KalshiBattleBot:
             fractional_kelly=self.kelly_fraction,
             limits=self._risk_limits,
         )
+        
+        # Market Intelligence Service (news, domain data, inefficiency detection)
+        self._intelligence = get_intelligence_service()
+        self._use_intelligence = os.getenv('USE_INTELLIGENCE', 'true').lower() == 'true'
+        self._prefer_inefficient = os.getenv('PREFER_INEFFICIENT_MARKETS', 'true').lower() == 'true'
+        self._use_contrarian = os.getenv('USE_CONTRARIAN_TIMING', 'true').lower() == 'true'
+        
+        # Inefficiency threshold: prefer markets with score > this
+        self._min_inefficiency_score = float(os.getenv('MIN_INEFFICIENCY_SCORE', '0.1'))
     
     def _load_state(self):
         """Load positions and trades from disk."""
@@ -375,6 +385,11 @@ class KalshiBattleBot:
             'daily_drawdown': self._risk_engine.daily_stats.current_drawdown_pct,
             'exposure_ratio': at_risk / self.initial_bankroll,
             'trading_allowed': self._risk_engine.is_trading_allowed,
+            # Intelligence features
+            'use_intelligence': self._use_intelligence,
+            'prefer_inefficient': self._prefer_inefficient,
+            'use_contrarian': self._use_contrarian,
+            'min_inefficiency_score': self._min_inefficiency_score,
         }
     
     async def start(self):
@@ -404,13 +419,18 @@ class KalshiBattleBot:
         
         # Print startup banner
         mode = "DRY RUN" if self.dry_run else "LIVE"
-        print(f"\n{'='*50}")
+        print(f"\n{'='*60}")
         print(f"KALSHI BATTLE-BOT [{mode}]")
-        print(f"{'='*50}")
+        print(f"{'='*60}")
         print(f"Platform: Kalshi (CFTC-regulated, US legal)")
         print(f"Bankroll: ${self.initial_bankroll:,.2f}")
         print(f"Min Edge: {self.min_edge*100:.1f}%")
         print(f"Max Position: ${self.max_position_size:,.2f}")
+        print(f"\n[Intelligence Features]")
+        print(f"  News Integration: {'ON' if self._use_intelligence else 'OFF'}")
+        print(f"  Prefer Inefficient Markets: {'ON' if self._prefer_inefficient else 'OFF'}")
+        print(f"  Contrarian Timing: {'ON' if self._use_contrarian else 'OFF'}")
+        print(f"  Min Inefficiency Score: {self._min_inefficiency_score:.2f}")
         if self.simulate_prices:
             print(f"\n⚠️  SIMULATE_PRICES=true (testing mode)")
         print(f"\nDashboard: http://localhost:{self.port}")
@@ -461,14 +481,15 @@ class KalshiBattleBot:
     async def _fetch_markets(self):
         """Fetch ALL markets from Kalshi using fast paginated fetch.
         
-        Strategy: Single paginated fetch gets ALL markets (~20 API calls, ~2 min)
-        No need to iterate through 4000+ series individually.
+        Strategy: Single paginated fetch gets ALL open markets (~20 API calls, ~2 min)
+        - Uses mve_filter='exclude' to skip combo/parlay markets at API level
+        - No need to iterate through 4000+ series individually
         """
         try:
             all_markets = []
             
-            # Single paginated fetch - gets ALL open markets
-            print(f"[Fetching] All open markets with pagination...")
+            # Fetch all open markets - exclude combo markets at API level for efficiency
+            print(f"[Fetching] All open markets (excluding combos) with pagination...")
             cursor = None
             pages_fetched = 0
             
@@ -479,6 +500,7 @@ class KalshiBattleBot:
                         status='open',
                         limit=1000,  # Max per page
                         cursor=cursor,
+                        exclude_mve=True,  # Skip combo/parlay markets at API level
                     )
                     markets = result.get('markets', [])
                     if not markets:
@@ -548,14 +570,14 @@ class KalshiBattleBot:
             # Process markets - NO category filtering, let volume/spread filters decide
             category_counts = {}
             
-            # Debug: Sample first few markets to see available time fields
+            # Debug: Sample market to verify API fields
             if all_markets:
                 sample = all_markets[0]
-                print(f"[Debug] Sample market time fields:")
-                print(f"  close_time: {sample.get('close_time')}")
-                print(f"  expected_expiration_time: {sample.get('expected_expiration_time')}")
-                print(f"  expiration_time: {sample.get('expiration_time')}")
-                print(f"  settlement_time: {sample.get('settlement_time')}")
+                print(f"[Debug] Sample market fields (ticker={sample.get('ticker', 'N/A')[:30]}):")
+                print(f"  Time: close={sample.get('close_time')}, expected_exp={sample.get('expected_expiration_time')}")
+                print(f"  Price: last_price_dollars={sample.get('last_price_dollars')}, last_price={sample.get('last_price')}")
+                print(f"  Bid/Ask: yes_bid_dollars={sample.get('yes_bid_dollars')}, yes_ask_dollars={sample.get('yes_ask_dollars')}")
+                print(f"  Volume: volume={sample.get('volume')}, volume_24h={sample.get('volume_24h')}, oi={sample.get('open_interest')}")
             
             # Count markets by time field availability
             time_field_stats = {'close_time': 0, 'expected_exp': 0, 'expiration': 0, 'none': 0}
@@ -712,7 +734,8 @@ class KalshiBattleBot:
             max_spread = float(os.getenv('MAX_SPREAD', '0.06'))
             # Allow 2x wider spread for ultra-short markets (daily events)
             effective_max_spread = max_spread * 2 if hours_to_resolution <= 24 else max_spread
-            actual_spread = m.get('spread', max_spread)
+            # Default to 1.0 (100%) if missing - require valid spread data
+            actual_spread = m.get('spread', 1.0)
             if actual_spread > effective_max_spread:
                 rejection_counts['wide_spread'] += 1
                 if hours_to_resolution <= 24:
@@ -741,6 +764,21 @@ class KalshiBattleBot:
             m['hours_to_resolution'] = hours_to_resolution
             m['days_to_resolution'] = days_to_resolution
             
+            # Calculate inefficiency score for prioritization
+            if self._prefer_inefficient:
+                ineff_score, ineff_reasons = self._intelligence.inefficiency_detector.calculate_inefficiency_score(
+                    volume=volume,
+                    spread=m.get('spread', 0.02),
+                    open_interest=oi,
+                    price=m.get('price', 0.5),
+                    recent_price_change=0.0,  # Will be filled by intelligence service later
+                )
+                m['inefficiency_score'] = ineff_score
+                m['inefficiency_reasons'] = ineff_reasons
+            else:
+                m['inefficiency_score'] = 0.0
+                m['inefficiency_reasons'] = []
+            
             # Categorize by time horizon
             if hours_to_resolution <= 24:
                 ultra_short.append(m)
@@ -749,10 +787,25 @@ class KalshiBattleBot:
             else:
                 medium_term.append(m)
         
-        # Sort each category by open interest
-        ultra_short.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
-        short_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
-        medium_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
+        # Sort each category by composite score:
+        # - Inefficiency score (higher = better opportunity)
+        # - Open interest (higher = more liquid for execution)
+        # Balance: inefficiency × 0.6 + normalized_oi × 0.4
+        def market_score(m):
+            ineff = m.get('inefficiency_score', 0) * 0.6
+            # Normalize OI to 0-1 scale (cap at 1000)
+            oi = min(m.get('open_interest', 0) / 1000, 1.0) * 0.4
+            return ineff + oi
+        
+        if self._prefer_inefficient:
+            ultra_short.sort(key=market_score, reverse=True)
+            short_term.sort(key=market_score, reverse=True)
+            medium_term.sort(key=market_score, reverse=True)
+        else:
+            # Original behavior: sort by OI only
+            ultra_short.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
+            short_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
+            medium_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         
         # PRIORITIZE: Ultra-short first, then short, then medium
         selected = ultra_short[:8] + short_term[:5] + medium_term[:2]
@@ -851,7 +904,13 @@ class KalshiBattleBot:
             await asyncio.sleep(30)
     
     async def _analyze_market(self, market: dict):
-        """Analyze market with AI and decide whether to trade."""
+        """Analyze market with AI and decide whether to trade.
+        
+        Enhanced with:
+        1. Market intelligence (news, domain data)
+        2. Inefficiency detection
+        3. Contrarian timing signals
+        """
         market_id = market['id']
         question = market.get('question', '')[:50]
         current_price = market.get('price', 0.5)
@@ -859,7 +918,37 @@ class KalshiBattleBot:
         print(f"[AI] Analyzing: {question}...")
         self._ai_calls += 1
         
-        # Get AI signal
+        # Step 1: Gather market intelligence (news, domain data, overreaction detection)
+        intel: MarketIntelligence = None
+        if self._use_intelligence:
+            try:
+                intel = await self._intelligence.gather_intelligence(
+                    market_id=market_id,
+                    market_question=market.get('question', ''),
+                    current_price=current_price,
+                    spread=market.get('spread', 0.02),
+                    volume=market.get('volume_24h', 0),
+                    open_interest=market.get('open_interest', 0),
+                    category=market.get('category'),
+                )
+                if intel.news_items:
+                    print(f"[Intel] Found {len(intel.news_items)} news items, inefficiency={intel.inefficiency_score:.2f}")
+                if intel.overreaction_detected:
+                    print(f"[Intel] OVERREACTION detected: {intel.overreaction_direction} {intel.overreaction_magnitude:.1%}")
+            except Exception as e:
+                print(f"[Intel] Failed to gather: {e}")
+                intel = None
+        
+        # Build overreaction info string for AI
+        overreaction_info = None
+        if intel and intel.overreaction_detected:
+            overreaction_info = (
+                f"ALERT: Market moved {intel.overreaction_magnitude:.1%} {intel.overreaction_direction} recently. "
+                f"Price change 24h: {intel.recent_price_change:+.1%}. "
+                f"This could be an overreaction - consider if the move is justified."
+            )
+        
+        # Step 2: Get AI signal with intelligence data
         try:
             result = await self._ai_generator.generate_signal(
                 market_question=market.get('question', ''),
@@ -867,6 +956,11 @@ class KalshiBattleBot:
                 spread=market.get('spread', 0.02),
                 resolution_rules=market.get('rules', '') or market.get('description', ''),
                 volume_24h=market.get('volume_24h', 0),
+                # NEW: Intelligence data
+                news_summary=intel.news_summary if intel else None,
+                domain_summary=intel.domain_summary if intel else None,
+                recent_price_change=intel.recent_price_change if intel else 0.0,
+                overreaction_info=overreaction_info,
             )
             
             # Check if AI call succeeded (result is AISignalResult with success flag)
@@ -898,7 +992,7 @@ class KalshiBattleBot:
             print(f"[AI] FAILED: {e}")
             return
         
-        # Calibrate probability (async call)
+        # Step 3: Calibrate probability (async call)
         try:
             cal_result = await self._calibration.calibrate(
                 raw_prob=signal.raw_prob,
@@ -915,7 +1009,7 @@ class KalshiBattleBot:
             adjusted_prob = signal.raw_prob
             calibration_method = "error"
         
-        # Determine trade side and edge using ACTUAL prices from Kalshi
+        # Step 4: Determine trade side and edge using ACTUAL prices from Kalshi
         yes_price = market.get('yes_price', current_price)
         no_price = market.get('no_price', 1 - current_price)  # Fallback if not available
         
@@ -933,8 +1027,22 @@ class KalshiBattleBot:
             trade_prob = no_prob         # Our belief in NO winning
             trade_price = no_price       # Actual cost to buy NO
         
-        # Store analysis
-        self._analyses.insert(0, {
+        # Step 5: Apply contrarian edge adjustment
+        contrarian_multiplier = 1.0
+        if self._use_contrarian and intel and intel.overreaction_detected:
+            ai_predicted_direction = "yes" if side == "YES" else "no"
+            contrarian_multiplier = self._intelligence.contrarian_detector.get_contrarian_edge_boost(
+                is_overreaction=intel.overreaction_detected,
+                overreaction_direction=intel.overreaction_direction,
+                ai_predicted_direction=ai_predicted_direction,
+                magnitude=intel.overreaction_magnitude,
+            )
+            if contrarian_multiplier != 1.0:
+                print(f"[Contrarian] Edge multiplier: {contrarian_multiplier:.2f}x ({'BOOST' if contrarian_multiplier > 1 else 'REDUCE'})")
+            edge = edge * contrarian_multiplier
+        
+        # Store analysis with intelligence data
+        analysis_record = {
             'market_id': market_id,
             'question': market.get('question', ''),
             'market_price': current_price,
@@ -950,7 +1058,19 @@ class KalshiBattleBot:
             'info_quality': signal.information_quality,
             'latency_ms': result.latency_ms,
             'calibration_method': calibration_method,
-        })
+        }
+        
+        # Add intelligence data if available
+        if intel:
+            analysis_record['has_intel'] = True
+            analysis_record['news_count'] = len(intel.news_items)
+            analysis_record['inefficiency_score'] = intel.inefficiency_score
+            analysis_record['overreaction'] = intel.overreaction_detected
+            analysis_record['contrarian_multiplier'] = contrarian_multiplier
+            if intel.inefficiency_reasons:
+                analysis_record['inefficiency_reasons'] = intel.inefficiency_reasons[:3]
+        
+        self._analyses.insert(0, analysis_record)
         self._analyses = self._analyses[:50]
         
         # Check if we should trade
@@ -1032,10 +1152,19 @@ class KalshiBattleBot:
                     print(f"[Order] Size ${size:.2f} too small for 1 contract at {int(entry_price*100)}¢")
                     return
                 
-                # Use very aggressive limit orders (effectively market orders with price protection)
-                # Cross the spread by 10¢ to sweep the order book and fill immediately
+                # Use aggressive limit orders with PERCENTAGE-BASED slippage protection
+                # Prevents overpaying on low-priced contracts
                 base_price_cents = int(entry_price * 100)
-                aggressive_price_cents = min(base_price_cents + 10, 95)  # Pay up to 10¢ more, cap at 95¢
+                
+                # Safety: validate price is reasonable (1-99 cents)
+                if base_price_cents < 1 or base_price_cents > 99:
+                    print(f"[Order] Invalid price {base_price_cents}¢ - aborting")
+                    return
+                
+                # Calculate aggressive price: max 20% slippage OR 5¢, whichever is larger
+                # This prevents massive overpay on low-priced contracts
+                max_slippage_cents = max(5, int(base_price_cents * 0.20))  # 20% or 5¢ minimum
+                aggressive_price_cents = min(base_price_cents + max_slippage_cents, 95)  # Cap at 95¢
                 
                 result = await self._kalshi.place_order(
                     ticker=market_id,
@@ -1209,9 +1338,16 @@ class KalshiBattleBot:
             try:
                 contracts = position.get('contracts', 0)
                 if contracts > 0:
-                    # Aggressive exit: accept 10¢ less than mid for immediate fill
+                    # Aggressive exit: accept percentage-based slippage for immediate fill
                     base_price_cents = int(exit_price * 100)
-                    aggressive_price_cents = max(base_price_cents - 10, 5)  # Accept 10¢ less, floor at 5¢
+                    
+                    # Safety: validate price is reasonable
+                    if base_price_cents < 1:
+                        base_price_cents = 5  # Floor at 5¢ for sell orders
+                    
+                    # Max 20% slippage OR 5¢, whichever is larger
+                    max_slippage_cents = max(5, int(base_price_cents * 0.20))
+                    aggressive_price_cents = max(base_price_cents - max_slippage_cents, 5)  # Floor at 5¢
                     
                     result = await self._kalshi.sell_position(
                         ticker=position['market_id'],

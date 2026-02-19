@@ -207,6 +207,11 @@ class AISignalGenerator:
         recent_price_path: Optional[list[float]] = None,
         depth_summary: Optional[str] = None,
         category: Optional[str] = None,
+        # NEW: Intelligence data for information advantage
+        news_summary: Optional[str] = None,
+        domain_summary: Optional[str] = None,
+        recent_price_change: float = 0.0,
+        overreaction_info: Optional[str] = None,
     ) -> AISignalResult:
         """Generate a probability signal for a market.
         
@@ -221,6 +226,10 @@ class AISignalGenerator:
             recent_price_path: Recent price history
             depth_summary: Orderbook depth summary
             category: Market category
+            news_summary: Recent news about this market topic
+            domain_summary: Domain-specific data (prices, stats, etc.)
+            recent_price_change: Price change in last 24h
+            overreaction_info: Info about potential market overreaction
             
         Returns:
             AISignalResult with signal or error
@@ -243,7 +252,7 @@ class AISignalGenerator:
         start_time = time.monotonic()
         self._total_calls += 1
         
-        # Build the prompt
+        # Build the prompt with intelligence data
         prompt = self._build_prompt(
             market_question=market_question,
             current_price=current_price,
@@ -254,6 +263,10 @@ class AISignalGenerator:
             liquidity=liquidity,
             recent_price_path=recent_price_path,
             depth_summary=depth_summary,
+            news_summary=news_summary,
+            domain_summary=domain_summary,
+            recent_price_change=recent_price_change,
+            overreaction_info=overreaction_info,
         )
         
         # Try to get a valid response
@@ -329,11 +342,19 @@ class AISignalGenerator:
         liquidity: float,
         recent_price_path: Optional[list[float]],
         depth_summary: Optional[str],
+        news_summary: Optional[str] = None,
+        domain_summary: Optional[str] = None,
+        recent_price_change: float = 0.0,
+        overreaction_info: Optional[str] = None,
     ) -> str:
         """Build the user prompt for the AI.
         
         Args:
             ... market data fields
+            news_summary: Recent news about this topic
+            domain_summary: Domain-specific data
+            recent_price_change: 24h price change
+            overreaction_info: Overreaction detection info
             
         Returns:
             Formatted prompt string
@@ -351,6 +372,29 @@ class AISignalGenerator:
             delta = resolution_date - datetime.utcnow()
             days_remaining = f"{delta.days} days, {delta.seconds // 3600} hours"
         
+        # Format price change
+        price_change_str = f"{recent_price_change:+.1%}" if recent_price_change != 0 else "N/A"
+        
+        # Build intelligence section
+        intelligence_section = ""
+        if news_summary or domain_summary:
+            intelligence_section = "\n=== CURRENT INTELLIGENCE (USE THIS!) ===\n"
+            if news_summary:
+                intelligence_section += f"RECENT NEWS:\n{news_summary}\n\n"
+            if domain_summary:
+                intelligence_section += f"DOMAIN DATA:\n{domain_summary}\n"
+            intelligence_section += "\nIMPORTANT: The above intelligence may contain information NOT yet priced into the market. Use it!\n"
+        
+        # Build overreaction section
+        overreaction_section = ""
+        if overreaction_info:
+            overreaction_section = f"""
+=== MARKET DYNAMICS ALERT ===
+{overreaction_info}
+
+CONSIDER: Large recent price moves often overshoot. If your analysis contradicts the move, this could be an opportunity.
+"""
+        
         prompt = f"""MARKET ANALYSIS REQUEST
 
 === MARKET QUESTION ===
@@ -364,6 +408,7 @@ Current Price: {current_price:.4f} ({current_price*100:.1f}%)
 Bid-Ask Spread: {spread:.4f} ({spread*100:.2f}%)
 24h Volume: ${volume_24h:,.0f}
 Liquidity: ${liquidity:,.0f}
+24h Price Change: {price_change_str}
 
 === TIMING ===
 Resolution Date: {resolution_str}
@@ -374,16 +419,21 @@ Time Remaining: {days_remaining}
 
 === ORDERBOOK DEPTH ===
 {depth_summary or 'Not available'}
-
+{intelligence_section}{overreaction_section}
 === YOUR TASK ===
 Estimate the TRUE probability that this market resolves YES.
 
+CRITICAL - INFORMATION ADVANTAGE:
+- You have been given CURRENT NEWS and DATA above that other traders may not have processed yet
+- This intelligence may reveal information the market hasn't fully priced in
+- Look for discrepancies between the news/data and the current market price
+- If the intelligence strongly contradicts the market price, be willing to diverge from it
+
 REMINDERS:
 - Your probability must be base-rate aware
-- Avoid narrative overreaction
-- Penalize weak evidence
-- The market price ({current_price:.1%}) may be wrong - that's what we're checking
-- If information quality is low, confidence should be low
+- Avoid narrative overreaction (but news IS useful signal)
+- The market price ({current_price:.1%}) may be WRONG - that's what we're checking
+- If you have strong intelligence that contradicts the market, USE IT
 - Extreme probabilities (>90% or <10%) require extreme evidence
 
 Respond with ONLY a valid JSON object. No other text."""
