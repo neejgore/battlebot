@@ -459,122 +459,42 @@ class KalshiBattleBot:
             await asyncio.sleep(900)  # Refresh every 15 minutes (markets don't change rapidly)
     
     async def _fetch_markets(self):
-        """Fetch ALL useful markets from Kalshi - no artificial limits.
+        """Fetch ALL markets from Kalshi using fast paginated fetch.
         
-        Strategy:
-        1. Discover all series ONCE and cache target categories
-        2. Fetch markets from cached target series (politics, economics, etc.)
-        3. Also fetch general non-MVE markets with full pagination
-        4. Deduplicate and sort by liquidity
+        Strategy: Single paginated fetch gets ALL markets (~20 API calls, ~2 min)
+        No need to iterate through 4000+ series individually.
         """
         try:
             all_markets = []
             
-            # Categories we want (excludes Sports, Entertainment, Mentions, Social)
-            target_categories = [
-                'Politics', 'Economics', 'Financials', 'Elections', 
-                'Climate and Weather', 'Science and Technology', 
-                'Health', 'World', 'Companies', 'Crypto', 'Transportation', 'Education'
-            ]
-            
-            # STEP 1: Discover series (only on first run, then use cache)
-            if not self._target_series:
-                try:
-                    series_response = await self._kalshi.get_series_list()
-                    all_series = series_response.get('series', [])
-                    print(f"[Discovery] Found {len(all_series)} total series on Kalshi")
-                    
-                    # Count by category
-                    by_category = {}
-                    for s in all_series:
-                        cat = s.get('category', 'Unknown')
-                        by_category[cat] = by_category.get(cat, 0) + 1
-                        
-                        # Collect target series tickers
-                        if cat in target_categories:
-                            ticker = s.get('ticker')
-                            if ticker:
-                                self._target_series.append(ticker)
-                    
-                    print(f"[Categories]")
-                    for cat, count in sorted(by_category.items(), key=lambda x: -x[1]):
-                        marker = " <-- TARGET" if cat in target_categories else ""
-                        print(f"  {cat}: {count}{marker}")
-                    
-                    print(f"[Target Series] {len(self._target_series)} series in target categories (cached for future refreshes)")
-                    
-                except Exception as e:
-                    print(f"[Discovery Error] {e}")
-            else:
-                print(f"[Refresh] Using cached {len(self._target_series)} target series")
-            
-            # STEP 2: Fetch markets from target series
-            if self._target_series:
-                print(f"[Fetching] Markets from {len(self._target_series)} target series...")
-                series_with_markets = 0
-                total_from_series = 0
-                
-                for i, series_ticker in enumerate(self._target_series):
-                    try:
-                        # Rate limiting - brief pause between calls
-                        if i > 0 and i % 10 == 0:
-                            await asyncio.sleep(0.5)
-                        else:
-                            await asyncio.sleep(0.1)
-                        
-                        result = await self._kalshi.get_markets(
-                            status='open',
-                            series_ticker=series_ticker,
-                            limit=200
-                        )
-                        markets = result.get('markets', [])
-                        if markets:
-                            series_with_markets += 1
-                            total_from_series += len(markets)
-                            all_markets.extend(markets)
-                            
-                    except Exception as e:
-                        if '429' in str(e):
-                            print(f"[Rate Limited] Pausing for 3 seconds...")
-                            await asyncio.sleep(3)
-                        continue
-                    
-                    # Progress update every 100 series
-                    if (i + 1) % 100 == 0:
-                        print(f"[Progress] {i + 1}/{len(self._target_series)} series checked, {total_from_series} markets found")
-                
-                print(f"[Series Fetch Complete] {series_with_markets} series had open markets, {total_from_series} total")
-            
-            # STEP 3: Paginated general fetch - get ALL non-MVE markets
-            print(f"[General Fetch] Fetching all non-MVE markets with pagination...")
+            # Single paginated fetch - gets ALL open markets
+            print(f"[Fetching] All open markets with pagination...")
             cursor = None
             pages_fetched = 0
-            total_general = 0
             
             while True:
                 try:
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.2)  # Rate limiting
                     result = await self._kalshi.get_markets(
                         status='open',
                         limit=1000,  # Max per page
                         cursor=cursor,
-                        exclude_mve=True
                     )
-                    general = result.get('markets', [])
-                    if not general:
+                    markets = result.get('markets', [])
+                    if not markets:
                         break
                         
-                    all_markets.extend(general)
-                    total_general += len(general)
+                    all_markets.extend(markets)
                     pages_fetched += 1
+                    print(f"[Progress] Page {pages_fetched}: {len(all_markets)} markets total")
                     
                     cursor = result.get('cursor')
                     if not cursor:
                         break
                         
-                    # Safety limit - don't fetch forever
-                    if pages_fetched >= 20:
-                        print(f"[General Fetch] Reached page limit")
+                    # Safety limit
+                    if pages_fetched >= 50:
+                        print(f"[Fetch] Reached page limit (50)")
                         break
                         
                 except Exception as e:
@@ -582,12 +502,12 @@ class KalshiBattleBot:
                         print(f"[Rate Limited] Pausing for 3 seconds...")
                         await asyncio.sleep(3)
                         continue
-                    print(f"[General fetch error] {e}")
+                    print(f"[Fetch error] {e}")
                     break
             
-            print(f"[General Fetch Complete] {total_general} markets from {pages_fetched} pages")
+            print(f"[Fetch Complete] {len(all_markets)} markets from {pages_fetched} pages")
             
-            # STEP 4: Deduplicate by ticker
+            # Deduplicate by ticker (pagination may have overlap)
             seen = set()
             unique_markets = []
             for m in all_markets:
