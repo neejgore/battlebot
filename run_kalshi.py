@@ -432,13 +432,6 @@ class KalshiBattleBot:
                         await asyncio.sleep(2)
                     break
             
-            # Debug: print raw fields from first market to see what Kalshi returns
-            if all_markets:
-                sample = all_markets[0]
-                vol_fields = {k: v for k, v in sample.items() if 'vol' in k.lower() or 'interest' in k.lower() or 'liquidity' in k.lower()}
-                print(f"[Debug] Raw volume fields: {vol_fields}")
-                print(f"[Debug] All fields: {list(sample.keys())}")
-            
             # Sort ALL markets by volume (most liquid first)
             all_markets.sort(key=lambda x: x.get('volume', 0) or 0, reverse=True)
             
@@ -521,7 +514,7 @@ class KalshiBattleBot:
             # Minimum volume filter - require real liquidity
             # Use total volume, not just 24h (more stable indicator)
             volume = m.get('volume', 0) or m.get('volume_24h', 0) or 0
-            min_vol = int(os.getenv('MIN_VOLUME', '1000'))  # Default $1000 minimum
+            min_vol = int(os.getenv('MIN_VOLUME', '100'))  # Default $100 minimum
             if volume < min_vol:
                 rejection_counts['low_volume'] += 1
                 continue
