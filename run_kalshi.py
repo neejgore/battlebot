@@ -432,6 +432,13 @@ class KalshiBattleBot:
                         await asyncio.sleep(2)
                     break
             
+            # Debug: print raw fields from first market to see what Kalshi returns
+            if all_markets:
+                sample = all_markets[0]
+                vol_fields = {k: v for k, v in sample.items() if 'vol' in k.lower() or 'interest' in k.lower() or 'liquidity' in k.lower()}
+                print(f"[Debug] Raw volume fields: {vol_fields}")
+                print(f"[Debug] All fields: {list(sample.keys())}")
+            
             # Sort ALL markets by volume (most liquid first)
             all_markets.sort(key=lambda x: x.get('volume', 0) or 0, reverse=True)
             
