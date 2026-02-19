@@ -378,13 +378,40 @@ class KalshiBattleBot:
             await asyncio.sleep(60)  # Refresh every minute
     
     async def _fetch_markets(self):
-        """Fetch open markets from Kalshi."""
+        """Fetch open markets from Kalshi across all categories.
+        
+        Uses pagination to get comprehensive market coverage while
+        filtering out low-liquidity sports combo markets.
+        """
         try:
-            result = await self._kalshi.get_markets(status='open', limit=100)
-            markets = result.get('markets', [])
+            all_markets = []
+            cursor = None
+            pages_fetched = 0
+            max_pages = 10  # Fetch up to 1000 markets (10 pages x 100)
             
+            # Paginate through all open markets
+            while pages_fetched < max_pages:
+                result = await self._kalshi.get_markets(
+                    status='open', 
+                    limit=100,
+                    cursor=cursor
+                )
+                markets = result.get('markets', [])
+                if not markets:
+                    break
+                    
+                all_markets.extend(markets)
+                cursor = result.get('cursor')
+                pages_fetched += 1
+                
+                if not cursor:
+                    break
+            
+            # Process and filter markets
             skipped_combos = 0
-            for m in markets:
+            category_counts = {}
+            
+            for m in all_markets:
                 try:
                     ticker = m.get('ticker', '').upper()
                     
@@ -396,11 +423,18 @@ class KalshiBattleBot:
                     market = parse_kalshi_market(m)
                     if market['id']:
                         self._markets[market['id']] = market
+                        
+                        # Track categories for logging
+                        category = m.get('category', 'unknown')
+                        category_counts[category] = category_counts.get(category, 0) + 1
                 except Exception as e:
                     continue
             
             added = len(self._markets)
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetched {added} markets (skipped {skipped_combos} sports combos)")
+            categories_str = ', '.join(f"{k}:{v}" for k, v in sorted(category_counts.items()))
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetched {added} markets (skipped {skipped_combos} combos)")
+            if categories_str:
+                print(f"[Categories] {categories_str}")
         except Exception as e:
             print(f"[Kalshi API Error] {e}")
     

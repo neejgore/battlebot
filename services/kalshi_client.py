@@ -173,10 +173,23 @@ class KalshiClient:
     
     async def get_events(self, 
                         status: str = "open",
-                        limit: int = 100) -> dict:
-        """Fetch events (series of related markets)."""
+                        limit: int = 100,
+                        series_ticker: Optional[str] = None,
+                        cursor: Optional[str] = None) -> dict:
+        """Fetch events (series of related markets).
+        
+        Args:
+            status: Event status (open, closed, settled)
+            limit: Max results per page
+            series_ticker: Filter by series ticker (e.g., 'PRES' for politics)
+            cursor: Pagination cursor
+        """
         path = "/events"
         params = {'status': status, 'limit': limit}
+        if series_ticker:
+            params['series_ticker'] = series_ticker
+        if cursor:
+            params['cursor'] = cursor
         
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
