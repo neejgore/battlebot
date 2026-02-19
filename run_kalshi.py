@@ -650,18 +650,21 @@ class KalshiBattleBot:
                     print(f"[Order] Size ${size:.2f} too small for 1 contract at {int(entry_price*100)}¢")
                     return
                 
-                # Price in cents for Kalshi API
-                price_cents = int(entry_price * 100)
+                # Aggressive pricing: pay 2¢ more than mid-market for faster fills
+                # This reduces edge slightly but dramatically improves fill rate
+                aggression_cents = int(os.getenv('LIMIT_AGGRESSION_CENTS', '2'))
+                base_price_cents = int(entry_price * 100)
+                aggressive_price_cents = min(base_price_cents + aggression_cents, 99)  # Cap at 99¢
                 
                 result = await self._kalshi.place_order(
                     ticker=market_id,
                     side=side.lower(),  # 'yes' or 'no'
                     count=contracts,
-                    price=price_cents,
+                    price=aggressive_price_cents,
                     order_type='limit',
                 )
                 order_id = result.get('order', {}).get('order_id')
-                print(f"[LIVE ORDER] Placed: {contracts} {side} contracts @ {price_cents}¢ | Order ID: {order_id}")
+                print(f"[LIVE ORDER] Placed: {contracts} {side} @ {aggressive_price_cents}¢ (mid: {base_price_cents}¢) | Order ID: {order_id}")
             except Exception as e:
                 print(f"[Order Error] Failed to place order on Kalshi: {e}")
                 return  # Don't record if order failed
@@ -816,15 +819,19 @@ class KalshiBattleBot:
             try:
                 contracts = position.get('contracts', 0)
                 if contracts > 0:
-                    price_cents = int(exit_price * 100)
+                    # Aggressive exit: accept 2¢ less than mid-market for faster fills
+                    aggression_cents = int(os.getenv('LIMIT_AGGRESSION_CENTS', '2'))
+                    base_price_cents = int(exit_price * 100)
+                    aggressive_price_cents = max(base_price_cents - aggression_cents, 1)  # Floor at 1¢
+                    
                     result = await self._kalshi.sell_position(
                         ticker=position['market_id'],
                         side=position['side'].lower(),
                         count=contracts,
-                        price=price_cents,
+                        price=aggressive_price_cents,
                     )
                     exit_order_id = result.get('order', {}).get('order_id')
-                    print(f"[LIVE SELL ORDER] Placed: {contracts} {position['side']} @ {price_cents}¢ | Order ID: {exit_order_id}")
+                    print(f"[LIVE SELL ORDER] Placed: {contracts} {position['side']} @ {aggressive_price_cents}¢ (mid: {base_price_cents}¢) | Order ID: {exit_order_id}")
                     
                     # Track as pending exit - don't remove position until sell fills
                     position['pending_exit'] = {
