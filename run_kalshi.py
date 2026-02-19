@@ -520,6 +520,7 @@ class KalshiBattleBot:
         
         if should_trade:
             # Calculate position size (async with proper params)
+            print(f"[Debug] Calculating size: prob={trade_prob:.2f}, price={trade_price:.2f}, edge={edge:.2f}, conf={signal.confidence:.2f}")
             position_size = await self._risk_engine.calculate_position_size(
                 adjusted_prob=trade_prob,
                 market_price=trade_price,
@@ -527,14 +528,15 @@ class KalshiBattleBot:
                 confidence=signal.confidence,
                 market_id=market_id,
             )
+            print(f"[Debug] Position size: ${position_size:.2f}")
             
             if position_size > 0:
                 await self._enter_position(market, side, position_size, adjusted_prob, edge, signal.confidence)
                 print(f"[AI] {question}... | ✓ TRADE | Edge: +{edge*100:.1f}% | Conf: {signal.confidence*100:.0f}%")
             else:
-                print(f"[AI] {question}... | ✗ SKIP | Size: $0")
+                print(f"[AI] {question}... | ✗ SKIP | Size: $0 (edge={edge:.2%}, conf={signal.confidence:.2%})")
         else:
-            print(f"[AI] {question}... | ✗ SKIP | Edge: +{edge*100:.1f}%")
+            print(f"[AI] {question}... | ✗ SKIP | {', '.join(reasons)}")
         
         await self._broadcast_update()
     
