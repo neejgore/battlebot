@@ -519,11 +519,13 @@ class KalshiBattleBot:
         self._analyses[0]['reason'] = ', '.join(reasons) if reasons else 'CRITERIA_MET'
         
         if should_trade:
-            # Calculate position size
-            position_size = self._risk_engine.calculate_position_size(
+            # Calculate position size (async with proper params)
+            position_size = await self._risk_engine.calculate_position_size(
+                adjusted_prob=trade_prob,
+                market_price=trade_price,
                 edge=edge,
-                probability=trade_prob,
-                price=trade_price,
+                confidence=signal.confidence,
+                market_id=market_id,
             )
             
             if position_size > 0:
