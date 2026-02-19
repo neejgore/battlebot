@@ -399,62 +399,39 @@ class KalshiBattleBot:
             await asyncio.sleep(60)  # Refresh every minute
     
     async def _fetch_markets(self):
-        """Fetch open markets from Kalshi - target high-volume political/economic markets.
+        """Fetch open markets from Kalshi - get highest volume markets.
         
-        Strategy: Fetch from specific high-value event series, not just default listing.
+        Strategy: Fetch ALL markets (limit 1000), sort by volume, trade the liquid ones.
+        Sports = 85% of volume, so don't filter them out.
         """
         try:
             all_markets = []
+            cursor = None
+            pages_fetched = 0
+            max_pages = 3  # 3 pages x 1000 = 3000 markets
             
-            # Target series for politics, economics, climate - where the real volume is
-            target_series = [
-                'KXFEDCHAIR',      # Fed Chair nomination
-                'KXTRUMP',         # Trump-related
-                'KXDEM',           # Democratic primaries
-                'KXGOP',           # Republican primaries  
-                'KXPRES',          # Presidential
-                'KXCONGRESS',      # Congress
-                'KXSHUTDOWN',      # Government shutdown
-                'KXINFLATION',     # Inflation
-                'KXGDP',           # GDP
-                'KXUNEMPLOYMENT',  # Unemployment
-                'KXSNOW',          # Weather - snow
-                'KXRAIN',          # Weather - rain
-                'KXHURRICANE',     # Weather - hurricanes
-                'KXSUPREME',       # Supreme Court
-                'KXBIDEN',         # Biden-related
-            ]
-            
-            # Fetch from each target series
-            for series in target_series:
+            while pages_fetched < max_pages:
                 try:
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.3)
                     result = await self._kalshi.get_markets(
                         status='open',
-                        series_ticker=series,
-                        limit=50
+                        limit=1000,  # Max allowed
+                        cursor=cursor
                     )
                     markets = result.get('markets', [])
+                    if not markets:
+                        break
                     all_markets.extend(markets)
+                    cursor = result.get('cursor')
+                    pages_fetched += 1
+                    if not cursor:
+                        break
                 except Exception as e:
-                    continue
+                    if '429' in str(e):
+                        await asyncio.sleep(2)
+                    break
             
-            # Also fetch general markets (excluding MVE) for diversity
-            try:
-                result = await self._kalshi.get_markets(
-                    status='open',
-                    limit=100,
-                    exclude_mve=True
-                )
-                all_markets.extend(result.get('markets', []))
-            except:
-                pass
-            
-            print(f"[Fetched] {len(all_markets)} markets from targeted series")
-            
-            # Log sample
-            sample_tickers = [m.get('ticker', '')[:40] for m in all_markets[:10]]
-            print(f"[Sample] {sample_tickers[:5]}")
+            print(f"[Fetched] {len(all_markets)} total markets")
             
             # Sort ALL markets by volume (most liquid first)
             all_markets.sort(key=lambda x: x.get('volume', 0) or 0, reverse=True)
