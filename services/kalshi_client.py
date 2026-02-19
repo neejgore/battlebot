@@ -367,12 +367,30 @@ def parse_kalshi_market(market: dict) -> dict:
     # Liquidity estimate from open interest
     liquidity = market.get('open_interest', 0) * yes_price
     
+    # Build resolution rules from available fields
+    # Kalshi uses different fields depending on market type
+    rules = (
+        market.get('rules_primary', '') or 
+        market.get('rules_secondary', '') or
+        market.get('subtitle', '') or
+        market.get('settlement_source_url', '') or
+        ''
+    )
+    
+    # For sports/event markets without explicit rules, create synthetic rules
+    title = market.get('title', '')
+    if not rules and title:
+        # Generate rules from the market structure
+        rules = f"Market resolves YES if '{title}' occurs. Market resolves NO otherwise. Settlement based on official results."
+    
+    description = market.get('subtitle', '') or market.get('rules_primary', '') or title
+    
     return {
         'id': market.get('ticker', ''),
         'token_id': market.get('ticker', ''),
-        'question': market.get('title', ''),
-        'description': market.get('rules_primary', '') or market.get('subtitle', ''),
-        'rules': market.get('rules_primary', ''),
+        'question': title,
+        'description': description,
+        'rules': rules,
         'price': yes_price,
         'price_pct': int(yes_price * 100),
         'spread': spread,
