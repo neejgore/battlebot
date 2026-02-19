@@ -519,7 +519,7 @@ class KalshiBattleBot:
         
         # Max days to resolution - political/economic markets often have longer timeframes
         # Default 180 days (6 months) to capture most active markets
-        max_days = int(os.getenv('MAX_DAYS_TO_RESOLUTION', '180'))
+        max_days = int(os.getenv('MAX_DAYS_TO_RESOLUTION', '365'))
         
         for m in self._markets.values():
             # Must have end date
