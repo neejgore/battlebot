@@ -395,13 +395,42 @@ class KalshiBattleBot:
         except Exception as e:
             print(f"[Kalshi API Error] {e}")
     
+    def _is_combo_market(self, market: dict) -> bool:
+        """Detect multi-leg combo markets that have poor liquidity.
+        
+        These are markets like "Team A AND Team B AND Team C all win"
+        which have very few traders.
+        """
+        title = market.get('question', '') or market.get('id', '')
+        
+        # Count commas - combo markets list multiple teams/events
+        comma_count = title.count(',')
+        if comma_count >= 3:  # 4+ items = likely combo
+            return True
+        
+        # Check for multi-game indicators in the ticker
+        ticker = market.get('id', '').upper()
+        if 'MULTIGAME' in ticker or 'MULTI' in ticker:
+            return True
+        
+        # Check for "and" patterns suggesting multiple conditions
+        title_lower = title.lower()
+        if title_lower.count(' and ') >= 2:
+            return True
+        
+        return False
+    
     async def _select_markets(self):
         """Filter markets using eligibility criteria."""
         eligible = []
         rejection_counts = {
             'no_end_date': 0, 'too_far_out': 0, 'low_volume': 0,
             'wide_spread': 0, 'extreme_price': 0, 'low_liquidity': 0,
+            'combo_market': 0,
         }
+        
+        # Minimum volume threshold - only trade markets with real activity
+        min_volume = float(os.getenv('MIN_VOLUME_24H', '100'))
         
         for m in self._markets.values():
             # Must have end date
@@ -421,6 +450,17 @@ class KalshiBattleBot:
             except:
                 pass
             
+            # Skip combo/multi-leg markets - they have no liquidity
+            if self._is_combo_market(m):
+                rejection_counts['combo_market'] += 1
+                continue
+            
+            # Minimum volume filter - need real trading activity
+            volume = m.get('volume_24h', 0) or 0
+            if volume < min_volume:
+                rejection_counts['low_volume'] += 1
+                continue
+            
             # Spread check (≤4 cents)
             if m.get('spread', 0.04) > 0.04:
                 rejection_counts['wide_spread'] += 1
@@ -434,7 +474,7 @@ class KalshiBattleBot:
             
             eligible.append(m)
         
-        # Take top 15 by volume
+        # Take top 15 by volume (most liquid markets)
         eligible.sort(key=lambda x: x.get('volume_24h', 0), reverse=True)
         self._monitored = {m['id']: m for m in eligible[:15]}
         
@@ -650,9 +690,9 @@ class KalshiBattleBot:
                     print(f"[Order] Size ${size:.2f} too small for 1 contract at {int(entry_price*100)}¢")
                     return
                 
-                # Aggressive pricing: pay 2¢ more than mid-market for faster fills
+                # Aggressive pricing: pay 4¢ more than mid-market for faster fills
                 # This reduces edge slightly but dramatically improves fill rate
-                aggression_cents = int(os.getenv('LIMIT_AGGRESSION_CENTS', '2'))
+                aggression_cents = int(os.getenv('LIMIT_AGGRESSION_CENTS', '4'))
                 base_price_cents = int(entry_price * 100)
                 aggressive_price_cents = min(base_price_cents + aggression_cents, 99)  # Cap at 99¢
                 
@@ -819,8 +859,8 @@ class KalshiBattleBot:
             try:
                 contracts = position.get('contracts', 0)
                 if contracts > 0:
-                    # Aggressive exit: accept 2¢ less than mid-market for faster fills
-                    aggression_cents = int(os.getenv('LIMIT_AGGRESSION_CENTS', '2'))
+                    # Aggressive exit: accept 4¢ less than mid-market for faster fills
+                    aggression_cents = int(os.getenv('LIMIT_AGGRESSION_CENTS', '4'))
                     base_price_cents = int(exit_price * 100)
                     aggressive_price_cents = max(base_price_cents - aggression_cents, 1)  # Floor at 1¢
                     
