@@ -263,6 +263,122 @@ class KalshiBattleBot:
         self._save_state()
         print(f"[Startup] Sync complete: {filled} filled, {canceled} canceled, {still_pending} still pending")
     
+    async def _sync_positions_with_kalshi(self):
+        """Sync internal positions with Kalshi's actual positions.
+        
+        This ensures the bot's state matches reality by:
+        1. Fetching actual positions from Kalshi API
+        2. Removing phantom positions that don't exist on Kalshi
+        3. Adding any positions that exist on Kalshi but not in bot state
+        4. Updating entry prices to match Kalshi's records
+        """
+        print("[Sync] Fetching actual positions from Kalshi...")
+        
+        try:
+            result = await self._kalshi.get_positions()
+            kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
+            
+            if not kalshi_positions:
+                print("[Sync] No positions found on Kalshi")
+                if self._positions:
+                    print(f"[Sync] WARNING: Bot has {len(self._positions)} phantom positions - clearing them")
+                    self._positions.clear()
+                    self._save_state()
+                return
+            
+            print(f"[Sync] Found {len(kalshi_positions)} positions on Kalshi")
+            
+            # Build a map of Kalshi positions by ticker
+            kalshi_by_ticker = {}
+            for kp in kalshi_positions:
+                ticker = kp.get('ticker', kp.get('market_ticker', ''))
+                if ticker:
+                    kalshi_by_ticker[ticker] = kp
+            
+            # Check for phantom positions (in bot but not on Kalshi)
+            phantom_count = 0
+            for pos_id in list(self._positions.keys()):
+                pos = self._positions[pos_id]
+                market_id = pos.get('market_id', '')
+                
+                if market_id not in kalshi_by_ticker:
+                    print(f"[Sync] Removing phantom position: {pos.get('question', '')[:40]}...")
+                    self._positions.pop(pos_id)
+                    phantom_count += 1
+            
+            if phantom_count:
+                print(f"[Sync] Removed {phantom_count} phantom positions")
+            
+            # Check for missing positions (on Kalshi but not in bot)
+            # and update entry prices for existing positions
+            existing_tickers = {p.get('market_id') for p in self._positions.values()}
+            added_count = 0
+            updated_count = 0
+            
+            for ticker, kp in kalshi_by_ticker.items():
+                position_count = kp.get('position', 0)
+                if position_count == 0:
+                    continue  # No actual position
+                
+                # Get the actual entry price from Kalshi
+                # Kalshi returns prices in cents
+                avg_price_cents = kp.get('average_entry_price', 0) or kp.get('average_execution_price', 0)
+                if avg_price_cents > 1:  # Likely in cents
+                    entry_price = avg_price_cents / 100
+                else:
+                    entry_price = avg_price_cents or 0.5  # Fallback
+                
+                # Determine side from position count
+                side = 'YES' if position_count > 0 else 'NO'
+                contracts = abs(position_count)
+                
+                if ticker not in existing_tickers:
+                    # Add missing position
+                    pos_id = f"pos_kalshi_{ticker[:20]}_{int(datetime.utcnow().timestamp())}"
+                    question = kp.get('title', kp.get('market_title', ticker))
+                    
+                    self._positions[pos_id] = {
+                        'id': pos_id,
+                        'market_id': ticker,
+                        'question': question,
+                        'side': side,
+                        'size': contracts * entry_price,
+                        'entry_price': entry_price,
+                        'current_price': entry_price,
+                        'contracts': contracts,
+                        'ai_probability': 0.5,
+                        'edge': 0,
+                        'confidence': 0.5,
+                        'entry_time': datetime.utcnow().isoformat(),
+                        'unrealized_pnl': 0.0,
+                        'synced_from_kalshi': True,
+                    }
+                    print(f"[Sync] Added position from Kalshi: {side} {contracts} @ {entry_price*100:.0f}¢ | {question[:40]}...")
+                    added_count += 1
+                else:
+                    # Update existing position with correct entry price
+                    for pos_id, pos in self._positions.items():
+                        if pos.get('market_id') == ticker:
+                            old_price = pos.get('entry_price', 0)
+                            if abs(old_price - entry_price) > 0.01:  # Significant difference
+                                print(f"[Sync] Updating entry price: {old_price*100:.0f}¢ → {entry_price*100:.0f}¢ | {pos.get('question', '')[:40]}...")
+                                pos['entry_price'] = entry_price
+                                pos['contracts'] = contracts
+                                pos['size'] = contracts * entry_price
+                                updated_count += 1
+                            break
+            
+            if added_count or updated_count or phantom_count:
+                self._save_state()
+                print(f"[Sync] Complete: {added_count} added, {updated_count} updated, {phantom_count} removed")
+            else:
+                print("[Sync] Positions already in sync with Kalshi")
+                
+        except Exception as e:
+            print(f"[Sync] Error syncing with Kalshi: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def _get_stats(self) -> dict:
         """Calculate all stats from current state."""
         # Filled positions
@@ -440,6 +556,10 @@ class KalshiBattleBot:
         if not self.dry_run and self._pending_orders:
             print(f"[Startup] Checking {len(self._pending_orders)} pending orders from previous session...")
             await self._sync_pending_orders_on_startup()
+        
+        # Sync positions with Kalshi to ensure accuracy (LIVE mode only)
+        if not self.dry_run:
+            await self._sync_positions_with_kalshi()
         
         # Start background tasks
         asyncio.create_task(self._market_loop())
