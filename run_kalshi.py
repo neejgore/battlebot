@@ -433,8 +433,8 @@ class KalshiBattleBot:
             
             print(f"[Fetched] {len(all_markets)} total markets")
             
-            # Sort ALL markets by volume (most liquid first)
-            all_markets.sort(key=lambda x: x.get('volume', 0) or 0, reverse=True)
+            # Sort by open interest (better for holding positions to resolution)
+            all_markets.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
             
             # Log top volume markets - check both volume and open_interest
             top_5 = all_markets[:5]
@@ -491,7 +491,7 @@ class KalshiBattleBot:
         """Filter markets using eligibility criteria."""
         eligible = []
         rejection_counts = {
-            'no_end_date': 0, 'too_far_out': 0, 'low_volume': 0,
+            'no_end_date': 0, 'too_far_out': 0, 'low_oi': 0,
             'wide_spread': 0, 'extreme_price': 0, 'low_liquidity': 0,
             'combo_market': 0,
         }
@@ -522,12 +522,12 @@ class KalshiBattleBot:
             except:
                 pass
             
-            # Minimum volume filter - require real liquidity
-            # Use total volume, not just 24h (more stable indicator)
-            volume = m.get('volume', 0) or m.get('volume_24h', 0) or 0
-            min_vol = int(os.getenv('MIN_VOLUME', '100'))  # Default $100 minimum
-            if volume < min_vol:
-                rejection_counts['low_volume'] += 1
+            # Minimum open interest filter - require real liquidity
+            # OI = committed capital, better than volume for holding positions
+            oi = m.get('open_interest', 0) or 0
+            min_oi = int(os.getenv('MIN_OPEN_INTEREST', '100'))  # Default 100 contracts
+            if oi < min_oi:
+                rejection_counts['low_oi'] += 1
                 continue
             
             # Spread check - configurable, default 6 cents
@@ -544,8 +544,8 @@ class KalshiBattleBot:
             
             eligible.append(m)
         
-        # Take top 15 by volume (most liquid markets)
-        eligible.sort(key=lambda x: x.get('volume', 0) or x.get('volume_24h', 0) or 0, reverse=True)
+        # Take top 15 by open interest (most liquid markets)
+        eligible.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         self._monitored = {m['id']: m for m in eligible[:15]}
         
         # Log top monitored markets
