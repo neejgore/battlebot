@@ -131,7 +131,8 @@ class KalshiClient:
                          status: str = "open",
                          series_ticker: Optional[str] = None,
                          limit: int = 100,
-                         cursor: Optional[str] = None) -> dict:
+                         cursor: Optional[str] = None,
+                         exclude_mve: bool = False) -> dict:
         """Fetch markets from Kalshi.
         
         Args:
@@ -139,6 +140,7 @@ class KalshiClient:
             series_ticker: Filter by series/event ticker
             limit: Max results to return
             cursor: Pagination cursor
+            exclude_mve: If True, exclude multivariate (sports combo) markets
             
         Returns:
             Dict with 'markets' list and 'cursor' for pagination
@@ -149,6 +151,8 @@ class KalshiClient:
             params['series_ticker'] = series_ticker
         if cursor:
             params['cursor'] = cursor
+        if exclude_mve:
+            params['mve_filter'] = 'exclude'
             
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(

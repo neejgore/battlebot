@@ -426,7 +426,8 @@ class KalshiBattleBot:
                     result = await self._kalshi.get_markets(
                         status='open',
                         limit=100,
-                        cursor=cursor
+                        cursor=cursor,
+                        exclude_mve=True  # Exclude sports combo markets
                     )
                     markets = result.get('markets', [])
                     if not markets:
