@@ -1321,6 +1321,9 @@ class KalshiBattleBot:
                         exit_reason = "STOP_LOSS"
                     
                     if should_exit:
+                        # Don't place another sell order if one is already pending
+                        if 'pending_exit' in pos:
+                            continue
                         await self._exit_position(pos_id, current_price, unrealized_pnl, exit_reason)
                 
             except Exception as e:

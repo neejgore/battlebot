@@ -142,7 +142,7 @@ class NewsService:
     ) -> list[NewsItem]:
         """Fetch relevant news for a market question.
         
-        Uses DuckDuckGo instant answers API (no API key needed).
+        Uses DuckDuckGo HTML search for better results on current events.
         """
         # Check cache
         cache_key = f"{question[:50]}:{category}"
@@ -156,50 +156,59 @@ class NewsService:
         news_items = []
         
         try:
-            # Use DuckDuckGo instant answers (free, no API key)
+            # Use DuckDuckGo HTML search (more reliable for news/current events)
             async with httpx.AsyncClient(timeout=10.0) as client:
-                # DDG instant answer API
+                # DDG HTML search - returns actual search results
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
                 response = await client.get(
-                    "https://api.duckduckgo.com/",
-                    params={
-                        "q": query,
-                        "format": "json",
-                        "no_html": 1,
-                        "skip_disambig": 1,
-                    }
+                    "https://html.duckduckgo.com/html/",
+                    params={"q": query},
+                    headers=headers,
+                    follow_redirects=True,
                 )
                 
                 if response.status_code == 200:
-                    data = response.json()
+                    html = response.text
                     
-                    # Extract from abstract
-                    if data.get("Abstract"):
-                        news_items.append(NewsItem(
-                            title=data.get("Heading", "Summary"),
-                            snippet=data["Abstract"][:500],
-                            source=data.get("AbstractSource", "DuckDuckGo"),
-                            url=data.get("AbstractURL", ""),
-                        ))
+                    # Parse search results from HTML
+                    # Look for result snippets between specific markers
+                    import re
                     
-                    # Extract from related topics
-                    for topic in data.get("RelatedTopics", [])[:max_results]:
-                        if isinstance(topic, dict) and topic.get("Text"):
+                    # Extract result blocks
+                    result_pattern = r'<a class="result__a"[^>]*href="([^"]*)"[^>]*>([^<]*)</a>.*?<a class="result__snippet"[^>]*>([^<]*)</a>'
+                    matches = re.findall(result_pattern, html, re.DOTALL)
+                    
+                    for url, title, snippet in matches[:max_results]:
+                        if title and snippet:
+                            # Clean up URL (DDG wraps URLs)
+                            if 'uddg=' in url:
+                                url_match = re.search(r'uddg=([^&]+)', url)
+                                if url_match:
+                                    from urllib.parse import unquote
+                                    url = unquote(url_match.group(1))
+                            
                             news_items.append(NewsItem(
-                                title=topic.get("Text", "")[:100],
-                                snippet=topic.get("Text", "")[:300],
-                                source="DuckDuckGo",
-                                url=topic.get("FirstURL", ""),
+                                title=title.strip()[:100],
+                                snippet=snippet.strip()[:300],
+                                source="Web",
+                                url=url,
                             ))
                     
-                    # Extract from news results if available
-                    for result in data.get("Results", [])[:max_results]:
-                        if isinstance(result, dict):
-                            news_items.append(NewsItem(
-                                title=result.get("Text", "")[:100],
-                                snippet=result.get("Text", "")[:300],
-                                source="DuckDuckGo",
-                                url=result.get("FirstURL", ""),
-                            ))
+                    # Fallback: simpler pattern if above didn't work
+                    if not news_items:
+                        # Try to extract any text snippets
+                        snippet_pattern = r'class="result__snippet"[^>]*>([^<]+)</a>'
+                        snippets = re.findall(snippet_pattern, html)
+                        for i, snippet in enumerate(snippets[:max_results]):
+                            if snippet.strip():
+                                news_items.append(NewsItem(
+                                    title=f"Search Result {i+1}",
+                                    snippet=snippet.strip()[:300],
+                                    source="Web",
+                                    url="",
+                                ))
                 
         except Exception as e:
             logger.warning(f"News fetch failed for '{query[:30]}...': {e}")
