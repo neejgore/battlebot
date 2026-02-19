@@ -599,21 +599,22 @@ class KalshiBattleBot:
         return False
     
     async def _select_markets(self):
-        """Filter markets using eligibility criteria."""
-        eligible = []
+        """Filter markets using eligibility criteria.
+        
+        PRIORITIZES SHORT-TERM MARKETS (1-14 days) for faster feedback,
+        while still including some medium-term markets for diversity.
+        """
+        short_term = []   # 1-14 days to resolution
+        medium_term = []  # 15-365 days to resolution
         rejection_counts = {
             'no_end_date': 0, 'too_far_out': 0, 'low_oi': 0,
             'wide_spread': 0, 'extreme_price': 0, 'low_liquidity': 0,
             'combo_market': 0,
         }
         
-        # Minimum volume threshold - only trade markets with real activity
-        # Set to 0 by default to allow markets through, rely on spread filter
-        min_volume = float(os.getenv('MIN_VOLUME_24H', '0'))
-        
-        # Max days to resolution - political/economic markets often have longer timeframes
-        # Default 180 days (6 months) to capture most active markets
+        # Max days to resolution
         max_days = int(os.getenv('MAX_DAYS_TO_RESOLUTION', '365'))
+        short_term_cutoff = 14  # Days - markets resolving within 2 weeks
         
         for m in self._markets.values():
             # Must have end date
@@ -622,6 +623,7 @@ class KalshiBattleBot:
                 continue
             
             # Time to resolution check
+            days_to_resolution = None
             try:
                 end_date = datetime.fromisoformat(m['end_date'].replace('Z', '+00:00'))
                 days_to_resolution = (end_date.replace(tzinfo=None) - datetime.utcnow()).days
@@ -631,15 +633,13 @@ class KalshiBattleBot:
                 if days_to_resolution < 0:
                     continue
             except:
-                pass
+                continue  # Skip if we can't parse date
             
             # Minimum open interest filter - require real liquidity
-            # OI = committed capital, better than volume for holding positions
             oi = m.get('open_interest', 0) or 0
-            min_oi = int(os.getenv('MIN_OPEN_INTEREST', '10'))  # Default 10 contracts
+            min_oi = int(os.getenv('MIN_OPEN_INTEREST', '10'))
             if oi < min_oi:
                 rejection_counts['low_oi'] += 1
-                # Debug: log first few rejections
                 if rejection_counts['low_oi'] <= 3:
                     print(f"[Debug] Rejected for low_oi: {m.get('ticker', '')[:30]} oi={oi}")
                 continue
@@ -656,18 +656,37 @@ class KalshiBattleBot:
                 rejection_counts['extreme_price'] += 1
                 continue
             
-            eligible.append(m)
+            # Add days_to_resolution to market for sorting
+            m['days_to_resolution'] = days_to_resolution
+            
+            # Categorize by time horizon
+            if days_to_resolution <= short_term_cutoff:
+                short_term.append(m)
+            else:
+                medium_term.append(m)
         
-        # Take top 15 by open interest (most liquid markets)
-        eligible.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
-        self._monitored = {m['id']: m for m in eligible[:15]}
+        # Sort each category by open interest
+        short_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
+        medium_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         
-        # Log top monitored markets
-        if self._monitored:
-            top_3 = list(self._monitored.values())[:3]
-            print(f"[Monitoring] Top 3: {[m.get('question', '')[:30] + '...' for m in top_3]}")
+        # PRIORITIZE SHORT-TERM: Take up to 10 short-term, fill remaining with medium-term
+        selected = short_term[:10] + medium_term[:5]
         
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Market eligibility: {len(eligible)} eligible / {len(self._markets)} total")
+        # Log what we found
+        print(f"[Time Horizon] Short-term (≤14d): {len(short_term)} | Medium-term (15-365d): {len(medium_term)}")
+        if short_term:
+            print(f"[Short-term Top 3]")
+            for m in short_term[:3]:
+                days = m.get('days_to_resolution', '?')
+                oi = m.get('open_interest', 0)
+                q = m.get('question', '')[:50]
+                print(f"  {days}d | oi=${oi:,} | {q}...")
+        
+        self._monitored = {m['id']: m for m in selected}
+        
+        total_eligible = len(short_term) + len(medium_term)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Market eligibility: {total_eligible} eligible / {len(self._markets)} total")
+        print(f"[Monitoring] {len(selected)} markets selected ({len([m for m in selected if m.get('days_to_resolution', 999) <= 14])} short-term)")
         
         if rejection_counts:
             reasons = [f"{k}={v}" for k, v in rejection_counts.items() if v > 0]
