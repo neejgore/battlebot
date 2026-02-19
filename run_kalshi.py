@@ -399,87 +399,59 @@ class KalshiBattleBot:
             await asyncio.sleep(60)  # Refresh every minute
     
     async def _fetch_markets(self):
-        """Fetch open markets from Kalshi across diverse categories.
+        """Fetch open markets from Kalshi - prioritize by volume for liquidity.
         
-        Strategy: Fetch events first to discover available series, then
-        target non-sports series for higher quality markets with liquidity.
+        Strategy: Fetch ALL markets, sort by volume, trade the liquid ones.
+        Volume is the best proxy for liquidity - let it decide, not category filters.
         """
         try:
-            # Step 1: Discover available events/series
-            events_result = await self._kalshi.get_events(status='open', limit=100)
-            events = events_result.get('events', [])
-            
-            # Identify non-sports series tickers (politics, economics, weather, etc.)
-            target_series = set()
-            sports_series = set()
-            
-            for event in events:
-                series_ticker = event.get('series_ticker', '')
-                category = event.get('category', '').lower()
-                title = event.get('title', '').lower()
-                
-                # Skip sports combo series
-                if any(x in series_ticker.upper() for x in ['MULTIGAME', 'MULTILEG', 'KXMVESPORTS']):
-                    sports_series.add(series_ticker)
-                    continue
-                
-                # Skip if category indicates sports combos
-                if 'multi' in category or 'parlay' in category:
-                    sports_series.add(series_ticker)
-                    continue
-                    
-                if series_ticker:
-                    target_series.add(series_ticker)
-            
-            print(f"[Events] Found {len(target_series)} target series, {len(sports_series)} sports combo series")
-            
-            # Step 2: Fetch markets from target series (with rate limiting)
             all_markets = []
-            series_fetched = 0
+            cursor = None
+            pages_fetched = 0
+            max_pages = 5  # Fetch up to 500 markets
             
-            for series_ticker in list(target_series)[:50]:  # Fetch from up to 50 series
+            # Fetch markets with pagination
+            while pages_fetched < max_pages:
                 try:
-                    await asyncio.sleep(0.2)  # Rate limit: 5 req/sec
+                    await asyncio.sleep(0.3)  # Rate limit
                     result = await self._kalshi.get_markets(
                         status='open',
-                        series_ticker=series_ticker,
-                        limit=50
+                        limit=100,
+                        cursor=cursor
                     )
                     markets = result.get('markets', [])
+                    if not markets:
+                        break
                     all_markets.extend(markets)
-                    series_fetched += 1
+                    cursor = result.get('cursor')
+                    pages_fetched += 1
+                    if not cursor:
+                        break
                 except Exception as e:
                     if '429' in str(e):
-                        await asyncio.sleep(2)  # Back off on rate limit
-                    continue
+                        await asyncio.sleep(2)
+                    break
             
-            # Step 3: Also fetch some general markets (first page only, for diversity)
-            try:
-                await asyncio.sleep(0.2)
-                general_result = await self._kalshi.get_markets(status='open', limit=100)
-                general_markets = general_result.get('markets', [])
-                all_markets.extend(general_markets)
-            except Exception as e:
-                pass
+            # Sort ALL markets by volume (most liquid first)
+            all_markets.sort(key=lambda x: x.get('volume', 0) or 0, reverse=True)
             
-            # Step 4: Process and filter markets
-            skipped_combos = 0
+            # Log top volume markets to see where liquidity is
+            top_5 = all_markets[:5]
+            if top_5:
+                print(f"[Top Volume Markets]")
+                for m in top_5:
+                    vol = m.get('volume', 0)
+                    ticker = m.get('ticker', '')[:40]
+                    print(f"  ${vol:,} - {ticker}")
+            
+            # Process markets - NO category filtering, let volume/spread filters decide
             category_counts = {}
             
             for m in all_markets:
                 try:
-                    ticker = m.get('ticker', '').upper()
-                    
-                    # Skip sports combo/multi-game markets
-                    if 'MULTIGAME' in ticker or 'MULTILEG' in ticker or 'KXMVESPORTS' in ticker:
-                        skipped_combos += 1
-                        continue
-                    
                     market = parse_kalshi_market(m)
                     if market['id'] and market['id'] not in self._markets:
                         self._markets[market['id']] = market
-                        
-                        # Track categories for logging
                         category = m.get('category', 'unknown')
                         category_counts[category] = category_counts.get(category, 0) + 1
                 except Exception as e:
@@ -487,7 +459,7 @@ class KalshiBattleBot:
             
             added = len(self._markets)
             categories_str = ', '.join(f"{k}:{v}" for k, v in sorted(category_counts.items()))
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetched {added} markets from {series_fetched} series (skipped {skipped_combos} combos)")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetched {added} markets total")
             if categories_str:
                 print(f"[Categories] {categories_str}")
         except Exception as e:
@@ -539,14 +511,11 @@ class KalshiBattleBot:
             except:
                 pass
             
-            # Skip combo/multi-leg markets - they have no liquidity
-            if self._is_combo_market(m):
-                rejection_counts['combo_market'] += 1
-                continue
-            
-            # Minimum volume filter - need real trading activity
-            volume = m.get('volume_24h', 0) or 0
-            if volume < min_volume:
+            # Minimum volume filter - require real liquidity
+            # Use total volume, not just 24h (more stable indicator)
+            volume = m.get('volume', 0) or m.get('volume_24h', 0) or 0
+            min_vol = int(os.getenv('MIN_VOLUME', '1000'))  # Default $1000 minimum
+            if volume < min_vol:
                 rejection_counts['low_volume'] += 1
                 continue
             
@@ -565,8 +534,13 @@ class KalshiBattleBot:
             eligible.append(m)
         
         # Take top 15 by volume (most liquid markets)
-        eligible.sort(key=lambda x: x.get('volume_24h', 0), reverse=True)
+        eligible.sort(key=lambda x: x.get('volume', 0) or x.get('volume_24h', 0) or 0, reverse=True)
         self._monitored = {m['id']: m for m in eligible[:15]}
+        
+        # Log top monitored markets
+        if self._monitored:
+            top_3 = list(self._monitored.values())[:3]
+            print(f"[Monitoring] Top 3: {[m.get('question', '')[:30] + '...' for m in top_3]}")
         
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Market eligibility: {len(eligible)} eligible / {len(self._markets)} total")
         
