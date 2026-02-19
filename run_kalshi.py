@@ -613,9 +613,9 @@ class KalshiBattleBot:
         rejection_counts = {
             'no_end_date': 0, 'too_far_out': 0, 'low_oi': 0,
             'wide_spread': 0, 'extreme_price': 0, 'low_liquidity': 0,
-            'combo_market': 0,
+            'combo_market': 0, 'no_volume': 0,
         }
-        ultra_short_rejected = {'low_oi': 0, 'wide_spread': 0, 'extreme_price': 0, 'too_close': 0}
+        ultra_short_rejected = {'low_oi': 0, 'wide_spread': 0, 'extreme_price': 0, 'too_close': 0, 'combo': 0, 'no_volume': 0}
         
         max_days = int(os.getenv('MAX_DAYS_TO_RESOLUTION', '365'))
         now = datetime.utcnow()
@@ -679,6 +679,24 @@ class KalshiBattleBot:
                         ultra_short_rejected['too_close'] += 1
                     continue
             except:
+                continue
+            
+            # Filter out MULTIGAME combo/parlay markets - they have no liquidity
+            market_id = m.get('id', '')
+            is_combo = 'MULTIGAME' in market_id.upper() or 'PARLAY' in market_id.upper()
+            if is_combo:
+                rejection_counts['combo_market'] += 1
+                if hours_to_resolution <= 24:
+                    ultra_short_rejected['combo'] += 1
+                continue
+            
+            # Require some trading activity (volume) - markets with 0 volume have no liquidity
+            volume = m.get('volume', 0) or m.get('volume_24h', 0) or 0
+            min_volume = int(os.getenv('MIN_VOLUME', '1'))  # At least 1 contract traded
+            if volume < min_volume:
+                rejection_counts['no_volume'] += 1
+                if hours_to_resolution <= 24:
+                    ultra_short_rejected['no_volume'] += 1
                 continue
             
             # Minimum open interest - lower bar for ultra-short (more forgiving)
@@ -751,8 +769,10 @@ class KalshiBattleBot:
             for m in ultra_short[:5]:
                 hours = m.get('hours_to_resolution', 0)
                 oi = m.get('open_interest', 0)
-                q = m.get('question', '')[:45]
-                print(f"  {hours:.1f}h | oi=${oi:,} | {q}...")
+                vol = m.get('volume', 0) or m.get('volume_24h', 0) or 0
+                ticker = m.get('id', '')[:25]
+                q = m.get('question', '')[:35]
+                print(f"  {hours:.1f}h | oi={oi} vol={vol} | {ticker} | {q}...")
         
         if short_term and not ultra_short:
             print(f"[Short-term Top 3]")
