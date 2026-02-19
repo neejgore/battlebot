@@ -752,22 +752,27 @@ class KalshiBattleBot:
                         current_price = simulated_price
                         market['price'] = simulated_price
                     
-                    # Calculate P&L
+                    # Calculate P&L (based on contracts, not dollar size)
+                    contracts = pos.get('contracts', int(pos['size'] / entry_price) if entry_price > 0 else 0)
                     if side == 'YES':
                         price_change = current_price - entry_price
                     else:
                         price_change = entry_price - current_price
                     
-                    unrealized_pnl = price_change * pos['size']
+                    unrealized_pnl = price_change * contracts
                     pos['current_price'] = current_price
                     pos['unrealized_pnl'] = unrealized_pnl
                     
-                    # Exit conditions
+                    # Exit conditions based on actual position value
+                    # Max gain per contract = 1 - entry_price (for YES) or entry_price (for NO)
+                    # Max loss per contract = entry_price (for YES) or 1 - entry_price (for NO)
                     profit_take_pct = self._risk_limits.profit_take_pct
                     stop_loss_pct = self._risk_limits.stop_loss_pct
                     
-                    profit_target = pos['size'] * profit_take_pct
-                    stop_loss = -pos['size'] * stop_loss_pct
+                    # Calculate profit target and stop loss based on contract cost
+                    cost_basis = contracts * entry_price  # What we paid
+                    profit_target = cost_basis * profit_take_pct
+                    stop_loss = -cost_basis * stop_loss_pct
                     
                     should_exit = False
                     exit_reason = ""
@@ -839,13 +844,16 @@ class KalshiBattleBot:
             except Exception as e:
                 print(f"[DB] Failed to log trade exit: {e}")
         
+        contracts = position.get('contracts', 0)
         trade = {
             'id': pos_id,
             'market_id': position['market_id'],
             'question': position.get('question', ''),
             'action': 'EXIT',
             'side': position['side'],
-            'price': exit_price,
+            'entry_price': position.get('entry_price', 0),
+            'exit_price': exit_price,
+            'contracts': contracts,
             'size': position['size'],
             'pnl': pnl,
             'reason': reason,
@@ -854,7 +862,7 @@ class KalshiBattleBot:
         self._trades.insert(0, trade)
         
         mode = "[DRY RUN]" if self.dry_run else "[LIVE]"
-        print(f"{mode} EXITED: ${pnl:+.2f} ({reason}) | {position.get('question', '')[:50]}...")
+        print(f"{mode} EXITED: ${pnl:+.2f} ({reason}) | {contracts} contracts @ {int(exit_price*100)}¢ | {position.get('question', '')[:50]}...")
         
         self._save_state()
         await self._broadcast_update()
@@ -904,17 +912,17 @@ class KalshiBattleBot:
                     fill_price = order_data.get('average_fill_price', pending_exit.get('exit_price', 0.5) * 100) / 100
                     reason = pending_exit.get('reason', 'UNKNOWN')
                     
-                    # Calculate final PnL
-                    entry_price = position['entry_price']
+                    # Calculate final PnL using ACTUAL fill prices and contract count
+                    entry_price = position['entry_price']  # Actual buy fill price
                     side = position['side']
-                    size = position['size']
+                    contracts = position.get('contracts', 0)
                     
                     if side.upper() == 'YES':
                         price_change = fill_price - entry_price
                     else:
                         price_change = entry_price - fill_price
                     
-                    pnl = price_change * size
+                    pnl = price_change * contracts  # PnL per contract × number of contracts
                     
                     # Now actually remove the position and record exit
                     self._positions.pop(pos_id, None)
@@ -934,22 +942,24 @@ class KalshiBattleBot:
                         except Exception as e:
                             print(f"[DB] Failed to log trade exit: {e}")
                     
-                    # Record trade
+                    # Record trade with actual fill data
                     trade = {
                         'id': pos_id,
                         'market_id': position['market_id'],
                         'question': position.get('question', ''),
                         'action': 'EXIT',
                         'side': position['side'],
-                        'price': fill_price,
-                        'size': size,
+                        'entry_price': entry_price,  # Actual buy fill price
+                        'exit_price': fill_price,    # Actual sell fill price
+                        'contracts': contracts,
+                        'size': position.get('size', 0),
                         'pnl': pnl,
                         'reason': reason,
                         'timestamp': datetime.utcnow().isoformat(),
                     }
                     self._trades.insert(0, trade)
                     
-                    print(f"[EXIT CONFIRMED] ${pnl:+.2f} ({reason}) | {position.get('question', '')[:50]}...")
+                    print(f"[EXIT CONFIRMED] ${pnl:+.2f} ({reason}) | {contracts} @ {entry_price*100:.0f}¢→{fill_price*100:.0f}¢ | {position.get('question', '')[:50]}...")
                     self._save_state()
                     await self._broadcast_update()
                     
