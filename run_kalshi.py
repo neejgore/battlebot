@@ -51,6 +51,7 @@ class KalshiBattleBot:
         # Market data
         self._markets: dict[str, dict] = {}
         self._monitored: dict[str, dict] = {}
+        self._target_series: list[str] = []  # Cached target series tickers (discovered once)
         
         # Trading state (persisted)
         self._state_file = f"{self._storage_dir}/kalshi_state.json"
@@ -402,8 +403,8 @@ class KalshiBattleBot:
         """Fetch ALL useful markets from Kalshi - no artificial limits.
         
         Strategy:
-        1. Discover all series and identify target categories
-        2. Fetch ALL markets from ALL target series (politics, economics, etc.)
+        1. Discover all series ONCE and cache target categories
+        2. Fetch markets from cached target series (politics, economics, etc.)
         3. Also fetch general non-MVE markets with full pagination
         4. Deduplicate and sort by liquidity
         """
@@ -417,42 +418,44 @@ class KalshiBattleBot:
                 'Health', 'World', 'Companies', 'Crypto', 'Transportation', 'Education'
             ]
             
-            # STEP 1: Discover all available series
-            target_series_tickers = []
-            try:
-                series_response = await self._kalshi.get_series_list()
-                all_series = series_response.get('series', [])
-                print(f"[Discovery] Found {len(all_series)} total series on Kalshi")
-                
-                # Count by category
-                by_category = {}
-                for s in all_series:
-                    cat = s.get('category', 'Unknown')
-                    by_category[cat] = by_category.get(cat, 0) + 1
+            # STEP 1: Discover series (only on first run, then use cache)
+            if not self._target_series:
+                try:
+                    series_response = await self._kalshi.get_series_list()
+                    all_series = series_response.get('series', [])
+                    print(f"[Discovery] Found {len(all_series)} total series on Kalshi")
                     
-                    # Collect target series tickers
-                    if cat in target_categories:
-                        ticker = s.get('ticker')
-                        if ticker:
-                            target_series_tickers.append(ticker)
-                
-                print(f"[Categories]")
-                for cat, count in sorted(by_category.items(), key=lambda x: -x[1]):
-                    marker = " <-- TARGET" if cat in target_categories else ""
-                    print(f"  {cat}: {count}{marker}")
-                
-                print(f"[Target Series] {len(target_series_tickers)} series in target categories")
-                
-            except Exception as e:
-                print(f"[Discovery Error] {e}")
+                    # Count by category
+                    by_category = {}
+                    for s in all_series:
+                        cat = s.get('category', 'Unknown')
+                        by_category[cat] = by_category.get(cat, 0) + 1
+                        
+                        # Collect target series tickers
+                        if cat in target_categories:
+                            ticker = s.get('ticker')
+                            if ticker:
+                                self._target_series.append(ticker)
+                    
+                    print(f"[Categories]")
+                    for cat, count in sorted(by_category.items(), key=lambda x: -x[1]):
+                        marker = " <-- TARGET" if cat in target_categories else ""
+                        print(f"  {cat}: {count}{marker}")
+                    
+                    print(f"[Target Series] {len(self._target_series)} series in target categories (cached for future refreshes)")
+                    
+                except Exception as e:
+                    print(f"[Discovery Error] {e}")
+            else:
+                print(f"[Refresh] Using cached {len(self._target_series)} target series")
             
-            # STEP 2: Fetch markets from ALL target series
-            if target_series_tickers:
-                print(f"[Fetching] Markets from {len(target_series_tickers)} target series...")
+            # STEP 2: Fetch markets from target series
+            if self._target_series:
+                print(f"[Fetching] Markets from {len(self._target_series)} target series...")
                 series_with_markets = 0
                 total_from_series = 0
                 
-                for i, series_ticker in enumerate(target_series_tickers):
+                for i, series_ticker in enumerate(self._target_series):
                     try:
                         # Rate limiting - brief pause between calls
                         if i > 0 and i % 10 == 0:
@@ -479,7 +482,7 @@ class KalshiBattleBot:
                     
                     # Progress update every 100 series
                     if (i + 1) % 100 == 0:
-                        print(f"[Progress] {i + 1}/{len(target_series_tickers)} series checked, {total_from_series} markets found")
+                        print(f"[Progress] {i + 1}/{len(self._target_series)} series checked, {total_from_series} markets found")
                 
                 print(f"[Series Fetch Complete] {series_with_markets} series had open markets, {total_from_series} total")
             
