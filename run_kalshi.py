@@ -120,6 +120,12 @@ class KalshiBattleBot:
                     self._pending_orders = state.get('pending_orders', {})
                     self._trades = state.get('trades', [])
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades")
+                    
+                    # In dry run mode, clear old positions to allow fresh trading
+                    if self.dry_run and self._positions:
+                        print(f"[State] DRY RUN: Clearing {len(self._positions)} old simulated positions")
+                        self._positions = {}
+                        self._pending_orders = {}
             elif os.path.exists(self._state_file + '.backup'):
                 print(f"[State] Main file missing, loading from backup...")
                 with open(self._state_file + '.backup', 'r') as f:
