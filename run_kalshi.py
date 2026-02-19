@@ -378,36 +378,70 @@ class KalshiBattleBot:
             await asyncio.sleep(60)  # Refresh every minute
     
     async def _fetch_markets(self):
-        """Fetch open markets from Kalshi across all categories.
+        """Fetch open markets from Kalshi across diverse categories.
         
-        Uses pagination to get comprehensive market coverage while
-        filtering out low-liquidity sports combo markets.
+        Strategy: Fetch events first to discover available series, then
+        target non-sports series for higher quality markets with liquidity.
         """
         try:
-            all_markets = []
-            cursor = None
-            pages_fetched = 0
-            max_pages = 10  # Fetch up to 1000 markets (10 pages x 100)
+            # Step 1: Discover available events/series
+            events_result = await self._kalshi.get_events(status='open', limit=100)
+            events = events_result.get('events', [])
             
-            # Paginate through all open markets
-            while pages_fetched < max_pages:
-                result = await self._kalshi.get_markets(
-                    status='open', 
-                    limit=100,
-                    cursor=cursor
-                )
-                markets = result.get('markets', [])
-                if not markets:
-                    break
-                    
-                all_markets.extend(markets)
-                cursor = result.get('cursor')
-                pages_fetched += 1
+            # Identify non-sports series tickers (politics, economics, weather, etc.)
+            target_series = set()
+            sports_series = set()
+            
+            for event in events:
+                series_ticker = event.get('series_ticker', '')
+                category = event.get('category', '').lower()
+                title = event.get('title', '').lower()
                 
-                if not cursor:
-                    break
+                # Skip sports combo series
+                if any(x in series_ticker.upper() for x in ['MULTIGAME', 'MULTILEG', 'KXMVESPORTS']):
+                    sports_series.add(series_ticker)
+                    continue
+                
+                # Skip if category indicates sports combos
+                if 'multi' in category or 'parlay' in category:
+                    sports_series.add(series_ticker)
+                    continue
+                    
+                if series_ticker:
+                    target_series.add(series_ticker)
             
-            # Process and filter markets
+            print(f"[Events] Found {len(target_series)} target series, {len(sports_series)} sports combo series")
+            
+            # Step 2: Fetch markets from target series (with rate limiting)
+            all_markets = []
+            series_fetched = 0
+            
+            for series_ticker in list(target_series)[:20]:  # Limit to 20 series
+                try:
+                    await asyncio.sleep(0.2)  # Rate limit: 5 req/sec
+                    result = await self._kalshi.get_markets(
+                        status='open',
+                        series_ticker=series_ticker,
+                        limit=50
+                    )
+                    markets = result.get('markets', [])
+                    all_markets.extend(markets)
+                    series_fetched += 1
+                except Exception as e:
+                    if '429' in str(e):
+                        await asyncio.sleep(2)  # Back off on rate limit
+                    continue
+            
+            # Step 3: Also fetch some general markets (first page only, for diversity)
+            try:
+                await asyncio.sleep(0.2)
+                general_result = await self._kalshi.get_markets(status='open', limit=100)
+                general_markets = general_result.get('markets', [])
+                all_markets.extend(general_markets)
+            except Exception as e:
+                pass
+            
+            # Step 4: Process and filter markets
             skipped_combos = 0
             category_counts = {}
             
@@ -415,13 +449,13 @@ class KalshiBattleBot:
                 try:
                     ticker = m.get('ticker', '').upper()
                     
-                    # Skip sports combo/multi-game markets - they have no liquidity
-                    if 'MULTIGAME' in ticker or 'MULTILEG' in ticker:
+                    # Skip sports combo/multi-game markets
+                    if 'MULTIGAME' in ticker or 'MULTILEG' in ticker or 'KXMVESPORTS' in ticker:
                         skipped_combos += 1
                         continue
                     
                     market = parse_kalshi_market(m)
-                    if market['id']:
+                    if market['id'] and market['id'] not in self._markets:
                         self._markets[market['id']] = market
                         
                         # Track categories for logging
@@ -432,7 +466,7 @@ class KalshiBattleBot:
             
             added = len(self._markets)
             categories_str = ', '.join(f"{k}:{v}" for k, v in sorted(category_counts.items()))
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetched {added} markets (skipped {skipped_combos} combos)")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetched {added} markets from {series_fetched} series (skipped {skipped_combos} combos)")
             if categories_str:
                 print(f"[Categories] {categories_str}")
         except Exception as e:
