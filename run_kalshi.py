@@ -259,6 +259,26 @@ class KalshiBattleBot:
         unrealized_pnl = sum(p.get('unrealized_pnl', 0) for p in self._positions.values())
         total_value = available + at_risk + unrealized_pnl
         
+        # Calculate at-risk by time horizon
+        at_risk_ultra_short = 0  # ≤24 hours
+        at_risk_short = 0        # 1-7 days
+        at_risk_medium = 0       # 8+ days
+        
+        for pos in self._positions.values():
+            size = pos.get('size', 0)
+            market = self._markets.get(pos.get('market_id', ''))
+            if market:
+                hours = market.get('hours_to_resolution', 999)
+                days = market.get('days_to_resolution', 999)
+                if hours <= 24:
+                    at_risk_ultra_short += size
+                elif days <= 7:
+                    at_risk_short += size
+                else:
+                    at_risk_medium += size
+            else:
+                at_risk_medium += size  # Default to medium if unknown
+        
         exits = [t for t in self._trades if t.get('action') == 'EXIT']
         winning = len([t for t in exits if t.get('pnl', 0) > 0])
         losing = len([t for t in exits if t.get('pnl', 0) < 0])
@@ -287,6 +307,9 @@ class KalshiBattleBot:
             'initial_bankroll': self.initial_bankroll,
             'available': available,
             'at_risk': at_risk,
+            'at_risk_ultra_short': at_risk_ultra_short,
+            'at_risk_short': at_risk_short,
+            'at_risk_medium': at_risk_medium,
             'total_value': total_value,
             'realized_pnl': realized_pnl,
             'unrealized_pnl': unrealized_pnl,
@@ -1578,6 +1601,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Total Value</div><div class="card-value" id="totalValue">$0.00</div></div>
                 <div class="card"><div class="card-label">Return</div><div class="card-value green" id="returnPct">0.00%</div></div>
             </div>
+            <div class="section-title">AT RISK BY TIME HORIZON</div>
+            <div class="grid">
+                <div class="card"><div class="card-label">Ultra-Short (≤24h)</div><div class="card-value" id="atRiskUltra">$0.00</div><div class="card-sub">resolves in hours</div></div>
+                <div class="card"><div class="card-label">Short (1-7d)</div><div class="card-value" id="atRiskShort">$0.00</div><div class="card-sub">resolves in days</div></div>
+                <div class="card"><div class="card-label">Medium (8+d)</div><div class="card-value" id="atRiskMedium">$0.00</div><div class="card-sub">resolves in weeks+</div></div>
+            </div>
             <div class="section-title">PERFORMANCE</div>
             <div class="grid">
                 <div class="card"><div class="card-label">Realized P&L</div><div class="card-value green" id="realizedPnl">$0.00</div></div>
@@ -1642,6 +1671,9 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             document.getElementById('available').textContent = '$' + s.available.toFixed(2);
             document.getElementById('atRisk').textContent = '$' + s.at_risk.toFixed(2);
             document.getElementById('posCount').textContent = s.open_positions + ' positions';
+            document.getElementById('atRiskUltra').textContent = '$' + (s.at_risk_ultra_short || 0).toFixed(2);
+            document.getElementById('atRiskShort').textContent = '$' + (s.at_risk_short || 0).toFixed(2);
+            document.getElementById('atRiskMedium').textContent = '$' + (s.at_risk_medium || 0).toFixed(2);
             document.getElementById('totalValue').textContent = '$' + s.total_value.toFixed(2);
             document.getElementById('returnPct').textContent = (s.return_pct >= 0 ? '+' : '') + s.return_pct.toFixed(2) + '%';
             document.getElementById('returnPct').className = 'card-value ' + (s.return_pct >= 0 ? 'green' : 'red');
