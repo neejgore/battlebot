@@ -446,6 +446,8 @@ def parse_kalshi_market(market: dict) -> dict:
         'description': description,
         'rules': rules,
         'price': yes_price,
+        'yes_price': yes_price,
+        'no_price': no_price,
         'price_pct': int(yes_price * 100),
         'spread': spread,
         'spread_display': f"{spread*100:.1f}¢",

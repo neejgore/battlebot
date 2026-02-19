@@ -544,17 +544,23 @@ class KalshiBattleBot:
             adjusted_prob = signal.raw_prob
             calibration_method = "error"
         
-        # Determine trade side and edge
-        if adjusted_prob > current_price:
+        # Determine trade side and edge using ACTUAL prices from Kalshi
+        yes_price = market.get('yes_price', current_price)
+        no_price = market.get('no_price', 1 - current_price)  # Fallback if not available
+        
+        if adjusted_prob > yes_price:
+            # Bet YES: we think YES is more likely than the market price implies
             side = 'YES'
-            edge = adjusted_prob - current_price
-            trade_prob = adjusted_prob
-            trade_price = current_price
+            edge = adjusted_prob - yes_price
+            trade_prob = adjusted_prob  # Our belief in YES winning
+            trade_price = yes_price     # Actual cost to buy YES
         else:
+            # Bet NO: we think NO is more likely than the market implies
             side = 'NO'
-            edge = (1 - adjusted_prob) - (1 - current_price)
-            trade_prob = 1 - adjusted_prob
-            trade_price = 1 - current_price
+            no_prob = 1 - adjusted_prob  # Our belief in NO winning
+            edge = no_prob - no_price    # Edge = belief - cost
+            trade_prob = no_prob         # Our belief in NO winning
+            trade_price = no_price       # Actual cost to buy NO
         
         # Store analysis
         self._analyses.insert(0, {
@@ -627,7 +633,13 @@ class KalshiBattleBot:
         """Enter a new position."""
         market_id = market['id']
         pos_id = f"pos_{int(datetime.utcnow().timestamp()*1000)}"
-        entry_price = market['price']
+        
+        # Use the correct price for the side we're trading
+        if side.upper() == 'YES':
+            entry_price = market.get('yes_price', market['price'])
+        else:
+            entry_price = market.get('no_price', 1 - market['price'])
+        
         contracts = int(size / entry_price) if entry_price > 0 else 0
         
         # In LIVE mode, actually place the order on Kalshi
@@ -741,23 +753,25 @@ class KalshiBattleBot:
                     if not market:
                         continue
                     
-                    current_price = market['price']
                     entry_price = pos['entry_price']
                     side = pos['side']
+                    
+                    # Get current price for the side we hold
+                    if side.upper() == 'YES':
+                        current_price = market.get('yes_price', market['price'])
+                    else:
+                        current_price = market.get('no_price', 1 - market['price'])
                     
                     # Simulate price movement if enabled
                     if self.simulate_prices:
                         drift = random.gauss(0, 0.02)
                         simulated_price = max(0.05, min(0.95, entry_price + drift))
                         current_price = simulated_price
-                        market['price'] = simulated_price
                     
-                    # Calculate P&L (based on contracts, not dollar size)
+                    # Calculate P&L: (current_price - entry_price) × contracts
+                    # Same formula for both YES and NO since we're using the actual price for each side
                     contracts = pos.get('contracts', int(pos['size'] / entry_price) if entry_price > 0 else 0)
-                    if side == 'YES':
-                        price_change = current_price - entry_price
-                    else:
-                        price_change = entry_price - current_price
+                    price_change = current_price - entry_price
                     
                     unrealized_pnl = price_change * contracts
                     pos['current_price'] = current_price
