@@ -1665,18 +1665,28 @@ class KalshiBattleBot:
                     print(f"[Exit Check Error] {pos_id}: {e}")
     
     async def _position_sync_loop(self):
-        """Sync positions with Kalshi API to detect filled orders."""
+        """Sync positions with Kalshi API to detect filled orders and resolved markets."""
         await asyncio.sleep(5)  # Wait for startup
+        
+        sync_counter = 0
+        FULL_SYNC_INTERVAL = 30  # Full sync every 30 iterations (~5 minutes)
         
         while self._running:
             try:
+                sync_counter += 1
+                
+                # Periodically do a full position sync to detect resolved markets
+                if sync_counter >= FULL_SYNC_INTERVAL:
+                    sync_counter = 0
+                    await self._sync_positions_with_kalshi()
+                
                 # First, check pending EXIT orders (sells on existing positions)
                 await self._check_pending_exits()
                 
                 # Then check pending BUY orders
                 if not self._pending_orders:
                     await asyncio.sleep(10)
-                    continue
+                    continue  # Still loop to trigger full sync periodically
                 
                 # Check each pending order's status directly
                 filled_orders = []
