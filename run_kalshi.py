@@ -542,6 +542,34 @@ class KalshiBattleBot:
         """Enter a new position."""
         market_id = market['id']
         pos_id = f"pos_{int(datetime.utcnow().timestamp()*1000)}"
+        entry_price = market['price']
+        
+        # In LIVE mode, actually place the order on Kalshi
+        order_id = None
+        if not self.dry_run:
+            try:
+                # Convert size in dollars to contracts (Kalshi contracts pay $1 if correct)
+                # At price P, cost per contract = P dollars, so contracts = size / price
+                contracts = int(size / entry_price) if entry_price > 0 else 0
+                if contracts < 1:
+                    print(f"[Order] Size ${size:.2f} too small for 1 contract at {int(entry_price*100)}¢")
+                    return
+                
+                # Price in cents for Kalshi API
+                price_cents = int(entry_price * 100)
+                
+                result = await self._kalshi.place_order(
+                    ticker=market_id,
+                    side=side.lower(),  # 'yes' or 'no'
+                    count=contracts,
+                    price=price_cents,
+                    order_type='limit',
+                )
+                order_id = result.get('order', {}).get('order_id')
+                print(f"[LIVE ORDER] Placed: {contracts} {side} contracts @ {price_cents}¢ | Order ID: {order_id}")
+            except Exception as e:
+                print(f"[Order Error] Failed to place order on Kalshi: {e}")
+                return  # Don't record position if order failed
         
         pos = {
             'id': pos_id,
@@ -549,13 +577,15 @@ class KalshiBattleBot:
             'question': market.get('question', ''),
             'side': side,
             'size': size,
-            'entry_price': market['price'],
-            'current_price': market['price'],
+            'entry_price': entry_price,
+            'current_price': entry_price,
             'ai_probability': prob,
             'edge': edge,
             'confidence': confidence,
             'entry_time': datetime.utcnow().isoformat(),
             'unrealized_pnl': 0.0,
+            'order_id': order_id,
+            'contracts': int(size / entry_price) if entry_price > 0 else 0,
         }
         
         # Log to database
@@ -565,7 +595,7 @@ class KalshiBattleBot:
                     decision_id=0,  # We don't track this linking yet
                     market_id=market_id,
                     token_id=market.get('token_id', market_id),
-                    entry_price=market['price'],
+                    entry_price=entry_price,
                     entry_side=side,
                     size=size,
                     raw_prob=prob,
@@ -586,14 +616,15 @@ class KalshiBattleBot:
             'question': market.get('question', ''),
             'action': 'ENTRY',
             'side': side,
-            'price': market['price'],
+            'price': entry_price,
             'size': size,
             'timestamp': datetime.utcnow().isoformat(),
+            'order_id': order_id,
         }
         self._trades.insert(0, trade)
         
         mode = "[DRY RUN]" if self.dry_run else "[LIVE]"
-        print(f"{mode} ENTERED: {side} ${size:.2f} @ {int(market['price']*100)}¢ | {market.get('question', '')[:50]}...")
+        print(f"{mode} ENTERED: {side} ${size:.2f} @ {int(entry_price*100)}¢ | {market.get('question', '')[:50]}...")
         
         self._save_state()
         await self._broadcast_update()
@@ -658,6 +689,26 @@ class KalshiBattleBot:
         position = self._positions.pop(pos_id, None)
         if not position:
             return
+        
+        # In LIVE mode, actually sell the position on Kalshi
+        if not self.dry_run:
+            try:
+                contracts = position.get('contracts', 0)
+                if contracts > 0:
+                    price_cents = int(exit_price * 100)
+                    result = await self._kalshi.sell_position(
+                        ticker=position['market_id'],
+                        side=position['side'].lower(),
+                        count=contracts,
+                        price=price_cents,
+                    )
+                    exit_order_id = result.get('order', {}).get('order_id')
+                    print(f"[LIVE ORDER] Sold: {contracts} {position['side']} contracts @ {price_cents}¢ | Order ID: {exit_order_id}")
+            except Exception as e:
+                print(f"[Order Error] Failed to sell position on Kalshi: {e}")
+                # Re-add position if sell failed
+                self._positions[pos_id] = position
+                return
         
         await self._risk_engine.record_trade_result(pnl)
         

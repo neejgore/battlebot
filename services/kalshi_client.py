@@ -26,8 +26,8 @@ except ImportError:
 class KalshiClient:
     """Client for Kalshi prediction market API."""
     
-    # API endpoints
-    PROD_URL = "https://api.elections.kalshi.com/trade-api/v2"
+    # API endpoints (updated 2024/2025)
+    PROD_URL = "https://api.kalshi.com/trade-api/v2"
     DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
     
     def __init__(self, 
@@ -241,9 +241,14 @@ class KalshiClient:
             'count': count,
             'type': order_type,
         }
+        # Only include the price for the side we're trading
         if order_type == 'limit':
-            body['yes_price'] = price if side.lower() == 'yes' else None
-            body['no_price'] = price if side.lower() == 'no' else None
+            if side.lower() == 'yes':
+                body['yes_price'] = price
+            else:
+                body['no_price'] = price
+        
+        logger.debug(f"Placing order: {body}")
         
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
@@ -281,9 +286,14 @@ class KalshiClient:
             'side': side.lower(),
             'count': count,
             'type': 'limit',
-            'yes_price': price if side.lower() == 'yes' else None,
-            'no_price': price if side.lower() == 'no' else None,
         }
+        # Only include the price for the side we're selling
+        if side.lower() == 'yes':
+            body['yes_price'] = price
+        else:
+            body['no_price'] = price
+        
+        logger.debug(f"Selling position: {body}")
         
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
