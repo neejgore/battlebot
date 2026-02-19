@@ -601,92 +601,111 @@ class KalshiBattleBot:
     async def _select_markets(self):
         """Filter markets using eligibility criteria.
         
-        PRIORITIZES SHORT-TERM MARKETS (1-14 days) for faster feedback,
-        while still including some medium-term markets for diversity.
+        PRIORITIZES by time horizon for fastest feedback:
+        1. Ultra-short (≤24 hours) - immediate validation
+        2. Short-term (1-7 days) - quick feedback
+        3. Medium-term (8-365 days) - diversity
         """
-        short_term = []   # 1-14 days to resolution
-        medium_term = []  # 15-365 days to resolution
+        ultra_short = []  # ≤24 hours to resolution
+        short_term = []   # 1-7 days to resolution
+        medium_term = []  # 8-365 days to resolution
         rejection_counts = {
             'no_end_date': 0, 'too_far_out': 0, 'low_oi': 0,
             'wide_spread': 0, 'extreme_price': 0, 'low_liquidity': 0,
             'combo_market': 0,
         }
         
-        # Max days to resolution
         max_days = int(os.getenv('MAX_DAYS_TO_RESOLUTION', '365'))
-        short_term_cutoff = 14  # Days - markets resolving within 2 weeks
+        now = datetime.utcnow()
         
         for m in self._markets.values():
-            # Must have end date
             if not m.get('end_date'):
                 rejection_counts['no_end_date'] += 1
                 continue
             
-            # Time to resolution check
-            days_to_resolution = None
+            # Calculate time to resolution in hours AND days
             try:
                 end_date = datetime.fromisoformat(m['end_date'].replace('Z', '+00:00'))
-                days_to_resolution = (end_date.replace(tzinfo=None) - datetime.utcnow()).days
+                time_to_resolution = end_date.replace(tzinfo=None) - now
+                hours_to_resolution = time_to_resolution.total_seconds() / 3600
+                days_to_resolution = time_to_resolution.days
+                
                 if days_to_resolution > max_days:
                     rejection_counts['too_far_out'] += 1
                     continue
-                if days_to_resolution < 0:
+                if hours_to_resolution < 1:  # Less than 1 hour - too close
                     continue
             except:
-                continue  # Skip if we can't parse date
+                continue
             
-            # Minimum open interest filter - require real liquidity
+            # Minimum open interest - lower bar for ultra-short (more forgiving)
             oi = m.get('open_interest', 0) or 0
             min_oi = int(os.getenv('MIN_OPEN_INTEREST', '10'))
-            if oi < min_oi:
+            # Lower OI requirement for ultra-short markets
+            effective_min_oi = min_oi // 2 if hours_to_resolution <= 24 else min_oi
+            if oi < effective_min_oi:
                 rejection_counts['low_oi'] += 1
                 if rejection_counts['low_oi'] <= 3:
                     print(f"[Debug] Rejected for low_oi: {m.get('ticker', '')[:30]} oi={oi}")
                 continue
             
-            # Spread check - configurable, default 6 cents
+            # Spread check
             max_spread = float(os.getenv('MAX_SPREAD', '0.06'))
             if m.get('spread', max_spread) > max_spread:
                 rejection_counts['wide_spread'] += 1
                 continue
             
-            # Price range (not too extreme)
+            # Price range
             price = m.get('price', 0.5)
             if price < 0.05 or price > 0.95:
                 rejection_counts['extreme_price'] += 1
                 continue
             
-            # Add days_to_resolution to market for sorting
+            # Store time info
+            m['hours_to_resolution'] = hours_to_resolution
             m['days_to_resolution'] = days_to_resolution
             
             # Categorize by time horizon
-            if days_to_resolution <= short_term_cutoff:
+            if hours_to_resolution <= 24:
+                ultra_short.append(m)
+            elif days_to_resolution <= 7:
                 short_term.append(m)
             else:
                 medium_term.append(m)
         
         # Sort each category by open interest
+        ultra_short.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         short_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         medium_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         
-        # PRIORITIZE SHORT-TERM: Take up to 10 short-term, fill remaining with medium-term
-        selected = short_term[:10] + medium_term[:5]
+        # PRIORITIZE: Ultra-short first, then short, then medium
+        selected = ultra_short[:8] + short_term[:5] + medium_term[:2]
         
         # Log what we found
-        print(f"[Time Horizon] Short-term (≤14d): {len(short_term)} | Medium-term (15-365d): {len(medium_term)}")
-        if short_term:
+        print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
+        
+        if ultra_short:
+            print(f"[Ultra-short Markets - resolving within 24h]")
+            for m in ultra_short[:5]:
+                hours = m.get('hours_to_resolution', 0)
+                oi = m.get('open_interest', 0)
+                q = m.get('question', '')[:45]
+                print(f"  {hours:.1f}h | oi=${oi:,} | {q}...")
+        
+        if short_term and not ultra_short:
             print(f"[Short-term Top 3]")
             for m in short_term[:3]:
                 days = m.get('days_to_resolution', '?')
                 oi = m.get('open_interest', 0)
-                q = m.get('question', '')[:50]
+                q = m.get('question', '')[:45]
                 print(f"  {days}d | oi=${oi:,} | {q}...")
         
         self._monitored = {m['id']: m for m in selected}
         
-        total_eligible = len(short_term) + len(medium_term)
+        total_eligible = len(ultra_short) + len(short_term) + len(medium_term)
+        ultra_count = len([m for m in selected if m.get('hours_to_resolution', 999) <= 24])
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Market eligibility: {total_eligible} eligible / {len(self._markets)} total")
-        print(f"[Monitoring] {len(selected)} markets selected ({len([m for m in selected if m.get('days_to_resolution', 999) <= 14])} short-term)")
+        print(f"[Monitoring] {len(selected)} markets selected ({ultra_count} ultra-short, resolving in hours)")
         
         if rejection_counts:
             reasons = [f"{k}={v}" for k, v in rejection_counts.items() if v > 0]
