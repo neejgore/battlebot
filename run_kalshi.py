@@ -202,6 +202,7 @@ class KalshiBattleBot:
                         'confidence': order.get('confidence', 0),
                         'entry_time': order.get('placed_time', datetime.utcnow().isoformat()),
                         'unrealized_pnl': 0.0,
+                        'end_date': order.get('end_date'),  # Preserve for time horizon
                     }
                     self._positions[pos_id] = pos
                     self._pending_orders.pop(order_id)
@@ -279,20 +280,27 @@ class KalshiBattleBot:
             hours_to_res = 9999
             days_to_res = 9999
             
+            # Try to get end_date from market or position itself
+            end_date_str = None
             if market:
                 # Try cached values first
                 hours_to_res = market.get('hours_to_resolution', 9999)
                 days_to_res = market.get('days_to_resolution', 9999)
-                
-                # If not cached, calculate from end_date
-                if hours_to_res == 9999 and market.get('end_date'):
-                    try:
-                        end_date = datetime.fromisoformat(market['end_date'].replace('Z', '+00:00'))
-                        time_to_res = end_date.replace(tzinfo=None) - now
-                        hours_to_res = time_to_res.total_seconds() / 3600
-                        days_to_res = time_to_res.days
-                    except:
-                        pass
+                end_date_str = market.get('end_date')
+            
+            # Fallback: check position's own end_date (stored at entry time)
+            if hours_to_res == 9999 and not end_date_str:
+                end_date_str = pos.get('end_date')
+            
+            # Calculate from end_date if we have it
+            if hours_to_res == 9999 and end_date_str:
+                try:
+                    end_date = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                    time_to_res = end_date.replace(tzinfo=None) - now
+                    hours_to_res = time_to_res.total_seconds() / 3600
+                    days_to_res = time_to_res.days
+                except:
+                    pass
             
             # Categorize by time horizon
             if hours_to_res <= 24:
@@ -1018,6 +1026,7 @@ class KalshiBattleBot:
             'edge': edge,
             'confidence': confidence,
             'placed_time': datetime.utcnow().isoformat(),
+            'end_date': market.get('end_date'),  # Store for time horizon calc
         }
         
         # In dry run mode, immediately treat as filled position
@@ -1443,6 +1452,7 @@ class KalshiBattleBot:
                         'confidence': order.get('confidence', 0),
                         'entry_time': datetime.utcnow().isoformat(),
                         'unrealized_pnl': 0.0,
+                        'end_date': order.get('end_date'),  # Preserve for time horizon
                     }
                     self._positions[pos_id] = pos
                     
