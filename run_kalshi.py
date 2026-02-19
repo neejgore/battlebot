@@ -398,27 +398,12 @@ class KalshiBattleBot:
     def _is_combo_market(self, market: dict) -> bool:
         """Detect multi-leg combo markets that have poor liquidity.
         
-        These are markets like "Team A AND Team B AND Team C all win"
-        which have very few traders.
+        NOTE: Disabled for now - relying on volume filter instead.
+        Kalshi's API returns many MULTIGAME markets, but some may have
+        decent liquidity. Let volume filtering handle market quality.
         """
-        # Check for multi-game indicators in the ticker - most reliable signal
-        ticker = market.get('id', '').upper()
-        if 'MULTIGAME' in ticker:
-            return True
-        
-        # Check the title for patterns like "yes TeamA,yes TeamB,yes TeamC"
-        title = market.get('question', '') or ''
-        
-        # Count "yes " prefixes - combo markets list multiple "yes X" items
-        yes_count = title.lower().count('yes ')
-        if yes_count >= 3:
-            return True
-        
-        # Count "no " prefixes similarly
-        no_count = title.lower().count('no ')
-        if no_count >= 3:
-            return True
-        
+        # Disabled - let volume filter handle this
+        # The volume filter (MIN_VOLUME_24H) is a better proxy for liquidity
         return False
     
     async def _select_markets(self):
@@ -431,7 +416,8 @@ class KalshiBattleBot:
         }
         
         # Minimum volume threshold - only trade markets with real activity
-        min_volume = float(os.getenv('MIN_VOLUME_24H', '100'))
+        # Set to 0 by default to allow markets through, rely on spread filter
+        min_volume = float(os.getenv('MIN_VOLUME_24H', '0'))
         
         for m in self._markets.values():
             # Must have end date
