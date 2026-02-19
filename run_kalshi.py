@@ -55,6 +55,7 @@ class KalshiBattleBot:
         # Trading state (persisted)
         self._state_file = f"{self._storage_dir}/kalshi_state.json"
         self._positions: dict[str, dict] = {}
+        self._pending_orders: dict[str, dict] = {}  # Orders placed but not yet filled
         self._trades: list[dict] = []
         self._analyses: list[dict] = []
         self._load_state()
@@ -104,8 +105,9 @@ class KalshiBattleBot:
         """Load positions and trades from disk."""
         # Check if state should be cleared (for recovering from phantom positions)
         if os.getenv('CLEAR_STATE', '').lower() == 'true':
-            print("[State] CLEAR_STATE=true - clearing all positions and trades")
+            print("[State] CLEAR_STATE=true - clearing all positions, orders, and trades")
             self._positions = {}
+            self._pending_orders = {}
             self._trades = []
             self._save_state()
             return
@@ -115,22 +117,26 @@ class KalshiBattleBot:
                 with open(self._state_file, 'r') as f:
                     state = json.load(f)
                     self._positions = state.get('positions', {})
+                    self._pending_orders = state.get('pending_orders', {})
                     self._trades = state.get('trades', [])
-                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._trades)} trades")
+                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades")
             elif os.path.exists(self._state_file + '.backup'):
                 print(f"[State] Main file missing, loading from backup...")
                 with open(self._state_file + '.backup', 'r') as f:
                     state = json.load(f)
                     self._positions = state.get('positions', {})
+                    self._pending_orders = state.get('pending_orders', {})
                     self._trades = state.get('trades', [])
-                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._trades)} trades from backup")
+                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades from backup")
         except json.JSONDecodeError as e:
             print(f"[State] WARNING: Corrupted state file, starting fresh: {e}")
             self._positions = {}
+            self._pending_orders = {}
             self._trades = []
         except Exception as e:
             print(f"[State] Failed to load: {e}")
             self._positions = {}
+            self._pending_orders = {}
             self._trades = []
     
     def _save_state(self):
@@ -140,6 +146,7 @@ class KalshiBattleBot:
             
             state_data = {
                 'positions': self._positions,
+                'pending_orders': self._pending_orders,
                 'trades': self._trades[-100:],
                 'saved_at': datetime.utcnow().isoformat(),
             }
@@ -272,6 +279,8 @@ class KalshiBattleBot:
         asyncio.create_task(self._trading_loop())
         asyncio.create_task(self._position_monitor_loop())
         asyncio.create_task(self._price_refresh_loop())
+        if not self.dry_run:
+            asyncio.create_task(self._position_sync_loop())
         
         # Keep running
         try:
@@ -553,14 +562,12 @@ class KalshiBattleBot:
         market_id = market['id']
         pos_id = f"pos_{int(datetime.utcnow().timestamp()*1000)}"
         entry_price = market['price']
+        contracts = int(size / entry_price) if entry_price > 0 else 0
         
         # In LIVE mode, actually place the order on Kalshi
         order_id = None
         if not self.dry_run:
             try:
-                # Convert size in dollars to contracts (Kalshi contracts pay $1 if correct)
-                # At price P, cost per contract = P dollars, so contracts = size / price
-                contracts = int(size / entry_price) if entry_price > 0 else 0
                 if contracts < 1:
                     print(f"[Order] Size ${size:.2f} too small for 1 contract at {int(entry_price*100)}¢")
                     return
@@ -579,62 +586,81 @@ class KalshiBattleBot:
                 print(f"[LIVE ORDER] Placed: {contracts} {side} contracts @ {price_cents}¢ | Order ID: {order_id}")
             except Exception as e:
                 print(f"[Order Error] Failed to place order on Kalshi: {e}")
-                return  # Don't record position if order failed
+                return  # Don't record if order failed
         
-        pos = {
+        order_data = {
             'id': pos_id,
+            'order_id': order_id,
             'market_id': market_id,
             'question': market.get('question', ''),
             'side': side,
             'size': size,
             'entry_price': entry_price,
-            'current_price': entry_price,
+            'contracts': contracts,
             'ai_probability': prob,
             'edge': edge,
             'confidence': confidence,
-            'entry_time': datetime.utcnow().isoformat(),
-            'unrealized_pnl': 0.0,
-            'order_id': order_id,
-            'contracts': int(size / entry_price) if entry_price > 0 else 0,
+            'placed_time': datetime.utcnow().isoformat(),
         }
         
-        # Log to database
-        if self._db_connected:
-            try:
-                db_trade_id = await self._db.log_trade_entry(
-                    decision_id=0,  # We don't track this linking yet
-                    market_id=market_id,
-                    token_id=market.get('token_id', market_id),
-                    entry_price=entry_price,
-                    entry_side=side,
-                    size=size,
-                    raw_prob=prob,
-                    adjusted_prob=prob,
-                    edge=edge,
-                    confidence=confidence,
-                )
-                pos['db_trade_id'] = db_trade_id
-            except Exception as e:
-                print(f"[DB] Failed to log trade entry: {e}")
-        
-        self._positions[pos_id] = pos
-        
-        # Record trade
-        trade = {
-            'id': pos_id,
-            'market_id': market_id,
-            'question': market.get('question', ''),
-            'action': 'ENTRY',
-            'side': side,
-            'price': entry_price,
-            'size': size,
-            'timestamp': datetime.utcnow().isoformat(),
-            'order_id': order_id,
-        }
-        self._trades.insert(0, trade)
-        
-        mode = "[DRY RUN]" if self.dry_run else "[LIVE]"
-        print(f"{mode} ENTERED: {side} ${size:.2f} @ {int(entry_price*100)}¢ | {market.get('question', '')[:50]}...")
+        # In dry run mode, immediately treat as filled position
+        if self.dry_run:
+            pos = {
+                **order_data,
+                'current_price': entry_price,
+                'unrealized_pnl': 0.0,
+                'entry_time': datetime.utcnow().isoformat(),
+            }
+            # Log to database
+            if self._db_connected:
+                try:
+                    db_trade_id = await self._db.log_trade_entry(
+                        decision_id=0,
+                        market_id=market_id,
+                        token_id=market.get('token_id', market_id),
+                        entry_price=entry_price,
+                        entry_side=side,
+                        size=size,
+                        raw_prob=prob,
+                        adjusted_prob=prob,
+                        edge=edge,
+                        confidence=confidence,
+                    )
+                    pos['db_trade_id'] = db_trade_id
+                except Exception as e:
+                    print(f"[DB] Failed to log trade entry: {e}")
+            self._positions[pos_id] = pos
+            # Record trade for dry run
+            trade = {
+                'id': pos_id,
+                'market_id': market_id,
+                'question': market.get('question', ''),
+                'action': 'ENTRY',
+                'side': side,
+                'price': entry_price,
+                'size': size,
+                'timestamp': datetime.utcnow().isoformat(),
+            }
+            self._trades.insert(0, trade)
+            print(f"[DRY RUN] ENTERED: {side} ${size:.2f} @ {int(entry_price*100)}¢ | {market.get('question', '')[:50]}...")
+        else:
+            # In LIVE mode, track as pending until we confirm fill from Kalshi
+            self._pending_orders[order_id] = order_data
+            # Record as pending order (not entry yet)
+            trade = {
+                'id': pos_id,
+                'market_id': market_id,
+                'question': market.get('question', ''),
+                'action': 'ORDER_PLACED',
+                'side': side,
+                'price': entry_price,
+                'size': size,
+                'timestamp': datetime.utcnow().isoformat(),
+                'order_id': order_id,
+                'status': 'pending',
+            }
+            self._trades.insert(0, trade)
+            print(f"[PENDING] Order {order_id} placed, waiting to fill...")
         
         self._save_state()
         await self._broadcast_update()
@@ -774,6 +800,78 @@ class KalshiBattleBot:
                 print(f"[Price Refresh Error] {e}")
             await asyncio.sleep(30)  # Refresh every 30 seconds
     
+    async def _position_sync_loop(self):
+        """Sync positions with Kalshi API to detect filled orders."""
+        await asyncio.sleep(5)  # Wait for startup
+        while self._running:
+            try:
+                # Fetch actual positions from Kalshi
+                result = await self._kalshi.get_positions()
+                kalshi_positions = result.get('market_positions', [])
+                
+                # Build a map of ticker -> position data
+                kalshi_by_ticker = {}
+                for kp in kalshi_positions:
+                    ticker = kp.get('ticker')
+                    if ticker:
+                        kalshi_by_ticker[ticker] = kp
+                
+                # Check pending orders against actual positions
+                filled_orders = []
+                for order_id, order in list(self._pending_orders.items()):
+                    market_id = order.get('market_id')
+                    if market_id in kalshi_by_ticker:
+                        kp = kalshi_by_ticker[market_id]
+                        # Check if we have contracts on the side we ordered
+                        side = order.get('side', '').lower()
+                        if side == 'yes':
+                            filled_count = kp.get('position', 0)
+                        else:  # no
+                            filled_count = kp.get('position', 0)  # Kalshi uses negative for NO? Check API
+                        
+                        # For now, if there's any position on this ticker, assume our order filled
+                        total_position = kp.get('total_traded', 0) or abs(kp.get('position', 0))
+                        if total_position > 0:
+                            filled_orders.append(order_id)
+                            print(f"[FILLED] Order {order_id} filled! Position: {kp}")
+                
+                # Move filled orders to positions
+                for order_id in filled_orders:
+                    order = self._pending_orders.pop(order_id, None)
+                    if order:
+                        pos_id = order.get('id', f"pos_{order_id}")
+                        pos = {
+                            'id': pos_id,
+                            'order_id': order_id,
+                            'market_id': order['market_id'],
+                            'question': order.get('question', ''),
+                            'side': order['side'],
+                            'size': order['size'],
+                            'entry_price': order['entry_price'],
+                            'current_price': order['entry_price'],
+                            'contracts': order['contracts'],
+                            'ai_probability': order.get('ai_probability', 0.5),
+                            'edge': order.get('edge', 0),
+                            'confidence': order.get('confidence', 0),
+                            'entry_time': datetime.utcnow().isoformat(),
+                            'unrealized_pnl': 0.0,
+                        }
+                        self._positions[pos_id] = pos
+                        self._save_state()
+                        
+                        # Log entry
+                        mode = "[LIVE]"
+                        print(f"{mode} ENTERED: {order['side']} ${order['size']:.2f} @ {order['entry_price']*100:.0f}¢ | {order.get('question', '')[:50]}...")
+                
+                # Log sync status
+                if self._pending_orders:
+                    print(f"[Sync] {len(self._pending_orders)} orders pending, {len(self._positions)} positions filled")
+                
+            except Exception as e:
+                print(f"[Position Sync Error] {e}")
+            
+            await asyncio.sleep(15)  # Check every 15 seconds
+    
     async def _broadcast_update(self):
         """Send update to all connected WebSocket clients."""
         if not self._websockets:
@@ -783,6 +881,7 @@ class KalshiBattleBot:
             'type': 'update',
             'stats': self._get_stats(),
             'positions': list(self._positions.values()),
+            'pending_orders': list(self._pending_orders.values()),
             'trades': self._trades[:50],
             'analyses': self._analyses[:20],
             'monitored': list(self._monitored.values()),
