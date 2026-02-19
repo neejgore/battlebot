@@ -399,52 +399,62 @@ class KalshiBattleBot:
             await asyncio.sleep(60)  # Refresh every minute
     
     async def _fetch_markets(self):
-        """Fetch open markets from Kalshi - prioritize by volume for liquidity.
+        """Fetch open markets from Kalshi - target high-volume political/economic markets.
         
-        Strategy: Fetch ALL markets, sort by volume, trade the liquid ones.
-        Volume is the best proxy for liquidity - let it decide, not category filters.
+        Strategy: Fetch from specific high-value event series, not just default listing.
         """
         try:
-            # First, log available events/series to see what categories exist
-            try:
-                events_result = await self._kalshi.get_events(status='open', limit=50)
-                events = events_result.get('events', [])
-                event_tickers = [e.get('event_ticker', '')[:30] for e in events[:10]]
-                print(f"[Events Sample] {event_tickers}")
-            except Exception as e:
-                print(f"[Events Error] {e}")
-            
             all_markets = []
-            cursor = None
-            pages_fetched = 0
-            max_pages = 5  # Fetch up to 500 markets
             
-            # Fetch markets with pagination
-            while pages_fetched < max_pages:
+            # Target series for politics, economics, climate - where the real volume is
+            target_series = [
+                'KXFEDCHAIR',      # Fed Chair nomination
+                'KXTRUMP',         # Trump-related
+                'KXDEM',           # Democratic primaries
+                'KXGOP',           # Republican primaries  
+                'KXPRES',          # Presidential
+                'KXCONGRESS',      # Congress
+                'KXSHUTDOWN',      # Government shutdown
+                'KXINFLATION',     # Inflation
+                'KXGDP',           # GDP
+                'KXUNEMPLOYMENT',  # Unemployment
+                'KXSNOW',          # Weather - snow
+                'KXRAIN',          # Weather - rain
+                'KXHURRICANE',     # Weather - hurricanes
+                'KXSUPREME',       # Supreme Court
+                'KXBIDEN',         # Biden-related
+            ]
+            
+            # Fetch from each target series
+            for series in target_series:
                 try:
-                    await asyncio.sleep(0.3)  # Rate limit
+                    await asyncio.sleep(0.2)
                     result = await self._kalshi.get_markets(
                         status='open',
-                        limit=100,
-                        cursor=cursor,
-                        exclude_mve=True  # Exclude sports combo markets
+                        series_ticker=series,
+                        limit=50
                     )
                     markets = result.get('markets', [])
-                    if not markets:
-                        break
                     all_markets.extend(markets)
-                    cursor = result.get('cursor')
-                    pages_fetched += 1
-                    if not cursor:
-                        break
                 except Exception as e:
-                    if '429' in str(e):
-                        await asyncio.sleep(2)
-                    break
+                    continue
             
-            # Log sample of market tickers to see what we're getting
-            sample_tickers = [m.get('ticker', '')[:50] for m in all_markets[:20]]
-            print(f"[Sample Tickers] {sample_tickers[:10]}")
+            # Also fetch general markets (excluding MVE) for diversity
+            try:
+                result = await self._kalshi.get_markets(
+                    status='open',
+                    limit=100,
+                    exclude_mve=True
+                )
+                all_markets.extend(result.get('markets', []))
+            except:
+                pass
+            
+            print(f"[Fetched] {len(all_markets)} markets from targeted series")
+            
+            # Log sample
+            sample_tickers = [m.get('ticker', '')[:40] for m in all_markets[:10]]
+            print(f"[Sample] {sample_tickers[:5]}")
             
             # Sort ALL markets by volume (most liquid first)
             all_markets.sort(key=lambda x: x.get('volume', 0) or 0, reverse=True)
