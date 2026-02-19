@@ -1008,11 +1008,19 @@ class KalshiBattleBot:
                     pos['current_price'] = current_price
                     pos['unrealized_pnl'] = unrealized_pnl
                     
-                    # Exit conditions based on actual position value
-                    # Max gain per contract = 1 - entry_price (for YES) or entry_price (for NO)
-                    # Max loss per contract = entry_price (for YES) or 1 - entry_price (for NO)
-                    profit_take_pct = self._risk_limits.profit_take_pct
-                    stop_loss_pct = self._risk_limits.stop_loss_pct
+                    # Dynamic exit thresholds based on market spread
+                    # Tighter spreads = tighter thresholds, wider spreads = more room
+                    spread = market.get('spread', 0.04)  # Default 4¢ if unknown
+                    
+                    if spread <= 0.02:  # Tight spread (≤2¢)
+                        profit_take_pct = 0.05   # 5% profit target
+                        stop_loss_pct = 0.05     # 5% stop loss
+                    elif spread <= 0.04:  # Medium spread (2-4¢)
+                        profit_take_pct = 0.10   # 10% profit target
+                        stop_loss_pct = 0.08     # 8% stop loss
+                    else:  # Wide spread (>4¢)
+                        profit_take_pct = 0.15   # 15% profit target
+                        stop_loss_pct = 0.12     # 12% stop loss
                     
                     # Calculate profit target and stop loss based on contract cost
                     cost_basis = contracts * entry_price  # What we paid
