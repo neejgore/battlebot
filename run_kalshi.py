@@ -263,21 +263,38 @@ class KalshiBattleBot:
         at_risk_ultra_short = 0  # ≤24 hours
         at_risk_short = 0        # 1-7 days
         at_risk_medium = 0       # 8+ days
+        now = datetime.utcnow()
         
         for pos in self._positions.values():
             size = pos.get('size', 0)
             market = self._markets.get(pos.get('market_id', ''))
+            
+            # Calculate time to resolution from end_date if available
+            hours_to_res = 9999
+            days_to_res = 9999
+            
             if market:
-                hours = market.get('hours_to_resolution', 999)
-                days = market.get('days_to_resolution', 999)
-                if hours <= 24:
-                    at_risk_ultra_short += size
-                elif days <= 7:
-                    at_risk_short += size
-                else:
-                    at_risk_medium += size
+                # Try cached values first
+                hours_to_res = market.get('hours_to_resolution', 9999)
+                days_to_res = market.get('days_to_resolution', 9999)
+                
+                # If not cached, calculate from end_date
+                if hours_to_res == 9999 and market.get('end_date'):
+                    try:
+                        end_date = datetime.fromisoformat(market['end_date'].replace('Z', '+00:00'))
+                        time_to_res = end_date.replace(tzinfo=None) - now
+                        hours_to_res = time_to_res.total_seconds() / 3600
+                        days_to_res = time_to_res.days
+                    except:
+                        pass
+            
+            # Categorize by time horizon
+            if hours_to_res <= 24:
+                at_risk_ultra_short += size
+            elif days_to_res <= 7:
+                at_risk_short += size
             else:
-                at_risk_medium += size  # Default to medium if unknown
+                at_risk_medium += size
         
         exits = [t for t in self._trades if t.get('action') == 'EXIT']
         winning = len([t for t in exits if t.get('pnl', 0) > 0])
