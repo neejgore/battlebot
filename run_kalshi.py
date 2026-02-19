@@ -102,6 +102,14 @@ class KalshiBattleBot:
     
     def _load_state(self):
         """Load positions and trades from disk."""
+        # Check if state should be cleared (for recovering from phantom positions)
+        if os.getenv('CLEAR_STATE', '').lower() == 'true':
+            print("[State] CLEAR_STATE=true - clearing all positions and trades")
+            self._positions = {}
+            self._trades = []
+            self._save_state()
+            return
+            
         try:
             if os.path.exists(self._state_file):
                 with open(self._state_file, 'r') as f:
