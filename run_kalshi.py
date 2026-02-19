@@ -253,13 +253,19 @@ class KalshiBattleBot:
     
     def _get_stats(self) -> dict:
         """Calculate all stats from current state."""
-        at_risk = sum(p['size'] for p in self._positions.values())
+        # Filled positions
+        positions_at_risk = sum(p['size'] for p in self._positions.values())
+        # Pending/resting orders
+        pending_at_risk = sum(o.get('size', 0) for o in self._pending_orders.values())
+        # Total at risk
+        at_risk = positions_at_risk + pending_at_risk
+        
         realized_pnl = sum(t.get('pnl', 0) for t in self._trades if t.get('action') == 'EXIT')
         available = self.initial_bankroll - at_risk + realized_pnl
         unrealized_pnl = sum(p.get('unrealized_pnl', 0) for p in self._positions.values())
         total_value = available + at_risk + unrealized_pnl
         
-        # Calculate at-risk by time horizon
+        # Calculate at-risk by time horizon (positions only)
         at_risk_ultra_short = 0  # ≤24 hours
         at_risk_short = 0        # 1-7 days
         at_risk_medium = 0       # 8+ days
@@ -324,6 +330,9 @@ class KalshiBattleBot:
             'initial_bankroll': self.initial_bankroll,
             'available': available,
             'at_risk': at_risk,
+            'positions_at_risk': positions_at_risk,
+            'pending_at_risk': pending_at_risk,
+            'pending_orders': len(self._pending_orders),
             'at_risk_ultra_short': at_risk_ultra_short,
             'at_risk_short': at_risk_short,
             'at_risk_medium': at_risk_medium,
@@ -1635,11 +1644,16 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div class="section-title">ACCOUNT</div>
             <div class="grid">
                 <div class="card"><div class="card-label">Available</div><div class="card-value green" id="available">$0.00</div></div>
-                <div class="card"><div class="card-label">At Risk</div><div class="card-value yellow" id="atRisk">$0.00</div><div class="card-sub" id="posCount">0 positions</div></div>
+                <div class="card"><div class="card-label">At Risk (Total)</div><div class="card-value yellow" id="atRisk">$0.00</div><div class="card-sub" id="posCount">0 positions</div></div>
                 <div class="card"><div class="card-label">Total Value</div><div class="card-value" id="totalValue">$0.00</div></div>
                 <div class="card"><div class="card-label">Return</div><div class="card-value green" id="returnPct">0.00%</div></div>
             </div>
-            <div class="section-title">AT RISK BY TIME HORIZON</div>
+            <div class="section-title">AT RISK BREAKDOWN</div>
+            <div class="grid">
+                <div class="card"><div class="card-label">Filled Positions</div><div class="card-value" id="positionsAtRisk">$0.00</div><div class="card-sub" id="filledCount">0 filled</div></div>
+                <div class="card"><div class="card-label">Resting Orders</div><div class="card-value" id="pendingAtRisk">$0.00</div><div class="card-sub" id="restingCount">0 resting</div></div>
+            </div>
+            <div class="section-title">AT RISK BY TIME HORIZON (Filled Only)</div>
             <div class="grid">
                 <div class="card"><div class="card-label">Ultra-Short (≤24h)</div><div class="card-value" id="atRiskUltra">$0.00</div><div class="card-sub">resolves in hours</div></div>
                 <div class="card"><div class="card-label">Short (1-7d)</div><div class="card-value" id="atRiskShort">$0.00</div><div class="card-sub">resolves in days</div></div>
@@ -1708,7 +1722,13 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         function updateStats(s) {
             document.getElementById('available').textContent = '$' + s.available.toFixed(2);
             document.getElementById('atRisk').textContent = '$' + s.at_risk.toFixed(2);
-            document.getElementById('posCount').textContent = s.open_positions + ' positions';
+            document.getElementById('posCount').textContent = s.open_positions + ' positions + ' + (s.pending_orders || 0) + ' resting';
+            // At Risk Breakdown
+            document.getElementById('positionsAtRisk').textContent = '$' + (s.positions_at_risk || 0).toFixed(2);
+            document.getElementById('filledCount').textContent = s.open_positions + ' filled';
+            document.getElementById('pendingAtRisk').textContent = '$' + (s.pending_at_risk || 0).toFixed(2);
+            document.getElementById('restingCount').textContent = (s.pending_orders || 0) + ' resting';
+            // Time Horizon
             document.getElementById('atRiskUltra').textContent = '$' + (s.at_risk_ultra_short || 0).toFixed(2);
             document.getElementById('atRiskShort').textContent = '$' + (s.at_risk_short || 0).toFixed(2);
             document.getElementById('atRiskMedium').textContent = '$' + (s.at_risk_medium || 0).toFixed(2);
