@@ -42,6 +42,7 @@ class KalshiBattleBot:
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.5))
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 50))
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.1))
+        self.max_oi_pct = float(os.getenv('MAX_OI_PCT', 0.10))  # Max 10% of open interest
         self.simulate_prices = os.getenv('SIMULATE_PRICES', 'false').lower() == 'true'
         
         # Kalshi client
@@ -369,6 +370,7 @@ class KalshiBattleBot:
             'min_confidence': self.min_confidence,
             'max_position_size': self.max_position_size,
             'kelly_fraction': self.kelly_fraction,
+            'max_oi_pct': self.max_oi_pct,
             'kill_switch': self._risk_engine.daily_stats.kill_switch_triggered,
             'daily_drawdown': self._risk_engine.daily_stats.current_drawdown_pct,
             'exposure_ratio': at_risk / self.initial_bankroll,
@@ -962,6 +964,17 @@ class KalshiBattleBot:
                 confidence=signal.confidence,
                 market_id=market_id,
             )
+            
+            # Liquidity cap: don't exceed X% of open interest
+            open_interest = market.get('open_interest', 0) or 0
+            if open_interest > 0 and self.max_oi_pct > 0:
+                # Each contract costs ~trade_price, so max_contracts = OI * max_oi_pct
+                max_contracts_by_liquidity = int(open_interest * self.max_oi_pct)
+                max_size_by_liquidity = max_contracts_by_liquidity * trade_price
+                if position_size > max_size_by_liquidity:
+                    print(f"[Liquidity Cap] ${position_size:.2f} → ${max_size_by_liquidity:.2f} (OI={open_interest}, max {self.max_oi_pct*100:.0f}%)")
+                    position_size = max_size_by_liquidity
+            
             print(f"[Debug] Position size: ${position_size:.2f}")
             
             if position_size > 0:
