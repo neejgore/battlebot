@@ -588,16 +588,13 @@ class KalshiBattleBot:
         except Exception as e:
             print(f"[Kalshi API Error] {e}")
     
-    def _is_combo_market(self, market: dict) -> bool:
+    def _is_combo_market(self, market_id: str) -> bool:
         """Detect multi-leg combo markets that have poor liquidity.
         
-        NOTE: Disabled for now - relying on volume filter instead.
-        Kalshi's API returns many MULTIGAME markets, but some may have
-        decent liquidity. Let volume filtering handle market quality.
+        MULTIGAME and PARLAY markets are multi-leg bets with no liquidity.
         """
-        # Disabled - let volume filter handle this
-        # The volume filter (MIN_VOLUME_24H) is a better proxy for liquidity
-        return False
+        market_id_upper = market_id.upper()
+        return 'MULTIGAME' in market_id_upper or 'PARLAY' in market_id_upper
     
     async def _select_markets(self):
         """Filter markets using eligibility criteria.
@@ -683,8 +680,7 @@ class KalshiBattleBot:
             
             # Filter out MULTIGAME combo/parlay markets - they have no liquidity
             market_id = m.get('id', '')
-            is_combo = 'MULTIGAME' in market_id.upper() or 'PARLAY' in market_id.upper()
-            if is_combo:
+            if self._is_combo_market(market_id):
                 rejection_counts['combo_market'] += 1
                 if hours_to_resolution <= 24:
                     ultra_short_rejected['combo'] += 1
