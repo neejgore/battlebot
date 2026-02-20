@@ -1544,17 +1544,32 @@ class KalshiBattleBot:
         no_price = market.get('no_price', 1 - current_price)  # Fallback if not available
         
         if adjusted_prob > yes_price:
-            # Bet YES: we think YES is more likely than the market price implies
-            # DISABLED: Historical data shows YES bets have 0% win rate
-            # Skip YES bets entirely - only bet NO
+            # YES opportunity detected - but we only bet NO based on historical data
+            # Historical analysis: YES bets had 0% win rate, NO bets had 54%
             side = 'YES'
             edge = adjusted_prob - yes_price
             trade_prob = adjusted_prob
             trade_price = yes_price
-            # Log but don't trade
-            print(f"[AI] {question[:50]}... | ✗ SKIP YES | YES bets disabled (0% historical win rate)")
-            self._analyses[0]['decision'] = 'NO_TRADE'
-            self._analyses[0]['reason'] = 'YES_BETS_DISABLED'
+            
+            # Create analysis record for this skipped YES bet
+            skip_analysis = {
+                'market_id': market_id,
+                'question': market.get('question', ''),
+                'market_price': current_price,
+                'ai_probability': signal.raw_prob,
+                'calibrated_probability': calibrated_prob,
+                'adjusted_probability': adjusted_prob,
+                'confidence': signal.confidence,
+                'edge': edge,
+                'side': 'YES',
+                'decision': 'NO_TRADE',
+                'reason': 'YES_BETS_DISABLED',
+                'timestamp': datetime.utcnow().isoformat(),
+            }
+            self._analyses.insert(0, skip_analysis)
+            self._analyses = self._analyses[:50]
+            
+            print(f"[AI] {question[:50]}... | ✗ SKIP YES | edge={edge*100:.1f}% (YES bets disabled)")
             await self._broadcast_update()
             return
         else:
