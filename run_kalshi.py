@@ -406,6 +406,75 @@ class KalshiBattleBot:
             import traceback
             traceback.print_exc()
     
+    def _get_historical_performance(self) -> dict:
+        """Calculate win/loss performance by category from trade history.
+        
+        Returns dict with category stats that can be fed to AI for learning.
+        """
+        # Get all completed exits with P&L
+        exits = [t for t in self._trades if t.get('action') == 'EXIT' and 'pnl' in t]
+        
+        if not exits:
+            return {'summary': 'No completed trades yet.', 'by_category': {}}
+        
+        # Group by category
+        by_category = {}
+        for trade in exits:
+            # Try to get category from trade, or infer from question
+            category = trade.get('category', 'unknown')
+            if category == 'unknown':
+                question = trade.get('question', '').lower()
+                if any(word in question for word in ['basketball', 'nba', 'nfl', 'mlb', 'nhl', 'hockey', 'football', 'baseball', 'soccer', 'tennis', 'golf', 'ufc', 'boxing', 'double', 'points', 'rebounds', 'assists', 'wins']):
+                    category = 'sports'
+                elif any(word in question for word in ['bitcoin', 'btc', 'eth', 'crypto', 'coin']):
+                    category = 'crypto'
+                elif any(word in question for word in ['trump', 'biden', 'congress', 'senate', 'election', 'president', 'governor', 'fed', 'chair', 'nominee', 'bill', 'law']):
+                    category = 'politics'
+                elif any(word in question for word in ['s&p', 'stock', 'nasdaq', 'dow', 'market', 'gdp', 'inflation', 'rate']):
+                    category = 'economics'
+                else:
+                    category = 'other'
+            
+            if category not in by_category:
+                by_category[category] = {'wins': 0, 'losses': 0, 'total_pnl': 0.0}
+            
+            pnl = trade.get('pnl', 0)
+            if pnl > 0:
+                by_category[category]['wins'] += 1
+            else:
+                by_category[category]['losses'] += 1
+            by_category[category]['total_pnl'] += pnl
+        
+        # Build summary string for AI
+        lines = []
+        for cat, stats in sorted(by_category.items(), key=lambda x: x[1]['wins'] + x[1]['losses'], reverse=True):
+            total = stats['wins'] + stats['losses']
+            win_rate = stats['wins'] / total * 100 if total > 0 else 0
+            pnl = stats['total_pnl']
+            lines.append(f"- {cat.upper()}: {stats['wins']}W/{stats['losses']}L ({win_rate:.0f}% win rate), P&L: ${pnl:+.2f}")
+        
+        # Add recommendations based on performance
+        recommendations = []
+        for cat, stats in by_category.items():
+            total = stats['wins'] + stats['losses']
+            if total >= 2:  # Need at least 2 trades to judge
+                win_rate = stats['wins'] / total
+                if win_rate < 0.3:
+                    recommendations.append(f"AVOID {cat.upper()} - historically poor ({stats['wins']}W/{stats['losses']}L)")
+                elif win_rate > 0.6:
+                    recommendations.append(f"FAVOR {cat.upper()} - historically strong ({stats['wins']}W/{stats['losses']}L)")
+        
+        summary = "HISTORICAL PERFORMANCE:\n" + "\n".join(lines)
+        if recommendations:
+            summary += "\n\nRECOMMENDATIONS:\n" + "\n".join(recommendations)
+        
+        return {
+            'summary': summary,
+            'by_category': by_category,
+            'total_trades': len(exits),
+            'recommendations': recommendations,
+        }
+    
     def _get_stats(self) -> dict:
         """Calculate all stats from current state."""
         # Filled positions
@@ -1108,7 +1177,10 @@ class KalshiBattleBot:
                 f"This could be an overreaction - consider if the move is justified."
             )
         
-        # Step 2: Get AI signal with intelligence data
+        # Step 2: Get historical performance for learning
+        historical = self._get_historical_performance()
+        
+        # Step 3: Get AI signal with intelligence data and historical performance
         try:
             result = await self._ai_generator.generate_signal(
                 market_question=market.get('question', ''),
@@ -1116,11 +1188,14 @@ class KalshiBattleBot:
                 spread=market.get('spread', 0.02),
                 resolution_rules=market.get('rules', '') or market.get('description', ''),
                 volume_24h=market.get('volume_24h', 0),
-                # NEW: Intelligence data
+                category=market.get('category'),
+                # Intelligence data
                 news_summary=intel.news_summary if intel else None,
                 domain_summary=intel.domain_summary if intel else None,
                 recent_price_change=intel.recent_price_change if intel else 0.0,
                 overreaction_info=overreaction_info,
+                # Historical performance for learning
+                historical_performance=historical.get('summary') if historical.get('total_trades', 0) > 0 else None,
             )
             
             # Check if AI call succeeded (result is AISignalResult with success flag)
@@ -1391,6 +1466,7 @@ class KalshiBattleBot:
                 'side': side,
                 'price': entry_price,
                 'size': size,
+                'category': market.get('category', 'unknown'),  # Track for learning
                 'timestamp': datetime.utcnow().isoformat(),
             }
             self._trades.insert(0, trade)
@@ -1567,6 +1643,7 @@ class KalshiBattleBot:
             'size': position['size'],
             'pnl': pnl,
             'reason': reason,
+            'category': position.get('category', 'unknown'),  # Track for learning
             'timestamp': datetime.utcnow().isoformat(),
         }
         self._trades.insert(0, trade)
@@ -1665,6 +1742,7 @@ class KalshiBattleBot:
                         'size': position.get('size', 0),
                         'pnl': pnl,
                         'reason': reason,
+                        'category': position.get('category', 'unknown'),  # Track for learning
                         'timestamp': datetime.utcnow().isoformat(),
                     }
                     self._trades.insert(0, trade)

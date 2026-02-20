@@ -207,11 +207,13 @@ class AISignalGenerator:
         recent_price_path: Optional[list[float]] = None,
         depth_summary: Optional[str] = None,
         category: Optional[str] = None,
-        # NEW: Intelligence data for information advantage
+        # Intelligence data for information advantage
         news_summary: Optional[str] = None,
         domain_summary: Optional[str] = None,
         recent_price_change: float = 0.0,
         overreaction_info: Optional[str] = None,
+        # Historical performance for learning
+        historical_performance: Optional[str] = None,
     ) -> AISignalResult:
         """Generate a probability signal for a market.
         
@@ -230,6 +232,7 @@ class AISignalGenerator:
             domain_summary: Domain-specific data (prices, stats, etc.)
             recent_price_change: Price change in last 24h
             overreaction_info: Info about potential market overreaction
+            historical_performance: Summary of past trading performance by category
             
         Returns:
             AISignalResult with signal or error
@@ -252,7 +255,7 @@ class AISignalGenerator:
         start_time = time.monotonic()
         self._total_calls += 1
         
-        # Build the prompt with intelligence data
+        # Build the prompt with intelligence data and historical performance
         prompt = self._build_prompt(
             market_question=market_question,
             current_price=current_price,
@@ -267,6 +270,7 @@ class AISignalGenerator:
             domain_summary=domain_summary,
             recent_price_change=recent_price_change,
             overreaction_info=overreaction_info,
+            historical_performance=historical_performance,
         )
         
         # Try to get a valid response
@@ -346,6 +350,7 @@ class AISignalGenerator:
         domain_summary: Optional[str] = None,
         recent_price_change: float = 0.0,
         overreaction_info: Optional[str] = None,
+        historical_performance: Optional[str] = None,
     ) -> str:
         """Build the user prompt for the AI.
         
@@ -355,6 +360,7 @@ class AISignalGenerator:
             domain_summary: Domain-specific data
             recent_price_change: 24h price change
             overreaction_info: Overreaction detection info
+            historical_performance: Summary of past trading performance
             
         Returns:
             Formatted prompt string
@@ -395,6 +401,16 @@ class AISignalGenerator:
 CONSIDER: Large recent price moves often overshoot. If your analysis contradicts the move, this could be an opportunity.
 """
         
+        # Build historical performance section (learning from past trades)
+        historical_section = ""
+        if historical_performance:
+            historical_section = f"""
+=== LEARNING FROM PAST TRADES ===
+{historical_performance}
+
+IMPORTANT: Use this historical data to inform your confidence. If this market category has performed poorly, be MORE skeptical and consider LOWERING your confidence or SKIPPING the bet entirely.
+"""
+        
         prompt = f"""MARKET ANALYSIS REQUEST
 
 === MARKET QUESTION ===
@@ -419,7 +435,7 @@ Time Remaining: {days_remaining}
 
 === ORDERBOOK DEPTH ===
 {depth_summary or 'Not available'}
-{intelligence_section}{overreaction_section}
+{intelligence_section}{overreaction_section}{historical_section}
 === YOUR TASK ===
 Estimate the TRUE probability that this market resolves YES.
 
