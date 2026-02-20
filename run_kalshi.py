@@ -1232,16 +1232,37 @@ class KalshiBattleBot:
                     await asyncio.sleep(60)
                     continue
                 
-                # Sort monitored markets by time to resolution (shortest first)
+                # Sort monitored markets by:
+                # 1. Time to resolution (shorter = more urgent)
+                # 2. News relevance score (higher = news matters more)
+                # Combined score: lower time + higher news relevance = higher priority
+                from services.market_intelligence import NewsService
+                
+                def market_priority(m):
+                    hours = m.get('hours_to_resolution', 9999)
+                    news_score = NewsService.score_news_relevance(
+                        m.get('question', ''), 
+                        m.get('category')
+                    )
+                    # Weight: time matters most, but boost high-news-value markets
+                    # Lower score = higher priority
+                    time_score = min(hours, 168) / 168  # Normalize to 0-1 (cap at 1 week)
+                    return time_score - (news_score * 0.3)  # News relevance reduces score
+                
                 markets_by_urgency = sorted(
                     self._monitored.values(),
-                    key=lambda m: m.get('hours_to_resolution', 9999)
+                    key=market_priority
                 )
                 
                 for market in markets_by_urgency:
                     market_id = market.get('id')
                     if not market_id:
                         continue
+                    
+                    # Skip markets where news has very low value (mention/say markets)
+                    question_lower = market.get('question', '').lower()
+                    if any(term in question_lower for term in ['mention', 'announcer', 'say during']):
+                        continue  # These are pure noise/entertainment markets
                         
                     if len(self._positions) >= self._risk_limits.max_positions:
                         break
@@ -1261,9 +1282,14 @@ class KalshiBattleBot:
                         if (datetime.utcnow() - last).total_seconds() < cooldown:
                             continue
                     
-                    # Log time horizon for visibility
-                    if hours_to_res <= 24:
-                        print(f"[ULTRA-SHORT] Analyzing: {hours_to_res:.1f}h to resolution")
+                    # Log time horizon and news relevance for visibility
+                    news_relevance = NewsService.score_news_relevance(
+                        market.get('question', ''),
+                        market.get('category')
+                    )
+                    time_label = "ULTRA-SHORT" if hours_to_res <= 24 else "SHORT" if hours_to_res <= 168 else "MEDIUM"
+                    if hours_to_res <= 168 or news_relevance > 0.6:  # Log short-term or high news value
+                        print(f"[{time_label}] {hours_to_res:.1f}h | News relevance: {news_relevance:.2f}")
                     
                     await self._analyze_market(market)
                     self._last_analysis[market_id] = datetime.utcnow()

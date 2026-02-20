@@ -119,18 +119,35 @@ class NewsService:
     
     def _build_search_query(self, question: str, category: Optional[str] = None) -> str:
         """Build an effective search query for news."""
+        question_lower = question.lower()
+        
+        # SPORTS-SPECIFIC QUERY BUILDING
+        # Detect sports betting markets and build targeted queries
+        is_sports = (
+            category and category.lower() == 'sports' or
+            any(term in question_lower for term in [
+                'wins', 'points', 'spread', 'total', 'over', 'under',
+                'nba', 'nfl', 'mlb', 'nhl', 'ncaa', 'basketball', 'football',
+                'hockey', 'baseball', 'soccer', 'tennis', 'golf'
+            ])
+        )
+        
+        if is_sports:
+            return self._build_sports_query(question)
+        
+        # Default query building for non-sports
         terms = self._extract_search_terms(question)
         
         # Add category context
         if category:
             category_terms = {
-                'politics': 'news',
-                'sports': 'sports news',
-                'crypto': 'crypto news',
-                'economics': 'economic news',
+                'politics': 'latest news',
+                'crypto': 'crypto market news',
+                'economics': 'economic news today',
                 'entertainment': 'news',
                 'tech': 'tech news',
-                'weather': 'weather',
+                'weather': 'weather forecast',
+                'world': 'breaking news',
             }
             if category.lower() in category_terms:
                 terms.append(category_terms[category.lower()])
@@ -139,6 +156,66 @@ class NewsService:
         query = ' '.join(terms[:5])
         
         return query
+    
+    def _build_sports_query(self, question: str) -> str:
+        """Build sports-specific search queries for betting intelligence."""
+        question_lower = question.lower()
+        
+        # Extract team names (capitalized words that aren't common words)
+        import re
+        words = question.split()
+        
+        # Common non-team words to filter out
+        skip_words = {
+            'wins', 'win', 'points', 'point', 'spread', 'total', 'over', 'under',
+            'the', 'by', 'at', 'vs', 'and', 'or', 'will', 'what', 'how', 'who',
+            'game', 'match', 'tonight', 'today', 'this', 'season', 'announcers',
+            'say', 'during', 'mentions', 'mention', 'double', 'triple'
+        }
+        
+        # Extract potential team/player names (capitalized or known patterns)
+        teams = []
+        for i, word in enumerate(words):
+            # Skip numbers and short words
+            clean_word = re.sub(r'[^\w]', '', word)
+            if len(clean_word) < 2:
+                continue
+            if clean_word.lower() in skip_words:
+                continue
+            # Check if it looks like a proper noun or team name
+            if word[0].isupper() or clean_word.isupper():
+                # Handle multi-word team names like "San Antonio" or "North Texas"
+                if i > 0 and words[i-1][0].isupper() and words[i-1].lower() not in skip_words:
+                    # Combine with previous word
+                    if teams:
+                        teams[-1] = teams[-1] + ' ' + clean_word
+                    else:
+                        teams.append(clean_word)
+                else:
+                    teams.append(clean_word)
+        
+        # Detect bet type
+        bet_type = ""
+        if 'spread' in question_lower or 'by over' in question_lower or 'by under' in question_lower:
+            bet_type = "spread prediction"
+        elif 'total' in question_lower or 'over' in question_lower or 'under' in question_lower:
+            bet_type = "over under prediction"
+        elif 'wins' in question_lower:
+            bet_type = "game preview picks"
+        
+        # Build query focused on actionable betting intelligence
+        if len(teams) >= 2:
+            # Two teams - it's a matchup
+            query = f"{teams[0]} vs {teams[1]} {bet_type} injury report lineup"
+        elif len(teams) == 1:
+            # Single team
+            query = f"{teams[0]} {bet_type} injury report news today"
+        else:
+            # Fallback to basic extraction
+            terms = self._extract_search_terms(question)
+            query = ' '.join(terms[:4]) + " sports betting news"
+        
+        return query[:100]  # Keep query reasonable length
     
     async def _fetch_brave(self, query: str, max_results: int = 5) -> list[NewsItem]:
         """Fetch news using Brave Search API."""
@@ -257,6 +334,7 @@ class NewsService:
                 return cached_items
         
         query = self._build_search_query(question, category)
+        logger.info(f"[News] Query: '{query}' | Category: {category or 'none'}")
         news_items = []
         
         # Try Brave first (if configured)
@@ -289,6 +367,59 @@ class NewsService:
             'cache_size': len(self._cache),
             'cache_ttl_minutes': self._cache_ttl.total_seconds() / 60,
         }
+    
+    @staticmethod
+    def score_news_relevance(question: str, category: Optional[str] = None) -> float:
+        """Score how much news intelligence should matter for this market (0-1).
+        
+        Higher scores = news is more likely to provide edge.
+        Used to prioritize which markets to analyze with full intelligence.
+        """
+        question_lower = question.lower()
+        score = 0.5  # Base score
+        
+        # HIGH NEWS VALUE: Events that break suddenly
+        high_value_patterns = [
+            ('resign', 0.4), ('fired', 0.4), ('indicted', 0.4), ('arrested', 0.4),
+            ('announced', 0.3), ('breaking', 0.3), ('confirms', 0.3), ('denies', 0.3),
+            ('injury', 0.3), ('ruled out', 0.35), ('questionable', 0.25), ('starting', 0.2),
+            ('cabinet', 0.3), ('nomination', 0.3), ('confirmed', 0.25),
+            ('peace', 0.3), ('war', 0.3), ('ceasefire', 0.35), ('attack', 0.3),
+        ]
+        
+        for pattern, bonus in high_value_patterns:
+            if pattern in question_lower:
+                score += bonus
+        
+        # CATEGORY BONUSES
+        if category:
+            cat_lower = category.lower()
+            category_scores = {
+                'politics': 0.25,  # News breaks fast in politics
+                'world': 0.25,    # International events
+                'sports': 0.15,   # Injuries, lineups matter
+                'crypto': 0.1,    # Market news
+                'economics': 0.15, # Fed announcements, data
+                'entertainment': 0.1,
+                'weather': 0.05,  # Weather forecasts are known
+            }
+            score += category_scores.get(cat_lower, 0)
+        
+        # TIME-SENSITIVE BONUSES (detected from question)
+        if any(term in question_lower for term in ['tonight', 'today', 'tomorrow', 'this week']):
+            score += 0.1  # Imminent events = news matters more
+        
+        # SPORTS-SPECIFIC: Certain bet types benefit more from news
+        if 'spread' in question_lower or 'total' in question_lower:
+            score += 0.1  # Injury news directly impacts spreads
+        if 'wins' in question_lower and 'season' not in question_lower:
+            score += 0.1  # Single game outcomes
+        
+        # MENTION/SAY markets have LOW news value (entertainment speculation)
+        if 'mention' in question_lower or 'say' in question_lower or 'announcer' in question_lower:
+            score -= 0.3
+        
+        return min(max(score, 0.0), 1.0)  # Clamp to [0, 1]
 
 
 # ============================================================================
