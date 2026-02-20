@@ -288,12 +288,21 @@ class KalshiBattleBot:
             
             print(f"[Sync] Found {len(kalshi_positions)} positions on Kalshi")
             
+            # Debug: Log first position's structure
+            if kalshi_positions:
+                sample = kalshi_positions[0]
+                print(f"[Sync] Sample position fields: {list(sample.keys())}")
+            
             # Build a map of Kalshi positions by ticker
             kalshi_by_ticker = {}
             for kp in kalshi_positions:
                 ticker = kp.get('ticker', kp.get('market_ticker', ''))
                 if ticker:
                     kalshi_by_ticker[ticker] = kp
+                    # Debug log each position
+                    pos = kp.get('position', 0)
+                    exposure = kp.get('market_exposure', 0)
+                    print(f"[Sync] Kalshi: {ticker[:30]}... | pos={pos} | exposure={exposure}¢")
             
             # Check for phantom positions (in bot but not on Kalshi)
             phantom_count = 0
@@ -321,16 +330,27 @@ class KalshiBattleBot:
                     continue  # No actual position
                 
                 # Get the actual entry price from Kalshi
-                # Kalshi returns prices in cents
-                avg_price_cents = kp.get('average_entry_price', 0) or kp.get('average_execution_price', 0)
-                if avg_price_cents > 1:  # Likely in cents
-                    entry_price = avg_price_cents / 100
+                # Kalshi API returns market_exposure (cost in cents) and position (contracts)
+                # Entry price = market_exposure / abs(position)
+                market_exposure_cents = kp.get('market_exposure', 0)
+                contracts = abs(position_count)
+                
+                if contracts > 0 and market_exposure_cents > 0:
+                    entry_price = (market_exposure_cents / contracts) / 100  # Convert cents to dollars
                 else:
-                    entry_price = avg_price_cents or 0.5  # Fallback
+                    # Try dollars field as fallback
+                    market_exposure_dollars = kp.get('market_exposure_dollars', '0')
+                    try:
+                        exposure_float = float(market_exposure_dollars)
+                        entry_price = exposure_float / contracts if contracts > 0 else 0.5
+                    except:
+                        entry_price = 0.5  # Fallback
                 
                 # Determine side from position count
                 side = 'YES' if position_count > 0 else 'NO'
-                contracts = abs(position_count)
+                
+                # Calculate actual size (cost) from market_exposure
+                actual_size = market_exposure_cents / 100 if market_exposure_cents > 0 else contracts * entry_price
                 
                 if ticker not in existing_tickers:
                     # Add missing position
@@ -342,7 +362,7 @@ class KalshiBattleBot:
                         'market_id': ticker,
                         'question': question,
                         'side': side,
-                        'size': contracts * entry_price,
+                        'size': actual_size,
                         'entry_price': entry_price,
                         'current_price': entry_price,
                         'contracts': contracts,
@@ -353,18 +373,25 @@ class KalshiBattleBot:
                         'unrealized_pnl': 0.0,
                         'synced_from_kalshi': True,
                     }
-                    print(f"[Sync] Added position from Kalshi: {side} {contracts} @ {entry_price*100:.0f}¢ | {question[:40]}...")
+                    print(f"[Sync] Added position from Kalshi: {side} {contracts} @ {entry_price*100:.0f}¢ (${actual_size:.2f}) | {question[:40]}...")
                     added_count += 1
                 else:
-                    # Update existing position with correct entry price
+                    # Update existing position with correct entry price and size
                     for pos_id, pos in self._positions.items():
                         if pos.get('market_id') == ticker:
                             old_price = pos.get('entry_price', 0)
-                            if abs(old_price - entry_price) > 0.01:  # Significant difference
-                                print(f"[Sync] Updating entry price: {old_price*100:.0f}¢ → {entry_price*100:.0f}¢ | {pos.get('question', '')[:40]}...")
+                            old_size = pos.get('size', 0)
+                            
+                            # Check if anything needs updating
+                            price_diff = abs(old_price - entry_price) > 0.005
+                            size_diff = abs(old_size - actual_size) > 0.01
+                            
+                            if price_diff or size_diff:
+                                print(f"[Sync] Updating: {old_price*100:.0f}¢→{entry_price*100:.0f}¢, ${old_size:.2f}→${actual_size:.2f} | {pos.get('question', '')[:40]}...")
                                 pos['entry_price'] = entry_price
                                 pos['contracts'] = contracts
-                                pos['size'] = contracts * entry_price
+                                pos['size'] = actual_size
+                                pos['side'] = side  # Also update side in case it was wrong
                                 updated_count += 1
                             break
             
