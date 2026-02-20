@@ -61,7 +61,10 @@ class KalshiBattleBot:
         self._pending_orders: dict[str, dict] = {}  # Orders placed but not yet filled
         self._trades: list[dict] = []
         self._analyses: list[dict] = []
-        self._kalshi_cash = None  # Actual Kalshi balance from API (synced)
+        # Actual Kalshi values from API (synced every 5 min)
+        self._kalshi_cash = None       # Available cash
+        self._kalshi_portfolio = None  # Current positions value
+        self._kalshi_total = None      # Total portfolio value
         self._load_state()
         
         self._running = False
@@ -277,28 +280,23 @@ class KalshiBattleBot:
         print("[Sync] Fetching actual data from Kalshi...")
         
         try:
-            # Fetch actual balance from Kalshi
+            # Fetch actual balance and portfolio value from Kalshi
             try:
                 balance_result = await self._kalshi.get_balance()
-                # Kalshi returns balance in cents or dollars depending on field
-                cash_cents = balance_result.get('balance', 0)
-                cash_dollars = balance_result.get('balance_dollars', None)
-                if cash_dollars:
-                    self._kalshi_cash = float(cash_dollars)
-                elif cash_cents:
-                    self._kalshi_cash = cash_cents / 100 if cash_cents > 100 else cash_cents
-                else:
-                    self._kalshi_cash = None
+                # Kalshi returns all values in cents
+                balance_cents = balance_result.get('balance', 0)
+                portfolio_cents = balance_result.get('portfolio_value', 0)
                 
-                # Also get portfolio value if available
-                payout_cents = balance_result.get('payout_available', 0)
-                payout_dollars = balance_result.get('payout_available_dollars', None)
+                self._kalshi_cash = balance_cents / 100  # Convert to dollars
+                self._kalshi_portfolio = portfolio_cents / 100  # Convert to dollars
+                self._kalshi_total = self._kalshi_cash + self._kalshi_portfolio
                 
-                if self._kalshi_cash is not None:
-                    print(f"[Sync] Kalshi cash balance: ${self._kalshi_cash:.2f}")
+                print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, Positions=${self._kalshi_portfolio:.2f}, Total=${self._kalshi_total:.2f}")
             except Exception as e:
                 print(f"[Sync] Could not fetch balance: {e}")
                 self._kalshi_cash = None
+                self._kalshi_portfolio = None
+                self._kalshi_total = None
             
             result = await self._kalshi.get_positions()
             kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
@@ -512,13 +510,17 @@ class KalshiBattleBot:
         realized_pnl = sum(t.get('pnl', 0) for t in self._trades if t.get('action') == 'EXIT')
         unrealized_pnl = sum(p.get('unrealized_pnl', 0) for p in self._positions.values())
         
-        # Use actual Kalshi balance if available, otherwise calculate
-        if self._kalshi_cash is not None:
+        # Use ACTUAL Kalshi values if available (these are ground truth)
+        if self._kalshi_total is not None:
             available = self._kalshi_cash
-            total_value = self._kalshi_cash + positions_at_risk + unrealized_pnl
+            total_value = self._kalshi_total
+            # Recalculate return based on actual Kalshi total
+            return_pct_actual = ((self._kalshi_total - self.initial_bankroll) / self.initial_bankroll) * 100
         else:
+            # Fallback to calculated values (less accurate)
             available = self.initial_bankroll - at_risk + realized_pnl
             total_value = available + at_risk + unrealized_pnl
+            return_pct_actual = None
         
         # Calculate at-risk by time horizon (positions only)
         at_risk_ultra_short = 0  # ≤24 hours
@@ -574,7 +576,12 @@ class KalshiBattleBot:
         
         total_closed = winning + losing
         win_rate = winning / total_closed if total_closed > 0 else 0
-        return_pct = ((total_value - self.initial_bankroll) / self.initial_bankroll) * 100
+        
+        # Use actual Kalshi return if available, otherwise calculated
+        if return_pct_actual is not None:
+            return_pct = return_pct_actual
+        else:
+            return_pct = ((total_value - self.initial_bankroll) / self.initial_bankroll) * 100
 
         runtime = "0h 0m 0s"
         if self._start_time:
@@ -592,7 +599,7 @@ class KalshiBattleBot:
             'initial_bankroll': self.initial_bankroll,
             'available': available,
             'at_risk': at_risk,
-            'positions_at_risk': positions_at_risk,
+            'positions_at_risk': self._kalshi_portfolio if self._kalshi_portfolio is not None else positions_at_risk,
             'pending_at_risk': pending_at_risk,
             'pending_orders': len(self._pending_orders),
             'at_risk_ultra_short': at_risk_ultra_short,
@@ -603,6 +610,7 @@ class KalshiBattleBot:
             'unrealized_pnl': unrealized_pnl,
             'total_pnl': realized_pnl + unrealized_pnl,
             'return_pct': return_pct,
+            'kalshi_synced': self._kalshi_total is not None,  # Shows if using real Kalshi data
             'total_entries': len([t for t in self._trades if t.get('action') == 'ENTRY']),
             'total_exits': len(exits),
             'winning_trades': winning,
