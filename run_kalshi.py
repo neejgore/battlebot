@@ -99,9 +99,9 @@ class KalshiBattleBot:
             max_percent_bankroll_per_market=0.15,  # 15% per market max
             max_total_open_risk=0.90,  # 90% max exposure - 10% reserve
             max_positions=10,  # Max 10 positions - focus, don't spread thin
-            profit_take_pct=0.20,  # 20% profit target - let winners run
-            stop_loss_pct=0.50,  # 50% stop loss - let bets ride, don't cut early
-            time_stop_hours=720,  # 30 days - let bets ride to settlement
+            profit_take_pct=999.0,  # DISABLED - let bets settle naturally
+            stop_loss_pct=999.0,  # DISABLED - let bets settle naturally
+            time_stop_hours=720,  # 30 days max - but prefer settlement
             edge_scale=0.10,
             min_edge=self.min_edge,
         )
@@ -1215,12 +1215,25 @@ class KalshiBattleBot:
         # Sort each category by composite score:
         # - Inefficiency score (higher = better opportunity)
         # - Open interest (higher = more liquid for execution)
-        # Balance: inefficiency × 0.6 + normalized_oi × 0.4
+        # - Category bonus (weather=100% win, sports_winner=28% win)
+        # Balance: inefficiency × 0.5 + normalized_oi × 0.3 + category_bonus × 0.2
         def market_score(m):
-            ineff = m.get('inefficiency_score', 0) * 0.6
-            # Normalize OI to 0-1 scale (cap at 1000)
-            oi = min(m.get('open_interest', 0) / 1000, 1.0) * 0.4
-            return ineff + oi
+            ineff = m.get('inefficiency_score', 0) * 0.5
+            oi = min(m.get('open_interest', 0) / 1000, 1.0) * 0.3
+            
+            # Category bonus based on historical win rates
+            q = m.get('question', '').lower()
+            category_bonus = 0.0
+            if 'weather' in q or 'rain' in q or 'snow' in q or 'precipitation' in q:
+                category_bonus = 1.0  # Weather: 100% win rate historically
+            elif 'crypto' in q or 'bitcoin' in q or 'ethereum' in q:
+                category_bonus = 0.5  # Crypto markets - mid tier
+            elif 'politics' in q or 'election' in q or 'congress' in q or 'senate' in q:
+                category_bonus = 0.3  # Politics - some edge possible
+            elif any(sport in q for sport in ['nba', 'nfl', 'mlb', 'nhl', 'ncaa', 'soccer', 'golf', 'tennis']):
+                category_bonus = -0.5  # Sports: historically poor (28% win rate)
+            
+            return ineff + oi + (category_bonus * 0.2)
         
         if self._prefer_inefficient:
             ultra_short.sort(key=market_score, reverse=True)
@@ -1532,10 +1545,18 @@ class KalshiBattleBot:
         
         if adjusted_prob > yes_price:
             # Bet YES: we think YES is more likely than the market price implies
+            # DISABLED: Historical data shows YES bets have 0% win rate
+            # Skip YES bets entirely - only bet NO
             side = 'YES'
             edge = adjusted_prob - yes_price
-            trade_prob = adjusted_prob  # Our belief in YES winning
-            trade_price = yes_price     # Actual cost to buy YES
+            trade_prob = adjusted_prob
+            trade_price = yes_price
+            # Log but don't trade
+            print(f"[AI] {question[:50]}... | ✗ SKIP YES | YES bets disabled (0% historical win rate)")
+            self._analyses[0]['decision'] = 'NO_TRADE'
+            self._analyses[0]['reason'] = 'YES_BETS_DISABLED'
+            await self._broadcast_update()
+            return
         else:
             # Bet NO: we think NO is more likely than the market implies
             side = 'NO'
@@ -1679,8 +1700,8 @@ class KalshiBattleBot:
         
         # STRICT LIMITS - prevent runaway orders
         MAX_CONTRACTS_PER_ORDER = 10  # Max 10 contracts per order
-        MIN_PRICE_CENTS = 5  # Don't trade below 5¢ (too risky)
-        MAX_PRICE_CENTS = 90  # Don't trade above 90¢ (not enough upside)
+        MIN_PRICE_CENTS = 15  # Don't trade below 15¢ - cheap contracts have 6% win rate
+        MAX_PRICE_CENTS = 85  # Don't trade above 85¢ - not enough upside
         
         # Use the correct price for the side we're trading
         if side.upper() == 'YES':
@@ -1884,40 +1905,18 @@ class KalshiBattleBot:
                     pos['current_price'] = current_price
                     pos['unrealized_pnl'] = unrealized_pnl
                     
-                    # Dynamic exit thresholds based on market spread
-                    # Tighter spreads = tighter thresholds, wider spreads = more room
-                    spread = market.get('spread', 0.04)  # Default 4¢ if unknown
+                    # DISABLED: Stop loss and profit target exits
+                    # Historical data shows:
+                    # - Stop losses cutting winners (32% win rate, still losing money)
+                    # - Profit targets not working (0% win rate)
+                    # Strategy: Let ALL bets settle naturally - don't exit early
+                    # Positions will only exit when market settles (winner pays 100¢)
                     
-                    if spread <= 0.02:  # Tight spread (≤2¢)
-                        profit_take_pct = 0.10   # 10% profit target
-                        stop_loss_pct = 0.50     # 50% stop loss - let bets settle
-                    elif spread <= 0.04:  # Medium spread (2-4¢)
-                        profit_take_pct = 0.15   # 15% profit target
-                        stop_loss_pct = 0.50     # 50% stop loss - let bets settle
-                    else:  # Wide spread (>4¢)
-                        profit_take_pct = 0.20   # 20% profit target
-                        stop_loss_pct = 0.50     # 50% stop loss - let bets settle
-                    
-                    # Calculate profit target and stop loss based on contract cost
-                    cost_basis = contracts * entry_price  # What we paid
-                    profit_target = cost_basis * profit_take_pct
-                    stop_loss = -cost_basis * stop_loss_pct
-                    
-                    should_exit = False
-                    exit_reason = ""
-                    
-                    if unrealized_pnl >= profit_target:
-                        should_exit = True
-                        exit_reason = "PROFIT_TARGET"
-                    elif unrealized_pnl <= stop_loss:
-                        should_exit = True
-                        exit_reason = "STOP_LOSS"
-                    
-                    if should_exit:
-                        # Don't place another sell order if one is already pending
-                        if 'pending_exit' in pos:
-                            continue
-                        await self._exit_position(pos_id, current_price, unrealized_pnl, exit_reason)
+                    # Only log extreme movements for monitoring (don't exit)
+                    if unrealized_pnl < -0.70 * (contracts * entry_price):
+                        print(f"[Position Monitor] {pos_id[:8]} down 70%+ - holding for settlement")
+                    elif unrealized_pnl > 0.50 * (contracts * entry_price):
+                        print(f"[Position Monitor] {pos_id[:8]} up 50%+ - holding for settlement")
                 
             except Exception as e:
                 print(f"[Monitor Error] {e}")
