@@ -506,27 +506,44 @@ class KalshiBattleBot:
     
     def _get_stats(self) -> dict:
         """Calculate all stats from current state."""
-        # Filled positions
-        positions_at_risk = sum(p['size'] for p in self._positions.values())
-        # Pending/resting orders
+        # Pending/resting orders (always from internal state)
         pending_at_risk = sum(o.get('size', 0) for o in self._pending_orders.values())
-        # Total at risk
-        at_risk = positions_at_risk + pending_at_risk
         
+        # Realized P&L from closed trades
         realized_pnl = sum(t.get('pnl', 0) for t in self._trades if t.get('action') == 'EXIT')
         unrealized_pnl = sum(p.get('unrealized_pnl', 0) for p in self._positions.values())
         
+        # Internal calculation for reference
+        internal_positions = sum(p['size'] for p in self._positions.values())
+        
         # Use ACTUAL Kalshi values if available (these are ground truth)
-        if self._kalshi_total is not None:
+        if self._kalshi_total is not None and self._kalshi_portfolio is not None:
+            # Kalshi API provides authoritative values
             available = self._kalshi_cash
-            total_value = self._kalshi_total
-            # Recalculate return based on actual Kalshi total
+            positions_at_risk = self._kalshi_portfolio  # Current value of filled positions
+            at_risk = positions_at_risk + pending_at_risk  # Total at risk
+            total_value = self._kalshi_total  # Cash + positions
             return_pct_actual = ((self._kalshi_total - self.initial_bankroll) / self.initial_bankroll) * 100
+            using_kalshi = True
         else:
-            # Fallback to calculated values (less accurate)
+            # Fallback to internal calculations (less accurate)
+            positions_at_risk = internal_positions
+            at_risk = positions_at_risk + pending_at_risk
             available = self.initial_bankroll - at_risk + realized_pnl
-            total_value = available + at_risk + unrealized_pnl
+            total_value = available + positions_at_risk + unrealized_pnl
             return_pct_actual = None
+            using_kalshi = False
+        
+        # Debug: Log which values are being used (every 10th call to avoid spam)
+        if not hasattr(self, '_stats_debug_counter'):
+            self._stats_debug_counter = 0
+        self._stats_debug_counter += 1
+        if self._stats_debug_counter % 10 == 1:
+            print(f"[Stats] Source: {'KALSHI API' if using_kalshi else 'INTERNAL'}")
+            print(f"[Stats] Cash=${available:.2f}, Positions=${positions_at_risk:.2f}, Total=${total_value:.2f}")
+            if using_kalshi:
+                print(f"[Stats] Kalshi raw: cash={self._kalshi_cash}, portfolio={self._kalshi_portfolio}, total={self._kalshi_total}")
+            print(f"[Stats] Internal positions sum: ${internal_positions:.2f}")
         
         # Calculate at-risk by time horizon (positions only)
         at_risk_ultra_short = 0  # ≤24 hours
@@ -605,7 +622,7 @@ class KalshiBattleBot:
             'initial_bankroll': self.initial_bankroll,
             'available': available,
             'at_risk': at_risk,
-            'positions_at_risk': self._kalshi_portfolio if self._kalshi_portfolio is not None else positions_at_risk,
+            'positions_at_risk': positions_at_risk,  # Uses Kalshi value when available
             'pending_at_risk': pending_at_risk,
             'pending_orders': len(self._pending_orders),
             'at_risk_ultra_short': at_risk_ultra_short,
