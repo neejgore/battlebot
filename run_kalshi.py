@@ -2618,6 +2618,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     </div>
     <div class="tabs">
         <div class="tab active" data-tab="portfolio">Portfolio</div>
+        <div class="tab" data-tab="txlog">Transaction Log</div>
         <div class="tab" data-tab="activity">Activity</div>
         <div class="tab" data-tab="markets">Markets</div>
     </div>
@@ -2654,6 +2655,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div id="positions"></div>
             <div class="section-title" style="margin-top:20px">Recent Trades <span id="tradeCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="trades"></div>
+        </div>
+        <div id="txlog" class="tab-content hidden">
+            <div class="section-title">Settled Bets <span id="txlogCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
+            <div id="txlogList"></div>
         </div>
         <div id="activity" class="tab-content hidden">
             <div class="section-title">AI Analyses</div>
@@ -2695,7 +2700,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 const data = JSON.parse(e.data);
                 if (data.stats) updateStats(data.stats);
                 if (data.positions) renderPositions(data.positions);
-                if (data.trades) renderTrades(data.trades);
+                if (data.trades) {
+                    renderTrades(data.trades);
+                    renderTransactionLog(data.trades);
+                }
                 if (data.analyses) renderAnalyses(data.analyses);
                 if (data.monitored) renderMarkets(data.monitored);
             };
@@ -2816,6 +2824,37 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 </div>
             `).join('');
             document.getElementById('marketList').innerHTML = html || '<div style="color:#8b949e;font-size:13px;padding:12px;">No markets monitored</div>';
+        }
+        
+        function renderTransactionLog(trades) {
+            const exits = trades.filter(t => t.action === 'EXIT').sort((a, b) => 
+                new Date(b.timestamp) - new Date(a.timestamp)
+            );
+            document.getElementById('txlogCount').textContent = exits.length;
+            const html = exits.map(t => {
+                const isWin = t.pnl > 0;
+                const pnlClass = t.pnl > 0 ? 'green' : (t.pnl < 0 ? 'red' : '');
+                const pnlSign = t.pnl >= 0 ? '+' : '';
+                const date = new Date(t.timestamp);
+                const dateStr = date.toLocaleDateString('en-US', {month:'short', day:'numeric'}) + ' ' + date.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit'});
+                return `
+                    <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;border-bottom:1px solid #30363d;">
+                        <div style="flex:1;min-width:0;">
+                            <div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${t.question}</div>
+                            <div style="font-size:11px;color:#8b949e;margin-top:2px;">${dateStr} · ${t.reason || 'SETTLED'}</div>
+                        </div>
+                        <div style="text-align:center;padding:0 16px;min-width:60px;">
+                            <div style="font-size:13px;font-weight:600;color:#58a6ff;">${t.side}</div>
+                            <div style="font-size:11px;color:#8b949e;">@ ${((t.entry_price || t.price)*100).toFixed(0)}¢</div>
+                        </div>
+                        <div style="text-align:right;min-width:80px;">
+                            <div style="font-size:15px;font-weight:600;" class="${pnlClass}">${pnlSign}$${Math.abs(t.pnl).toFixed(2)}</div>
+                            <div style="font-size:11px;color:#8b949e;">${isWin ? 'WIN' : (t.pnl < 0 ? 'LOSS' : 'BREAK EVEN')}</div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            document.getElementById('txlogList').innerHTML = html || '<div style="color:#8b949e;font-size:13px;padding:12px;">No settled bets yet</div>';
         }
         
         connect();
