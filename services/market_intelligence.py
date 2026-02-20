@@ -135,87 +135,173 @@ class NewsService:
         if is_sports:
             return self._build_sports_query(question)
         
-        # Default query building for non-sports
+        # Non-sports: build SPECIFIC queries based on category
         terms = self._extract_search_terms(question)
-        
-        # Add category context
-        if category:
-            category_terms = {
-                'politics': 'latest news',
-                'crypto': 'crypto market news',
-                'economics': 'economic news today',
-                'entertainment': 'news',
-                'tech': 'tech news',
-                'weather': 'weather forecast',
-                'world': 'breaking news',
-            }
-            if category.lower() in category_terms:
-                terms.append(category_terms[category.lower()])
-        
-        # Build query - keep it focused
-        query = ' '.join(terms[:5])
-        
-        return query
-    
-    def _build_sports_query(self, question: str) -> str:
-        """Build sports-specific search queries for betting intelligence."""
         question_lower = question.lower()
         
-        # Extract team names (capitalized words that aren't common words)
+        # Politics: Focus on specific names and actions
+        if category and category.lower() == 'politics':
+            # Extract person names (capitalized words)
+            names = [t for t in question.split() if t[0].isupper() and len(t) > 2][:2]
+            if 'resign' in question_lower or 'out' in question_lower:
+                return f'"{" ".join(names)}" resign resignation latest'
+            if 'confirm' in question_lower or 'nominat' in question_lower:
+                return f'"{" ".join(names)}" confirmation vote senate'
+            if 'attend' in question_lower:
+                return f'"{" ".join(names)}" attending will attend'
+            if names:
+                return f'"{" ".join(names)}" news today latest'
+        
+        # Crypto: Focus on specific coin and price action
+        if category and category.lower() == 'crypto':
+            coins = []
+            for coin in ['bitcoin', 'btc', 'ethereum', 'eth', 'solana', 'sol', 'xrp']:
+                if coin in question_lower:
+                    coins.append(coin.upper() if len(coin) <= 4 else coin.capitalize())
+            if coins:
+                return f'{coins[0]} price prediction news today'
+        
+        # Economics: Focus on specific indicators/events
+        if category and category.lower() == 'economics':
+            if 'fed' in question_lower or 'rate' in question_lower:
+                return 'Federal Reserve interest rate decision latest'
+            if 'inflation' in question_lower or 'cpi' in question_lower:
+                return 'inflation CPI report latest'
+            if 'jobs' in question_lower or 'employment' in question_lower:
+                return 'jobs report unemployment latest'
+        
+        # World events: Focus on specific countries/leaders
+        if category and category.lower() == 'world':
+            # Extract country/leader names
+            for leader in ['Putin', 'Xi', 'Zelensky', 'Netanyahu', 'Khamenei', 'Kim']:
+                if leader.lower() in question_lower:
+                    return f'"{leader}" news today latest'
+            for country in ['Ukraine', 'Russia', 'China', 'Israel', 'Iran', 'Taiwan', 'Gaza']:
+                if country.lower() in question_lower:
+                    return f'"{country}" breaking news latest'
+        
+        # Default: Use quotes around key terms for exact matching
+        if terms:
+            # Put the most specific term in quotes
+            return f'"{terms[0]}" {" ".join(terms[1:4])} news'
+        
+        return question[:50]
+    
+    def _build_sports_query(self, question: str) -> str:
+        """Build SPECIFIC sports search queries that return actionable intel.
+        
+        Focus on FACTS that move lines, not generic predictions:
+        - Injuries: Who's out/questionable?
+        - Lineups: Who's starting?
+        - Recent form: How are they playing?
+        """
+        question_lower = question.lower()
+        
+        # Extract team/player names
+        teams = self._extract_sports_entities(question)
+        
+        # Detect sport type for better queries
+        sport = self._detect_sport(question_lower)
+        
+        # Detect bet type to focus the query
+        if 'spread' in question_lower or 'by over' in question_lower or 'by under' in question_lower:
+            # Spread bets: injuries and scoring trends matter most
+            if teams:
+                return f'"{teams[0]}" injury report out questionable'
+        
+        elif 'total' in question_lower:
+            # Over/under: pace and scoring trends
+            if len(teams) >= 2:
+                return f'"{teams[0]}" "{teams[1]}" game total points scoring'
+            elif teams:
+                return f'"{teams[0]}" scoring average points per game'
+        
+        elif 'wins' in question_lower and 'season' not in question_lower:
+            # Single game winner: recent form and injuries
+            if teams:
+                return f'"{teams[0]}" injury report starting lineup'
+        
+        # Default: injury report is always the most valuable
+        if teams:
+            primary_team = teams[0]
+            # Make it SPECIFIC with quotes and focused terms
+            return f'"{primary_team}" injury report ruled out questionable'
+        
+        # Fallback for unrecognized format
+        terms = self._extract_search_terms(question)
+        if terms:
+            return f'"{terms[0]}" {sport} injury news'
+        
+        return question[:50]
+    
+    def _extract_sports_entities(self, question: str) -> list[str]:
+        """Extract team and player names from a sports question."""
         import re
         words = question.split()
         
-        # Common non-team words to filter out
+        # Words that are definitely NOT team/player names
         skip_words = {
             'wins', 'win', 'points', 'point', 'spread', 'total', 'over', 'under',
             'the', 'by', 'at', 'vs', 'and', 'or', 'will', 'what', 'how', 'who',
             'game', 'match', 'tonight', 'today', 'this', 'season', 'announcers',
-            'say', 'during', 'mentions', 'mention', 'double', 'triple'
+            'say', 'during', 'mentions', 'mention', 'double', 'triple', 'pro',
+            'basketball', 'football', 'hockey', 'baseball', 'soccer', 'nba',
+            'nfl', 'mlb', 'nhl', 'ncaa', 'college', 'mens', "men's", 'womens',
         }
         
-        # Extract potential team/player names (capitalized or known patterns)
-        teams = []
-        for i, word in enumerate(words):
-            # Skip numbers and short words
-            clean_word = re.sub(r'[^\w]', '', word)
-            if len(clean_word) < 2:
+        entities = []
+        current_entity = []
+        
+        for word in words:
+            clean = re.sub(r'[^\w\s-]', '', word).strip()
+            if not clean or len(clean) < 2:
+                # End of potential entity
+                if current_entity:
+                    entities.append(' '.join(current_entity))
+                    current_entity = []
                 continue
-            if clean_word.lower() in skip_words:
+            
+            if clean.lower() in skip_words:
+                if current_entity:
+                    entities.append(' '.join(current_entity))
+                    current_entity = []
                 continue
-            # Check if it looks like a proper noun or team name
-            if word[0].isupper() or clean_word.isupper():
-                # Handle multi-word team names like "San Antonio" or "North Texas"
-                if i > 0 and words[i-1][0].isupper() and words[i-1].lower() not in skip_words:
-                    # Combine with previous word
-                    if teams:
-                        teams[-1] = teams[-1] + ' ' + clean_word
-                    else:
-                        teams.append(clean_word)
-                else:
-                    teams.append(clean_word)
+            
+            # Check if it's a proper noun (capitalized)
+            if word[0].isupper():
+                current_entity.append(clean)
+            else:
+                if current_entity:
+                    entities.append(' '.join(current_entity))
+                    current_entity = []
         
-        # Detect bet type
-        bet_type = ""
-        if 'spread' in question_lower or 'by over' in question_lower or 'by under' in question_lower:
-            bet_type = "spread prediction"
-        elif 'total' in question_lower or 'over' in question_lower or 'under' in question_lower:
-            bet_type = "over under prediction"
-        elif 'wins' in question_lower:
-            bet_type = "game preview picks"
+        # Don't forget the last entity
+        if current_entity:
+            entities.append(' '.join(current_entity))
         
-        # Build query focused on actionable betting intelligence
-        if len(teams) >= 2:
-            # Two teams - it's a matchup
-            query = f"{teams[0]} vs {teams[1]} {bet_type} injury report lineup"
-        elif len(teams) == 1:
-            # Single team
-            query = f"{teams[0]} {bet_type} injury report news today"
-        else:
-            # Fallback to basic extraction
-            terms = self._extract_search_terms(question)
-            query = ' '.join(terms[:4]) + " sports betting news"
+        # Filter out single-letter entities and duplicates
+        seen = set()
+        result = []
+        for e in entities:
+            if len(e) > 2 and e.lower() not in seen:
+                seen.add(e.lower())
+                result.append(e)
         
-        return query[:100]  # Keep query reasonable length
+        return result[:3]  # Max 3 entities
+    
+    def _detect_sport(self, question_lower: str) -> str:
+        """Detect the sport type from question."""
+        if any(term in question_lower for term in ['nba', 'basketball', 'lakers', 'celtics', 'warriors']):
+            return 'NBA'
+        if any(term in question_lower for term in ['nfl', 'football', 'chiefs', 'eagles', 'cowboys']):
+            return 'NFL'
+        if any(term in question_lower for term in ['mlb', 'baseball', 'yankees', 'dodgers']):
+            return 'MLB'
+        if any(term in question_lower for term in ['nhl', 'hockey', 'bruins', 'rangers']):
+            return 'NHL'
+        if any(term in question_lower for term in ['ncaa', 'college', 'march madness']):
+            return 'college'
+        return 'sports'
     
     async def _fetch_brave(self, query: str, max_results: int = 5) -> list[NewsItem]:
         """Fetch news using Brave Search API."""
