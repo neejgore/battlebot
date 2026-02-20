@@ -1609,15 +1609,24 @@ class KalshiBattleBot:
             'confidence': confidence,
             'placed_time': datetime.utcnow().isoformat(),
             'end_date': market.get('end_date'),  # Store for time horizon calc
+            'category': market.get('category', 'unknown'),  # Store for learning
         }
         
         # In dry run mode, immediately treat as filled position
         if self.dry_run:
+            # Get intel data from most recent analysis for this market
+            recent_analysis = next((a for a in self._analyses if a.get('market_id') == market_id), None)
+            has_intel = recent_analysis.get('has_intel', False) if recent_analysis else False
+            news_count = recent_analysis.get('news_count', 0) if recent_analysis else 0
+            
             pos = {
                 **order_data,
                 'current_price': entry_price,
                 'unrealized_pnl': 0.0,
                 'entry_time': datetime.utcnow().isoformat(),
+                'has_intel': has_intel,  # Store for exit tracking
+                'news_count': news_count,  # Store for exit tracking
+                'category': market.get('category', 'unknown'),  # Store for learning
             }
             # Log to database
             if self._db_connected:
@@ -1638,11 +1647,6 @@ class KalshiBattleBot:
                 except Exception as e:
                     print(f"[DB] Failed to log trade entry: {e}")
             self._positions[pos_id] = pos
-            # Record trade for dry run
-            # Get intel data from most recent analysis for this market
-            recent_analysis = next((a for a in self._analyses if a.get('market_id') == market_id), None)
-            has_intel = recent_analysis.get('has_intel', False) if recent_analysis else False
-            news_count = recent_analysis.get('news_count', 0) if recent_analysis else 0
             
             trade = {
                 'id': pos_id,
@@ -1845,6 +1849,8 @@ class KalshiBattleBot:
             'pnl': pnl,
             'reason': reason,
             'category': position.get('category', 'unknown'),  # Track for learning
+            'has_intel': position.get('has_intel', False),  # Carry forward for effectiveness tracking
+            'news_count': position.get('news_count', 0),  # Carry forward for effectiveness tracking
             'timestamp': datetime.utcnow().isoformat(),
         }
         self._trades.insert(0, trade)
@@ -1944,6 +1950,8 @@ class KalshiBattleBot:
                         'pnl': pnl,
                         'reason': reason,
                         'category': position.get('category', 'unknown'),  # Track for learning
+                        'has_intel': position.get('has_intel', False),  # Track for effectiveness
+                        'news_count': position.get('news_count', 0),  # Track for effectiveness
                         'timestamp': datetime.utcnow().isoformat(),
                     }
                     self._trades.insert(0, trade)
@@ -2078,6 +2086,9 @@ class KalshiBattleBot:
                         'entry_time': datetime.utcnow().isoformat(),
                         'unrealized_pnl': 0.0,
                         'end_date': order.get('end_date'),  # Preserve for time horizon
+                        'has_intel': order.get('has_intel', False),  # Preserve for effectiveness tracking
+                        'news_count': order.get('news_count', 0),  # Preserve for effectiveness tracking
+                        'category': order.get('category', 'unknown'),  # Preserve for learning
                     }
                     self._positions[pos_id] = pos
                     
