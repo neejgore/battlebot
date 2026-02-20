@@ -2006,15 +2006,11 @@ class KalshiBattleBot:
                     reason = pending_exit.get('reason', 'UNKNOWN')
                     
                     # Calculate final PnL using ACTUAL fill prices and contract count
+                    # Profit = sell_price - buy_price (same formula for BOTH YES and NO)
                     entry_price = position['entry_price']  # Actual buy fill price
-                    side = position['side']
                     contracts = position.get('contracts', 0)
                     
-                    if side.upper() == 'YES':
-                        price_change = fill_price - entry_price
-                    else:
-                        price_change = entry_price - fill_price
-                    
+                    price_change = fill_price - entry_price  # Same for YES and NO
                     pnl = price_change * contracts  # PnL per contract × number of contracts
                     
                     # Now actually remove the position and record exit
