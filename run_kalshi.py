@@ -2083,6 +2083,8 @@ class KalshiBattleBot:
                 if sync_counter >= FULL_SYNC_INTERVAL:
                     sync_counter = 0
                     await self._sync_positions_with_kalshi()
+                    # Also cancel any stale resting orders that accumulated
+                    await self._cancel_all_resting_orders()
                 
                 # First, check pending EXIT orders (sells on existing positions)
                 await self._check_pending_exits()
