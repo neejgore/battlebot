@@ -90,7 +90,7 @@ class NewsService:
     
     def __init__(self):
         self._cache: dict[str, tuple[datetime, list[NewsItem]]] = {}
-        self._cache_ttl = timedelta(minutes=60)  # Increased from 15 to save API calls
+        self._cache_ttl = timedelta(minutes=30)  # 30 min cache - balance freshness vs API costs
         self._brave_api_key = os.getenv('BRAVE_API_KEY')
         self._brave_searches = 0  # Track usage
         
@@ -328,8 +328,8 @@ class NewsService:
                     
                     for r in results[:max_results]:
                         news_items.append(NewsItem(
-                            title=r.get('title', '')[:100],
-                            snippet=r.get('description', r.get('title', ''))[:300],
+                            title=r.get('title', '')[:200],
+                            snippet=r.get('description', r.get('title', ''))[:1000],  # Much more context
                             source=r.get('meta_url', {}).get('hostname', 'News'),
                             url=r.get('url', ''),
                         ))
@@ -372,8 +372,8 @@ class NewsService:
                         
                         if title:
                             news_items.append(NewsItem(
-                                title=title[:100],
-                                snippet=title[:200],
+                                title=title[:200],
+                                snippet=title[:500],  # Google RSS only has titles, but keep more
                                 source=source or "News",
                                 url=link.strip(),
                             ))
@@ -386,8 +386,8 @@ class NewsService:
                             title = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\\1', title).strip()
                             if title:
                                 news_items.append(NewsItem(
-                                    title=title[:100],
-                                    snippet=title[:200],
+                                    title=title[:200],
+                                    snippet=title[:500],
                                     source="News",
                                     url=link.strip(),
                                 ))
@@ -961,11 +961,11 @@ class MarketIntelligenceService:
         
         news_items, domain_data = await asyncio.gather(news_task, domain_task)
         
-        # Build news summary
+        # Build news summary - include full snippets for better AI context
         news_summary = ""
         if news_items:
-            summaries = [f"- {item.title}: {item.snippet[:150]}..." for item in news_items[:3]]
-            news_summary = "\n".join(summaries)
+            summaries = [f"- [{item.source}] {item.title}\n  {item.snippet}" for item in news_items[:5]]
+            news_summary = "\n\n".join(summaries)
         
         # Build domain summary
         domain_summary = ""
