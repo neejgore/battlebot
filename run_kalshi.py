@@ -1881,9 +1881,19 @@ class KalshiBattleBot:
             try:
                 contracts = position.get('contracts', 0)
                 if contracts > 0:
-                    # Use limit order at 1¢ for immediate fill (Kalshi doesn't support market orders well)
-                    # Selling at 1¢ means we accept any bid
-                    sell_price_cents = 1  # Floor price - will fill against any bid
+                    # Skip if position already has a pending exit order
+                    if position.get('pending_exit'):
+                        print(f"[LIVE SELL] Already has pending exit, skipping")
+                        return
+                    
+                    # Skip exit for illiquid positions (just wait for settlement)
+                    # Large positions in low-liquidity markets won't find buyers
+                    if contracts > 20:
+                        print(f"[LIVE SELL] Large position ({contracts} contracts) - waiting for settlement instead")
+                        return
+                    
+                    # Use limit order at 1¢ for immediate fill
+                    sell_price_cents = 1
                     
                     print(f"[LIVE SELL] Placing limit order: {contracts} {position['side']} @ {sell_price_cents}¢")
                     
