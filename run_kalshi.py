@@ -267,6 +267,53 @@ class KalshiBattleBot:
         self._save_state()
         print(f"[Startup] Sync complete: {filled} filled, {canceled} canceled, {still_pending} still pending")
     
+    async def _cancel_all_resting_orders(self):
+        """Cancel ALL resting orders on Kalshi at startup.
+        
+        This prevents accumulation of unfilled orders from previous sessions.
+        Fresh start every time.
+        """
+        print("[Startup] Checking for stale resting orders...")
+        try:
+            result = await self._kalshi.get_orders(status="resting")
+            orders = result.get('orders', [])
+            
+            if not orders:
+                print("[Startup] No resting orders found.")
+                return
+            
+            print(f"[Startup] Found {len(orders)} resting orders - CANCELING ALL")
+            
+            canceled = 0
+            failed = 0
+            for order in orders:
+                order_id = order.get('order_id')
+                if not order_id:
+                    continue
+                    
+                try:
+                    await self._kalshi.cancel_order(order_id)
+                    canceled += 1
+                    ticker = order.get('ticker', 'unknown')
+                    side = order.get('side', '?')
+                    count = order.get('remaining_count', order.get('count', '?'))
+                    print(f"  [CANCELED] {order_id[:8]}... | {count} {side.upper()} on {ticker[:30]}")
+                    await asyncio.sleep(0.3)  # Rate limit
+                except Exception as e:
+                    failed += 1
+                    print(f"  [ERROR] {order_id[:8]}...: {e}")
+            
+            print(f"[Startup] Order cleanup complete: {canceled} canceled, {failed} failed")
+            
+            # Also clear bot's internal pending orders since they're all canceled
+            if self._pending_orders:
+                print(f"[Startup] Clearing {len(self._pending_orders)} internal pending order records")
+                self._pending_orders.clear()
+                self._save_state()
+                
+        except Exception as e:
+            print(f"[Startup] Error fetching resting orders: {e}")
+    
     async def _sync_positions_with_kalshi(self):
         """Sync internal positions with Kalshi's actual positions and balance.
         
@@ -787,6 +834,10 @@ class KalshiBattleBot:
         print(f"\nDashboard: http://localhost:{self.port}")
         print("Press Ctrl+C to stop\n")
         
+        # CRITICAL: Cancel ALL stale resting orders on startup (LIVE mode only)
+        if not self.dry_run:
+            await self._cancel_all_resting_orders()
+        
         # Sync pending orders from previous session (LIVE mode only)
         if not self.dry_run and self._pending_orders:
             print(f"[Startup] Checking {len(self._pending_orders)} pending orders from previous session...")
@@ -1261,19 +1312,37 @@ class KalshiBattleBot:
                     
                     # Skip markets where news has very low value or outcomes are predictable
                     question_lower = market.get('question', '').lower()
+                    question_raw = market.get('question', '')
                     
-                    # Skip mention/announcer markets (pure entertainment noise)
-                    if any(term in question_lower for term in ['mention', 'announcer', 'say during']):
+                    # FILTER 1: Skip entertainment/noise markets
+                    if any(term in question_lower for term in ['mention', 'announcer', 'say during', 'tweet', 'post about']):
                         continue
                     
-                    # Skip player prop "1+" markets - these heavily favor YES
-                    # (e.g., "Karl-Anthony Towns: 1+ three pointers" - star players usually hit 1+)
-                    if ': 1+' in market.get('question', '') or ':1+' in market.get('question', ''):
-                        continue  # Skip "Player: 1+ stat" markets
-                    
-                    # Skip low-threshold player props (2+, 3+ points/rebounds/assists are usually easy)
-                    if any(pattern in question_lower for pattern in [': 2+', ': 3+', ':2+', ':3+', 'three pointers', 'three-pointers']):
+                    # FILTER 2: Skip ALL player prop markets with low thresholds
+                    # These are usually very predictable (star players hit basic stats)
+                    player_prop_patterns = [
+                        ': 1+', ':1+', ': 2+', ':2+', ': 3+', ':3+',
+                        ': 4+', ':4+', ': 5+', ':5+',
+                        'three pointers', 'three-pointers',
+                        '+ points', '+ rebounds', '+ assists', '+ steals', '+ blocks',
+                        'points or more', 'rebounds or more', 'assists or more',
+                    ]
+                    if any(pattern in question_lower or pattern in question_raw for pattern in player_prop_patterns):
                         continue
+                    
+                    # FILTER 3: Skip markets where probability is extreme (< 10% or > 90%)
+                    # These have low expected value and high variance
+                    market_price = market.get('price', 0.5)
+                    yes_price = market.get('yes_price', market_price)
+                    no_price = market.get('no_price', 1 - market_price)
+                    
+                    if yes_price < 0.10 or yes_price > 0.90:
+                        continue  # Skip extreme probability markets
+                    
+                    # FILTER 4: Skip markets with very low volume (no liquidity)
+                    volume = market.get('volume', 0) or market.get('open_interest', 0) or 0
+                    if volume < 100:
+                        continue  # Skip illiquid markets
                         
                     if len(self._positions) >= self._risk_limits.max_positions:
                         break
@@ -1563,48 +1632,67 @@ class KalshiBattleBot:
         market_id = market['id']
         pos_id = f"pos_{int(datetime.utcnow().timestamp()*1000)}"
         
+        # STRICT LIMITS - prevent runaway orders
+        MAX_CONTRACTS_PER_ORDER = 10  # Never place more than 10 contracts at once
+        MIN_PRICE_CENTS = 5  # Don't trade below 5¢ (too risky)
+        MAX_PRICE_CENTS = 90  # Don't trade above 90¢ (not enough upside)
+        
         # Use the correct price for the side we're trading
         if side.upper() == 'YES':
             entry_price = market.get('yes_price', market['price'])
         else:
             entry_price = market.get('no_price', 1 - market['price'])
         
+        # Convert to cents for validation
+        price_cents = int(entry_price * 100)
+        
+        # VALIDATION: Skip extreme prices
+        if price_cents < MIN_PRICE_CENTS:
+            print(f"[Order] SKIPPED: Price {price_cents}¢ too low (min {MIN_PRICE_CENTS}¢) - too risky")
+            return
+        if price_cents > MAX_PRICE_CENTS:
+            print(f"[Order] SKIPPED: Price {price_cents}¢ too high (max {MAX_PRICE_CENTS}¢) - not enough upside")
+            return
+        
+        # Calculate contracts with STRICT LIMIT
         contracts = int(size / entry_price) if entry_price > 0 else 0
+        if contracts > MAX_CONTRACTS_PER_ORDER:
+            print(f"[Order] Capping contracts: {contracts} → {MAX_CONTRACTS_PER_ORDER} (max per order)")
+            contracts = MAX_CONTRACTS_PER_ORDER
+        
+        # Recalculate actual size based on capped contracts
+        actual_size = contracts * entry_price
         
         # In LIVE mode, actually place the order on Kalshi
         order_id = None
         if not self.dry_run:
             try:
                 if contracts < 1:
-                    print(f"[Order] Size ${size:.2f} too small for 1 contract at {int(entry_price*100)}¢")
+                    print(f"[Order] Size ${size:.2f} too small for 1 contract at {price_cents}¢")
                     return
                 
-                # Use aggressive limit orders with PERCENTAGE-BASED slippage protection
-                # Prevents overpaying on low-priced contracts
-                base_price_cents = int(entry_price * 100)
+                # Use the ACTUAL market price, with small slippage for fills
+                # Slippage: 2¢ or 5%, whichever is larger
+                slippage_cents = max(2, int(price_cents * 0.05))
+                order_price_cents = min(price_cents + slippage_cents, 95)
                 
-                # Safety: validate price is reasonable (1-99 cents)
-                if base_price_cents < 1 or base_price_cents > 99:
-                    print(f"[Order] Invalid price {base_price_cents}¢ - aborting")
-                    return
-                
-                # Calculate aggressive price: max 20% slippage OR 5¢, whichever is larger
-                # This prevents massive overpay on low-priced contracts
-                max_slippage_cents = max(5, int(base_price_cents * 0.20))  # 20% or 5¢ minimum
-                aggressive_price_cents = min(base_price_cents + max_slippage_cents, 95)  # Cap at 95¢
+                print(f"[Order] Placing: {contracts} {side} @ {order_price_cents}¢ (market: {price_cents}¢, size: ${actual_size:.2f})")
                 
                 result = await self._kalshi.place_order(
                     ticker=market_id,
                     side=side.lower(),  # 'yes' or 'no'
                     count=contracts,
-                    price=aggressive_price_cents,
+                    price=order_price_cents,
                     order_type='limit',
                 )
                 order_id = result.get('order', {}).get('order_id')
-                print(f"[LIVE ORDER] Placed: {contracts} {side} @ {aggressive_price_cents}¢ (mid: {base_price_cents}¢) | Order ID: {order_id}")
+                print(f"[LIVE ORDER] Placed: {contracts} {side} @ {order_price_cents}¢ | Order ID: {order_id}")
             except Exception as e:
                 print(f"[Order Error] Failed to place order on Kalshi: {e}")
                 return  # Don't record if order failed
+        
+        # Update size to actual
+        size = actual_size
         
         order_data = {
             'id': pos_id,
@@ -2045,6 +2133,24 @@ class KalshiBattleBot:
                             filled_count = order_data.get('filled_count', 0)
                             if filled_count > 0:
                                 print(f"[PARTIAL FILL] {order_id} | {filled_count}/{order['contracts']} contracts filled")
+                            
+                            # CANCEL STALE ORDERS: If order has been resting > 10 minutes, cancel it
+                            STALE_ORDER_MINUTES = 10
+                            placed_time_str = order.get('placed_time', order.get('entry_time', ''))
+                            if placed_time_str:
+                                try:
+                                    placed_time = datetime.fromisoformat(placed_time_str)
+                                    age_minutes = (datetime.utcnow() - placed_time).total_seconds() / 60
+                                    if age_minutes > STALE_ORDER_MINUTES:
+                                        print(f"[STALE ORDER] {order_id} | {age_minutes:.0f}min old - canceling...")
+                                        try:
+                                            await self._kalshi.cancel_order(order_id)
+                                            canceled_orders.append(order_id)
+                                            print(f"[ORDER CANCELED] {order_id} (stale)")
+                                        except Exception as cancel_err:
+                                            print(f"[Cancel Error] {order_id}: {cancel_err}")
+                                except Exception as time_err:
+                                    pass  # Can't parse time, skip
                         
                         await asyncio.sleep(0.5)  # Rate limit between API calls
                         
