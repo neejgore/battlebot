@@ -99,7 +99,7 @@ class KalshiBattleBot:
             max_total_open_risk=0.90,  # 90% max exposure - 10% reserve
             max_positions=10,  # Max 10 positions - focus, don't spread thin
             profit_take_pct=0.20,  # 20% profit target - let winners run
-            stop_loss_pct=0.15,  # 15% stop loss - give room but limit damage
+            stop_loss_pct=0.50,  # 50% stop loss - let bets ride, don't cut early
             time_stop_hours=720,  # 30 days - let bets ride to settlement
             edge_scale=0.10,
             min_edge=self.min_edge,
@@ -1870,14 +1870,14 @@ class KalshiBattleBot:
                     spread = market.get('spread', 0.04)  # Default 4¢ if unknown
                     
                     if spread <= 0.02:  # Tight spread (≤2¢)
-                        profit_take_pct = 0.05   # 5% profit target
-                        stop_loss_pct = 0.05     # 5% stop loss
-                    elif spread <= 0.04:  # Medium spread (2-4¢)
                         profit_take_pct = 0.10   # 10% profit target
-                        stop_loss_pct = 0.08     # 8% stop loss
-                    else:  # Wide spread (>4¢)
+                        stop_loss_pct = 0.50     # 50% stop loss - let bets settle
+                    elif spread <= 0.04:  # Medium spread (2-4¢)
                         profit_take_pct = 0.15   # 15% profit target
-                        stop_loss_pct = 0.12     # 12% stop loss
+                        stop_loss_pct = 0.50     # 50% stop loss - let bets settle
+                    else:  # Wide spread (>4¢)
+                        profit_take_pct = 0.20   # 20% profit target
+                        stop_loss_pct = 0.50     # 50% stop loss - let bets settle
                     
                     # Calculate profit target and stop loss based on contract cost
                     cost_basis = contracts * entry_price  # What we paid
