@@ -1259,10 +1259,21 @@ class KalshiBattleBot:
                     if not market_id:
                         continue
                     
-                    # Skip markets where news has very low value (mention/say markets)
+                    # Skip markets where news has very low value or outcomes are predictable
                     question_lower = market.get('question', '').lower()
+                    
+                    # Skip mention/announcer markets (pure entertainment noise)
                     if any(term in question_lower for term in ['mention', 'announcer', 'say during']):
-                        continue  # These are pure noise/entertainment markets
+                        continue
+                    
+                    # Skip player prop "1+" markets - these heavily favor YES
+                    # (e.g., "Karl-Anthony Towns: 1+ three pointers" - star players usually hit 1+)
+                    if ': 1+' in market.get('question', '') or ':1+' in market.get('question', ''):
+                        continue  # Skip "Player: 1+ stat" markets
+                    
+                    # Skip low-threshold player props (2+, 3+ points/rebounds/assists are usually easy)
+                    if any(pattern in question_lower for pattern in [': 2+', ': 3+', ':2+', ':3+', 'three pointers', 'three-pointers']):
+                        continue
                         
                     if len(self._positions) >= self._risk_limits.max_positions:
                         break
