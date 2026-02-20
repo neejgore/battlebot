@@ -1232,7 +1232,7 @@ class KalshiBattleBot:
             medium_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         
         # PRIORITIZE: Ultra-short first, then short, then medium
-        selected = ultra_short[:8] + short_term[:5] + medium_term[:2]
+        selected = ultra_short[:15] + short_term[:10] + medium_term[:5]
         
         # Log what we found
         print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
