@@ -41,8 +41,8 @@ class KalshiBattleBot:
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 1000))
         self.min_edge = max(0.10, float(os.getenv('MIN_EDGE', 0.10)))  # 10% min edge - enforce minimum
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.30))  # 30% confidence - Claude is honest about uncertainty
-        self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 15))  # $15 max - bigger bets on high confidence
-        self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.1))
+        self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 30))  # $30 max - fewer bets = bigger size
+        self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.20))  # 20% Kelly - higher conviction on filtered bets
         self.max_oi_pct = float(os.getenv('MAX_OI_PCT', 0.10))  # Max 10% of open interest
         self.simulate_prices = os.getenv('SIMULATE_PRICES', 'false').lower() == 'true'
         
@@ -95,8 +95,8 @@ class KalshiBattleBot:
         # Risk Engine - selective but confident
         self._risk_limits = RiskLimits(
             max_daily_drawdown=0.15,
-            max_position_size=self.max_position_size,  # $15 max
-            max_percent_bankroll_per_market=0.15,  # 15% per market max
+            max_position_size=self.max_position_size,  # $30 max
+            max_percent_bankroll_per_market=0.25,  # 25% per market - fewer bets = bigger size
             max_total_open_risk=0.90,  # 90% max exposure - 10% reserve
             max_positions=10,  # Max 10 positions - focus, don't spread thin
             profit_take_pct=999.0,  # DISABLED - let bets settle naturally
@@ -1714,7 +1714,7 @@ class KalshiBattleBot:
         pos_id = f"pos_{int(datetime.utcnow().timestamp()*1000)}"
         
         # STRICT LIMITS - prevent runaway orders
-        MAX_CONTRACTS_PER_ORDER = 10  # Max 10 contracts per order
+        MAX_CONTRACTS_PER_ORDER = 25  # Max 25 contracts - bigger bets on quality opportunities
         MIN_PRICE_CENTS = 15  # Don't trade below 15¢ - cheap contracts have 6% win rate
         MAX_PRICE_CENTS = 85  # Don't trade above 85¢ - not enough upside
         
