@@ -41,7 +41,7 @@ class KalshiBattleBot:
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 1000))
         self.min_edge = float(os.getenv('MIN_EDGE', 0.10))  # 10% min edge - only trade with real edge
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.70))  # 70% confidence required
-        self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 5))  # $5 max - small positions
+        self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 15))  # $15 max - bigger bets on high confidence
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.1))
         self.max_oi_pct = float(os.getenv('MAX_OI_PCT', 0.10))  # Max 10% of open interest
         self.simulate_prices = os.getenv('SIMULATE_PRICES', 'false').lower() == 'true'
@@ -89,16 +89,16 @@ class KalshiBattleBot:
         # Calibration
         self._calibration: CalibrationEngine = None
         
-        # Risk Engine - STRICT settings for profitability
+        # Risk Engine - selective but confident
         self._risk_limits = RiskLimits(
             max_daily_drawdown=0.15,
-            max_position_size=self.max_position_size,  # $5 max
-            max_percent_bankroll_per_market=0.05,  # 5% per market max
-            max_total_open_risk=0.50,  # 50% max exposure - keep cash reserve
+            max_position_size=self.max_position_size,  # $15 max
+            max_percent_bankroll_per_market=0.15,  # 15% per market max
+            max_total_open_risk=0.90,  # 90% max exposure - 10% reserve
             max_positions=10,  # Max 10 positions - focus, don't spread thin
             profit_take_pct=0.20,  # 20% profit target - let winners run
             stop_loss_pct=0.15,  # 15% stop loss - give room but limit damage
-            time_stop_hours=48,  # 48h max hold - exit before settlement if needed
+            time_stop_hours=720,  # 30 days - let bets ride to settlement
             edge_scale=0.10,
             min_edge=self.min_edge,
         )
@@ -1638,7 +1638,7 @@ class KalshiBattleBot:
         pos_id = f"pos_{int(datetime.utcnow().timestamp()*1000)}"
         
         # STRICT LIMITS - prevent runaway orders
-        MAX_CONTRACTS_PER_ORDER = 5  # Max 5 contracts - keep positions small
+        MAX_CONTRACTS_PER_ORDER = 10  # Max 10 contracts per order
         MIN_PRICE_CENTS = 5  # Don't trade below 5¢ (too risky)
         MAX_PRICE_CENTS = 90  # Don't trade above 90¢ (not enough upside)
         
