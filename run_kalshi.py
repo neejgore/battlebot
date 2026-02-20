@@ -1339,10 +1339,15 @@ class KalshiBattleBot:
                     if yes_price < 0.10 or yes_price > 0.90:
                         continue  # Skip extreme probability markets
                     
-                    # FILTER 4: Skip markets with very low volume (no liquidity)
+                    # FILTER 4: Skip markets with low volume (need real liquidity)
                     volume = market.get('volume', 0) or market.get('open_interest', 0) or 0
-                    if volume < 100:
-                        continue  # Skip illiquid markets
+                    if volume < 500:
+                        continue  # Skip illiquid markets - need 500+ for reliable exits
+                    
+                    # FILTER 5: Skip narrow-range weather/temperature markets (coin flips)
+                    weather_patterns = ['temperature', '° to ', '°-', 'degrees', 'high of', 'low of']
+                    if any(p in question_lower for p in weather_patterns):
+                        continue  # Weather ranges are unpredictable coin flips
                         
                     if len(self._positions) >= self._risk_limits.max_positions:
                         break
@@ -1883,13 +1888,11 @@ class KalshiBattleBot:
                 if contracts > 0:
                     # Skip if position already has a pending exit order
                     if position.get('pending_exit'):
-                        print(f"[LIVE SELL] Already has pending exit, skipping")
-                        return
+                        return  # Silently skip - don't spam logs
                     
-                    # Skip exit for illiquid positions (just wait for settlement)
-                    # Large positions in low-liquidity markets won't find buyers
-                    if contracts > 20:
-                        print(f"[LIVE SELL] Large position ({contracts} contracts) - waiting for settlement instead")
+                    # Skip exit for positions > 5 contracts (likely illiquid, wait for settlement)
+                    if contracts > 5:
+                        print(f"[LIVE SELL] Position ({contracts} contracts) too large for liquid exit - waiting for settlement")
                         return
                     
                     # Use limit order at 1¢ for immediate fill
