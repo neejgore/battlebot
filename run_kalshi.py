@@ -72,6 +72,7 @@ class KalshiBattleBot:
         self._running = False
         self._last_analysis: dict[str, datetime] = {}
         self._last_analysis_price: dict[str, float] = {}
+        self._recently_exited: dict[str, datetime] = {}  # Track exits to prevent re-entry
         self._analysis_cooldown = 1800  # 30 minutes
         self._price_change_threshold = 0.02  # Re-analyze on 2% move
         self._start_time = None
@@ -1611,6 +1612,14 @@ class KalshiBattleBot:
             should_trade = False
             reasons.append('ALREADY_IN_POSITION')
         
+        # Don't re-enter markets we recently exited (prevent chasing losses)
+        recent_exit = self._recently_exited.get(market_id)
+        if recent_exit:
+            hours_since_exit = (datetime.utcnow() - recent_exit).total_seconds() / 3600
+            if hours_since_exit < 2:  # 2 hour cooldown after exit
+                should_trade = False
+                reasons.append(f'RECENTLY_EXITED_{hours_since_exit:.1f}h_AGO')
+        
         if len(self._positions) >= self._risk_limits.max_positions:
             should_trade = False
             reasons.append('MAX_POSITIONS')
@@ -1956,6 +1965,9 @@ class KalshiBattleBot:
         # For dry run mode, or after sell is confirmed (called from sync loop)
         self._positions.pop(pos_id, None)
         
+        # Track exit to prevent re-entry (chasing losses)
+        self._recently_exited[position['market_id']] = datetime.utcnow()
+        
         await self._risk_engine.record_trade_result(pnl)
         
         # Log to database
@@ -2054,6 +2066,9 @@ class KalshiBattleBot:
                     
                     # Now actually remove the position and record exit
                     self._positions.pop(pos_id, None)
+                    
+                    # Track exit to prevent re-entry (chasing losses)
+                    self._recently_exited[position['market_id']] = datetime.utcnow()
                     
                     await self._risk_engine.record_trade_result(pnl)
                     
