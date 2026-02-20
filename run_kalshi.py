@@ -61,6 +61,8 @@ class KalshiBattleBot:
         self._pending_orders: dict[str, dict] = {}  # Orders placed but not yet filled
         self._trades: list[dict] = []
         self._analyses: list[dict] = []
+        # Signal log for backtesting - tracks ALL AI signals and their outcomes
+        self._signal_log: list[dict] = []  # Persisted, checked for outcomes
         # Actual Kalshi values from API (synced every 5 min)
         self._kalshi_cash = None       # Available cash
         self._kalshi_portfolio = None  # Current positions value
@@ -135,7 +137,8 @@ class KalshiBattleBot:
                     self._positions = state.get('positions', {})
                     self._pending_orders = state.get('pending_orders', {})
                     self._trades = state.get('trades', [])
-                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades")
+                    self._signal_log = state.get('signal_log', [])
+                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals")
             elif os.path.exists(self._state_file + '.backup'):
                 print(f"[State] Main file missing, loading from backup...")
                 with open(self._state_file + '.backup', 'r') as f:
@@ -164,6 +167,7 @@ class KalshiBattleBot:
                 'positions': self._positions,
                 'pending_orders': self._pending_orders,
                 'trades': self._trades[-100:],
+                'signal_log': self._signal_log[-500:],  # Keep last 500 signals for backtesting
                 'saved_at': datetime.utcnow().isoformat(),
             }
             
@@ -788,6 +792,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/', self._handle_index)
         self._app.router.add_get('/ws', self._handle_websocket)
         self._app.router.add_get('/api/state', self._handle_state)
+        self._app.router.add_get('/api/signals', self._handle_signals)
         
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -1574,6 +1579,22 @@ class KalshiBattleBot:
         self._analyses.insert(0, analysis_record)
         self._analyses = self._analyses[:50]
         
+        # Log signal for backtesting (track ALL signals regardless of trade decision)
+        signal_entry = {
+            'market_id': market_id,
+            'question': question[:80],
+            'edge': edge,
+            'confidence': signal.confidence,
+            'side': side,
+            'market_price': current_price,
+            'ai_probability': signal.raw_prob,
+            'close_time': market.get('close_time'),
+            'timestamp': datetime.utcnow().isoformat(),
+            'outcome': None,  # To be filled when market settles
+            'outcome_checked': False,
+        }
+        self._signal_log.append(signal_entry)
+        
         # Check if we should trade
         should_trade = True
         reasons = []
@@ -1728,6 +1749,8 @@ class KalshiBattleBot:
                 'current_price': entry_price,
                 'unrealized_pnl': 0.0,
                 'entry_time': datetime.utcnow().isoformat(),
+                'edge': edge,  # Store for exit tracking
+                'confidence': confidence,  # Store for exit tracking
                 'has_intel': has_intel,  # Store for exit tracking
                 'news_count': news_count,  # Store for exit tracking
                 'category': market.get('category', 'unknown'),  # Store for learning
@@ -1760,6 +1783,8 @@ class KalshiBattleBot:
                 'side': side,
                 'price': entry_price,
                 'size': size,
+                'edge': edge,  # Track for performance analysis
+                'confidence': confidence,  # Track for performance analysis
                 'category': market.get('category', 'unknown'),  # Track for learning
                 'has_intel': has_intel,  # Track if news was used
                 'news_count': news_count,  # Track how many news items
@@ -1767,7 +1792,7 @@ class KalshiBattleBot:
             }
             self._trades.insert(0, trade)
             news_indicator = f" [NEWS:{news_count}]" if news_count > 0 else ""
-            print(f"[DRY RUN] ENTERED: {side} ${size:.2f} @ {int(entry_price*100)}¢{news_indicator} | {market.get('question', '')[:50]}...")
+            print(f"[DRY RUN] ENTERED: {side} ${size:.2f} @ {int(entry_price*100)}¢ E:{edge*100:.0f}% C:{confidence*100:.0f}%{news_indicator} | {market.get('question', '')[:50]}...")
         else:
             # In LIVE mode, track as pending until we confirm fill from Kalshi
             # Get intel data from most recent analysis for this market
@@ -1776,6 +1801,8 @@ class KalshiBattleBot:
             news_count = recent_analysis.get('news_count', 0) if recent_analysis else 0
             
             # Store intel info in order_data so it persists through fill
+            order_data['edge'] = edge
+            order_data['confidence'] = confidence
             order_data['has_intel'] = has_intel
             order_data['news_count'] = news_count
             
@@ -1789,6 +1816,8 @@ class KalshiBattleBot:
                 'side': side,
                 'price': entry_price,
                 'size': size,
+                'edge': edge,  # Track for performance analysis
+                'confidence': confidence,  # Track for performance analysis
                 'has_intel': has_intel,
                 'news_count': news_count,
                 'timestamp': datetime.utcnow().isoformat(),
@@ -1797,7 +1826,7 @@ class KalshiBattleBot:
             }
             self._trades.insert(0, trade)
             news_indicator = f" [NEWS:{news_count}]" if news_count > 0 else ""
-            print(f"[PENDING] Order {order_id} placed{news_indicator}, waiting to fill...")
+            print(f"[PENDING] Order {order_id} placed E:{edge*100:.0f}% C:{confidence*100:.0f}%{news_indicator}, waiting to fill...")
         
         self._save_state()
         await self._broadcast_update()
@@ -1955,6 +1984,8 @@ class KalshiBattleBot:
             'size': position['size'],
             'pnl': pnl,
             'reason': reason,
+            'edge': position.get('edge'),  # Carry forward for performance analysis
+            'confidence': position.get('confidence'),  # Carry forward for performance analysis
             'category': position.get('category', 'unknown'),  # Track for learning
             'has_intel': position.get('has_intel', False),  # Carry forward for effectiveness tracking
             'news_count': position.get('news_count', 0),  # Carry forward for effectiveness tracking
@@ -2052,6 +2083,8 @@ class KalshiBattleBot:
                         'size': position.get('size', 0),
                         'pnl': pnl,
                         'reason': reason,
+                        'edge': position.get('edge'),  # Track for performance analysis
+                        'confidence': position.get('confidence'),  # Track for performance analysis
                         'category': position.get('category', 'unknown'),  # Track for learning
                         'has_intel': position.get('has_intel', False),  # Track for effectiveness
                         'news_count': position.get('news_count', 0),  # Track for effectiveness
@@ -2081,6 +2114,141 @@ class KalshiBattleBot:
                 else:
                     print(f"[Exit Check Error] {pos_id}: {e}")
     
+    async def _check_signal_outcomes(self):
+        """Check outcomes of logged signals for backtesting analysis."""
+        if not self._signal_log:
+            return
+        
+        # Find signals that haven't been checked yet
+        unchecked = [s for s in self._signal_log if not s.get('outcome_checked')]
+        if not unchecked:
+            return
+            
+        checked_count = 0
+        for signal in unchecked[:20]:  # Check up to 20 at a time
+            market_id = signal.get('market_id')
+            if not market_id:
+                continue
+                
+            try:
+                # Fetch market status from Kalshi
+                market = await self._kalshi.get_market(market_id)
+                if not market:
+                    continue
+                
+                status = market.get('status', '')
+                
+                if status == 'settled':
+                    # Market has settled - record outcome
+                    result = market.get('result', '')  # 'yes' or 'no'
+                    signal['outcome_checked'] = True
+                    
+                    if result:
+                        predicted_side = signal.get('side', '').lower()
+                        actual_result = result.lower()
+                        
+                        # Did our prediction win?
+                        signal['actual_result'] = actual_result
+                        signal['predicted_correct'] = (predicted_side == actual_result)
+                        
+                        # Calculate what P&L would have been
+                        entry_price = signal.get('market_price', 0)
+                        if signal['predicted_correct']:
+                            # Won: paid entry_price, received $1
+                            signal['theoretical_pnl'] = 1.0 - entry_price
+                        else:
+                            # Lost: paid entry_price, received $0
+                            signal['theoretical_pnl'] = -entry_price
+                        
+                        signal['outcome'] = 'WIN' if signal['predicted_correct'] else 'LOSS'
+                        checked_count += 1
+                    
+                elif status == 'closed':
+                    # Market closed but not yet settled
+                    pass
+                    
+                await asyncio.sleep(0.3)  # Rate limit
+                
+            except Exception as e:
+                if '404' not in str(e).lower():
+                    print(f"[Signal Check] Error for {market_id}: {e}")
+        
+        if checked_count > 0:
+            print(f"[Signals] Checked {checked_count} signal outcomes")
+            self._save_state()
+    
+    def _get_signal_performance(self) -> dict:
+        """Analyze signal log to determine optimal thresholds."""
+        if not self._signal_log:
+            return {'error': 'No signals logged yet'}
+        
+        # Separate by outcome
+        settled = [s for s in self._signal_log if s.get('outcome')]
+        pending = [s for s in self._signal_log if not s.get('outcome_checked')]
+        
+        if not settled:
+            return {
+                'total_signals': len(self._signal_log),
+                'pending': len(pending),
+                'settled': 0,
+                'message': 'No settled signals yet - need to wait for markets to resolve'
+            }
+        
+        wins = [s for s in settled if s.get('outcome') == 'WIN']
+        losses = [s for s in settled if s.get('outcome') == 'LOSS']
+        
+        # Analyze by edge threshold
+        edge_analysis = []
+        for threshold in [0.05, 0.08, 0.10, 0.12, 0.15, 0.20]:
+            above = [s for s in settled if s.get('edge', 0) >= threshold]
+            if above:
+                above_wins = len([s for s in above if s.get('outcome') == 'WIN'])
+                above_pnl = sum(s.get('theoretical_pnl', 0) for s in above)
+                edge_analysis.append({
+                    'threshold': f"{threshold*100:.0f}%",
+                    'signals': len(above),
+                    'wins': above_wins,
+                    'win_rate': f"{above_wins/len(above)*100:.1f}%",
+                    'theoretical_pnl': f"${above_pnl:.2f}",
+                })
+        
+        # Analyze by confidence threshold
+        conf_analysis = []
+        for threshold in [0.25, 0.35, 0.50, 0.60, 0.70, 0.80]:
+            above = [s for s in settled if s.get('confidence', 0) >= threshold]
+            if above:
+                above_wins = len([s for s in above if s.get('outcome') == 'WIN'])
+                above_pnl = sum(s.get('theoretical_pnl', 0) for s in above)
+                conf_analysis.append({
+                    'threshold': f"{threshold*100:.0f}%",
+                    'signals': len(above),
+                    'wins': above_wins,
+                    'win_rate': f"{above_wins/len(above)*100:.1f}%",
+                    'theoretical_pnl': f"${above_pnl:.2f}",
+                })
+        
+        return {
+            'total_signals': len(self._signal_log),
+            'settled': len(settled),
+            'pending': len(pending),
+            'wins': len(wins),
+            'losses': len(losses),
+            'overall_win_rate': f"{len(wins)/len(settled)*100:.1f}%" if settled else "N/A",
+            'overall_pnl': f"${sum(s.get('theoretical_pnl', 0) for s in settled):.2f}",
+            'by_edge_threshold': edge_analysis,
+            'by_confidence_threshold': conf_analysis,
+            'recent_signals': [
+                {
+                    'question': s.get('question', '')[:50],
+                    'edge': f"{s.get('edge', 0)*100:.1f}%",
+                    'confidence': f"{s.get('confidence', 0)*100:.0f}%",
+                    'outcome': s.get('outcome', 'pending'),
+                    'pnl': f"${s.get('theoretical_pnl', 0):.2f}" if s.get('theoretical_pnl') else 'N/A',
+                }
+                for s in sorted(settled, key=lambda x: x.get('timestamp', ''), reverse=True)[:10]
+            ]
+        }
+    
     async def _position_sync_loop(self):
         """Sync positions with Kalshi API to detect filled orders and resolved markets."""
         await asyncio.sleep(5)  # Wait for startup
@@ -2098,6 +2266,8 @@ class KalshiBattleBot:
                     await self._sync_positions_with_kalshi()
                     # Also cancel any stale resting orders that accumulated
                     await self._cancel_all_resting_orders()
+                    # Check signal outcomes for backtesting
+                    await self._check_signal_outcomes()
                 
                 # First, check pending EXIT orders (sells on existing positions)
                 await self._check_pending_exits()
@@ -2303,6 +2473,10 @@ class KalshiBattleBot:
             'analyses': self._analyses[:20],
             'monitored': list(self._monitored.values()),
         })
+    
+    async def _handle_signals(self, request):
+        """API endpoint for signal backtesting analysis."""
+        return web.json_response(self._get_signal_performance())
     
     async def _handle_websocket(self, request):
         """Handle WebSocket connections for real-time updates."""
