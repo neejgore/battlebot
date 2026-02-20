@@ -1881,26 +1881,19 @@ class KalshiBattleBot:
             try:
                 contracts = position.get('contracts', 0)
                 if contracts > 0:
-                    # Aggressive exit: accept percentage-based slippage for immediate fill
-                    base_price_cents = int(exit_price * 100)
-                    
-                    # Safety: validate price is reasonable
-                    if base_price_cents < 1:
-                        base_price_cents = 5  # Floor at 5¢ for sell orders
-                    
-                    # Max 20% slippage OR 5¢, whichever is larger
-                    max_slippage_cents = max(5, int(base_price_cents * 0.20))
-                    aggressive_price_cents = max(base_price_cents - max_slippage_cents, 5)  # Floor at 5¢
+                    # Use MARKET order for exits - guarantees fill
+                    # Limit orders at low prices (5¢) never fill
+                    print(f"[LIVE SELL] Placing MARKET order: {contracts} {position['side']}")
                     
                     result = await self._kalshi.sell_position(
                         ticker=position['market_id'],
                         side=position['side'].lower(),
                         count=contracts,
-                        price=aggressive_price_cents,
-                        order_type='limit',
+                        price=None,  # No price for market order
+                        order_type='market',
                     )
                     exit_order_id = result.get('order', {}).get('order_id')
-                    print(f"[LIVE SELL] Placed: {contracts} {position['side']} @ {aggressive_price_cents}¢ (mid: {base_price_cents}¢) | Order ID: {exit_order_id}")
+                    print(f"[LIVE SELL] Market order placed | Order ID: {exit_order_id}")
                     
                     # Track as pending exit - don't remove position until sell fills
                     position['pending_exit'] = {
