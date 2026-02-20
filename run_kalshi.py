@@ -1336,6 +1336,16 @@ class KalshiBattleBot:
                     if any(pattern in question_lower or pattern in question_raw for pattern in player_prop_patterns):
                         continue
                     
+                    # FILTER 2b: Skip point spreads and totals - too volatile, no edge
+                    point_spread_patterns = [
+                        'total points', 'over 1', 'over 2', 'over 3', 'over 4', 'over 5',
+                        'over 6', 'over 7', 'over 8', 'over 9',
+                        'wins by over', 'wins by under', 'point spread',
+                        '.5 points', 'points scored',
+                    ]
+                    if any(pattern in question_lower for pattern in point_spread_patterns):
+                        continue
+                    
                     # FILTER 3: Skip markets where probability is extreme (< 10% or > 90%)
                     # These have low expected value and high variance
                     market_price = market.get('price', 0.5)
