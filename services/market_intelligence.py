@@ -83,11 +83,21 @@ class MarketIntelligence:
 # ============================================================================
 
 class NewsService:
-    """Fetches relevant news for market topics using web search."""
+    """Fetches relevant news for market topics.
+    
+    Uses Brave Search API (primary) with Google News RSS as fallback.
+    """
     
     def __init__(self):
         self._cache: dict[str, tuple[datetime, list[NewsItem]]] = {}
-        self._cache_ttl = timedelta(minutes=15)
+        self._cache_ttl = timedelta(minutes=60)  # Increased from 15 to save API calls
+        self._brave_api_key = os.getenv('BRAVE_API_KEY')
+        self._brave_searches = 0  # Track usage
+        
+        if self._brave_api_key:
+            logger.info("[News] Brave Search API configured (primary source)")
+        else:
+            logger.info("[News] No Brave API key - using Google News RSS only")
         
     def _extract_search_terms(self, question: str) -> list[str]:
         """Extract key search terms from a market question."""
@@ -114,51 +124,72 @@ class NewsService:
         # Add category context
         if category:
             category_terms = {
-                'politics': 'politics news',
-                'sports': 'sports news today',
-                'crypto': 'cryptocurrency news',
-                'economics': 'economic news today',
-                'entertainment': 'entertainment news',
-                'tech': 'technology news',
-                'weather': 'weather forecast',
+                'politics': 'news',
+                'sports': 'sports news',
+                'crypto': 'crypto news',
+                'economics': 'economic news',
+                'entertainment': 'news',
+                'tech': 'tech news',
+                'weather': 'weather',
             }
             if category.lower() in category_terms:
                 terms.append(category_terms[category.lower()])
         
-        # Build query
-        query = ' '.join(terms[:6])  # Limit to avoid overly specific queries
-        
-        # Add "latest" or "news" if not present
-        if 'news' not in query.lower():
-            query = f"latest news {query}"
+        # Build query - keep it focused
+        query = ' '.join(terms[:5])
         
         return query
     
-    async def fetch_news(
-        self,
-        question: str,
-        category: Optional[str] = None,
-        max_results: int = 5,
-    ) -> list[NewsItem]:
-        """Fetch relevant news for a market question.
-        
-        Uses Google News RSS feed - free, reliable, no auth required.
-        """
-        from urllib.parse import quote
-        
-        # Check cache
-        cache_key = f"{question[:50]}:{category}"
-        if cache_key in self._cache:
-            cached_time, cached_items = self._cache[cache_key]
-            if datetime.utcnow() - cached_time < self._cache_ttl:
-                logger.debug(f"News cache hit for: {question[:30]}...")
-                return cached_items
-        
-        query = self._build_search_query(question, category)
+    async def _fetch_brave(self, query: str, max_results: int = 5) -> list[NewsItem]:
+        """Fetch news using Brave Search API."""
         news_items = []
         
         try:
-            # Use Google News RSS feed (free, reliable, no captcha)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    "https://api.search.brave.com/res/v1/news/search",
+                    params={
+                        "q": query,
+                        "count": max_results,
+                        "freshness": "pd",  # Past day
+                    },
+                    headers={
+                        "X-Subscription-Token": self._brave_api_key,
+                        "Accept": "application/json",
+                    }
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    results = data.get('results', [])
+                    
+                    for r in results[:max_results]:
+                        news_items.append(NewsItem(
+                            title=r.get('title', '')[:100],
+                            snippet=r.get('description', r.get('title', ''))[:300],
+                            source=r.get('meta_url', {}).get('hostname', 'News'),
+                            url=r.get('url', ''),
+                        ))
+                    
+                    self._brave_searches += 1
+                    if news_items:
+                        logger.info(f"[Brave] Fetched {len(news_items)} items (total searches: {self._brave_searches})")
+                elif response.status_code == 429:
+                    logger.warning("[Brave] Rate limited - falling back to Google News")
+                else:
+                    logger.warning(f"[Brave] Status {response.status_code}: {response.text[:100]}")
+                    
+        except Exception as e:
+            logger.warning(f"[Brave] Error: {e}")
+        
+        return news_items
+    
+    async def _fetch_google_rss(self, query: str, max_results: int = 5) -> list[NewsItem]:
+        """Fetch news using Google News RSS (free fallback)."""
+        from urllib.parse import quote
+        news_items = []
+        
+        try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 encoded_query = quote(query)
                 url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
@@ -173,14 +204,13 @@ class NewsService:
                     matches = re.findall(item_pattern, rss_text, re.DOTALL)
                     
                     for title, link, source in matches[:max_results]:
-                        # Clean CDATA wrappers
                         title = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\\1', title).strip()
                         source = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\\1', source).strip()
                         
                         if title:
                             news_items.append(NewsItem(
                                 title=title[:100],
-                                snippet=title[:200],  # Google News RSS doesn't have snippets
+                                snippet=title[:200],
                                 source=source or "News",
                                 url=link.strip(),
                             ))
@@ -200,12 +230,42 @@ class NewsService:
                                 ))
                     
                     if news_items:
-                        logger.info(f"[News] Fetched {len(news_items)} items for: {query[:40]}...")
-                else:
-                    logger.warning(f"Google News returned status {response.status_code}")
-                
+                        logger.debug(f"[Google RSS] Fetched {len(news_items)} items")
+                        
         except Exception as e:
-            logger.warning(f"News fetch failed for '{query[:30]}...': {e}")
+            logger.warning(f"[Google RSS] Error: {e}")
+        
+        return news_items
+    
+    async def fetch_news(
+        self,
+        question: str,
+        category: Optional[str] = None,
+        max_results: int = 5,
+    ) -> list[NewsItem]:
+        """Fetch relevant news for a market question.
+        
+        Uses Brave Search API (primary) with Google News RSS fallback.
+        Results are cached for 60 minutes to minimize API usage.
+        """
+        # Check cache
+        cache_key = f"{question[:50]}:{category}"
+        if cache_key in self._cache:
+            cached_time, cached_items = self._cache[cache_key]
+            if datetime.utcnow() - cached_time < self._cache_ttl:
+                logger.debug(f"[News] Cache hit for: {question[:30]}...")
+                return cached_items
+        
+        query = self._build_search_query(question, category)
+        news_items = []
+        
+        # Try Brave first (if configured)
+        if self._brave_api_key:
+            news_items = await self._fetch_brave(query, max_results)
+        
+        # Fallback to Google News RSS
+        if not news_items:
+            news_items = await self._fetch_google_rss(query, max_results)
         
         # Dedupe and limit
         seen_urls = set()
@@ -220,8 +280,15 @@ class NewsService:
         # Cache results
         self._cache[cache_key] = (datetime.utcnow(), news_items)
         
-        logger.debug(f"Fetched {len(news_items)} news items for: {question[:30]}...")
         return news_items
+    
+    def get_usage_stats(self) -> dict:
+        """Get API usage statistics."""
+        return {
+            'brave_searches': self._brave_searches,
+            'cache_size': len(self._cache),
+            'cache_ttl_minutes': self._cache_ttl.total_seconds() / 60,
+        }
 
 
 # ============================================================================
