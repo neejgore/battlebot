@@ -1881,19 +1881,21 @@ class KalshiBattleBot:
             try:
                 contracts = position.get('contracts', 0)
                 if contracts > 0:
-                    # Use MARKET order for exits - guarantees fill
-                    # Limit orders at low prices (5¢) never fill
-                    print(f"[LIVE SELL] Placing MARKET order: {contracts} {position['side']}")
+                    # Use limit order at 1¢ for immediate fill (Kalshi doesn't support market orders well)
+                    # Selling at 1¢ means we accept any bid
+                    sell_price_cents = 1  # Floor price - will fill against any bid
+                    
+                    print(f"[LIVE SELL] Placing limit order: {contracts} {position['side']} @ {sell_price_cents}¢")
                     
                     result = await self._kalshi.sell_position(
                         ticker=position['market_id'],
                         side=position['side'].lower(),
                         count=contracts,
-                        price=None,  # No price for market order
-                        order_type='market',
+                        price=sell_price_cents,
+                        order_type='limit',
                     )
                     exit_order_id = result.get('order', {}).get('order_id')
-                    print(f"[LIVE SELL] Market order placed | Order ID: {exit_order_id}")
+                    print(f"[LIVE SELL] Order placed @ {sell_price_cents}¢ | Order ID: {exit_order_id}")
                     
                     # Track as pending exit - don't remove position until sell fills
                     position['pending_exit'] = {
