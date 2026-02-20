@@ -283,6 +283,10 @@ class KalshiBattleBot:
             # Fetch actual balance and portfolio value from Kalshi
             try:
                 balance_result = await self._kalshi.get_balance()
+                
+                # Debug: Log raw response to see what fields are available
+                print(f"[Sync] Raw balance response: {balance_result}")
+                
                 # Kalshi returns all values in cents
                 balance_cents = balance_result.get('balance', 0)
                 portfolio_cents = balance_result.get('portfolio_value', 0)
@@ -294,6 +298,8 @@ class KalshiBattleBot:
                 print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, Positions=${self._kalshi_portfolio:.2f}, Total=${self._kalshi_total:.2f}")
             except Exception as e:
                 print(f"[Sync] Could not fetch balance: {e}")
+                import traceback
+                traceback.print_exc()
                 self._kalshi_cash = None
                 self._kalshi_portfolio = None
                 self._kalshi_total = None
