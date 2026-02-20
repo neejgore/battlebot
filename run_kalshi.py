@@ -1671,12 +1671,12 @@ class KalshiBattleBot:
                     print(f"[Order] Size ${size:.2f} too small for 1 contract at {price_cents}¢")
                     return
                 
-                # Use the ACTUAL market price, with small slippage for fills
-                # Slippage: 2¢ or 5%, whichever is larger
-                slippage_cents = max(2, int(price_cents * 0.05))
+                # Use AGGRESSIVE slippage to ensure orders fill quickly
+                # Slippage: 10¢ or 15%, whichever is larger - this ensures fills
+                slippage_cents = max(10, int(price_cents * 0.15))
                 order_price_cents = min(price_cents + slippage_cents, 95)
                 
-                print(f"[Order] Placing: {contracts} {side} @ {order_price_cents}¢ (market: {price_cents}¢, size: ${actual_size:.2f})")
+                print(f"[Order] Placing: {contracts} {side} @ {order_price_cents}¢ (market: {price_cents}¢, slippage: {slippage_cents}¢)")
                 
                 result = await self._kalshi.place_order(
                     ticker=market_id,
