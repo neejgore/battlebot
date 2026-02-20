@@ -1890,8 +1890,8 @@ class KalshiBattleBot:
                     if position.get('pending_exit'):
                         return  # Silently skip - don't spam logs
                     
-                    # Skip exit for positions > 5 contracts (likely illiquid, wait for settlement)
-                    if contracts > 5:
+                    # Skip exit for positions > 10 contracts (likely illiquid, wait for settlement)
+                    if contracts > 10:
                         print(f"[LIVE SELL] Position ({contracts} contracts) too large for liquid exit - waiting for settlement")
                         return
                     
