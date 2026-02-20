@@ -504,6 +504,72 @@ class KalshiBattleBot:
             'recommendations': recommendations,
         }
     
+    def _get_intel_effectiveness(self) -> dict:
+        """Analyze win rates for trades with vs without news intelligence."""
+        exits = [t for t in self._trades if t.get('action') == 'EXIT']
+        
+        if not exits:
+            return {
+                'summary': 'No completed trades to analyze',
+                'with_news': {'trades': 0, 'wins': 0, 'losses': 0, 'pnl': 0},
+                'without_news': {'trades': 0, 'wins': 0, 'losses': 0, 'pnl': 0},
+            }
+        
+        with_news = {'trades': 0, 'wins': 0, 'losses': 0, 'pnl': 0.0}
+        without_news = {'trades': 0, 'wins': 0, 'losses': 0, 'pnl': 0.0}
+        
+        for trade in exits:
+            pnl = trade.get('pnl', 0)
+            has_intel = trade.get('has_intel', False)
+            news_count = trade.get('news_count', 0)
+            
+            bucket = with_news if (has_intel or news_count > 0) else without_news
+            bucket['trades'] += 1
+            bucket['pnl'] += pnl
+            if pnl > 0:
+                bucket['wins'] += 1
+            elif pnl < 0:
+                bucket['losses'] += 1
+        
+        # Calculate win rates
+        with_news['win_rate'] = with_news['wins'] / with_news['trades'] if with_news['trades'] > 0 else 0
+        without_news['win_rate'] = without_news['wins'] / without_news['trades'] if without_news['trades'] > 0 else 0
+        
+        # Build summary
+        lines = ["=== NEWS INTELLIGENCE EFFECTIVENESS ==="]
+        
+        if with_news['trades'] > 0:
+            lines.append(f"\nWITH NEWS ({with_news['trades']} trades):")
+            lines.append(f"  Win Rate: {with_news['win_rate']*100:.0f}% ({with_news['wins']}W/{with_news['losses']}L)")
+            lines.append(f"  P&L: ${with_news['pnl']:+.2f}")
+        else:
+            lines.append("\nWITH NEWS: No trades yet")
+        
+        if without_news['trades'] > 0:
+            lines.append(f"\nWITHOUT NEWS ({without_news['trades']} trades):")
+            lines.append(f"  Win Rate: {without_news['win_rate']*100:.0f}% ({without_news['wins']}W/{without_news['losses']}L)")
+            lines.append(f"  P&L: ${without_news['pnl']:+.2f}")
+        else:
+            lines.append("\nWITHOUT NEWS: No trades yet")
+        
+        # Conclusion
+        if with_news['trades'] >= 3 and without_news['trades'] >= 3:
+            diff = with_news['win_rate'] - without_news['win_rate']
+            if diff > 0.1:
+                lines.append(f"\n→ NEWS IS HELPING: +{diff*100:.0f}pp win rate improvement")
+            elif diff < -0.1:
+                lines.append(f"\n→ NEWS NOT HELPING: {diff*100:.0f}pp win rate difference")
+            else:
+                lines.append(f"\n→ INCONCLUSIVE: Only {diff*100:+.0f}pp difference")
+        else:
+            lines.append("\n→ Need more trades to determine effectiveness")
+        
+        return {
+            'summary': '\n'.join(lines),
+            'with_news': with_news,
+            'without_news': without_news,
+        }
+    
     def _get_stats(self) -> dict:
         """Calculate all stats from current state."""
         # Pending/resting orders (always from internal state)
@@ -664,6 +730,8 @@ class KalshiBattleBot:
             'prefer_inefficient': self._prefer_inefficient,
             'use_contrarian': self._use_contrarian,
             'min_inefficiency_score': self._min_inefficiency_score,
+            # Intel effectiveness metrics
+            'intel_effectiveness': self._get_intel_effectiveness(),
         }
     
     async def start(self):
@@ -702,6 +770,15 @@ class KalshiBattleBot:
         print(f"Max Position: ${self.max_position_size:,.2f}")
         print(f"\n[Intelligence Features]")
         print(f"  News Integration: {'ON' if self._use_intelligence else 'OFF'}")
+        # Check if Brave is configured
+        try:
+            brave_key = self._intelligence._news_service._brave_api_key
+            if brave_key:
+                print(f"  News Source: BRAVE SEARCH API (configured)")
+            else:
+                print(f"  News Source: Google News RSS (fallback)")
+        except:
+            print(f"  News Source: Unknown")
         print(f"  Prefer Inefficient Markets: {'ON' if self._prefer_inefficient else 'OFF'}")
         print(f"  Contrarian Timing: {'ON' if self._use_contrarian else 'OFF'}")
         print(f"  Min Inefficiency Score: {self._min_inefficiency_score:.2f}")
@@ -1146,6 +1223,9 @@ class KalshiBattleBot:
         """
         await asyncio.sleep(5)  # Wait for initial market fetch
         
+        loop_counter = 0
+        INTEL_LOG_INTERVAL = 50  # Log intel stats every ~50 loops
+        
         while self._running:
             try:
                 if not self._risk_engine.is_trading_allowed:
@@ -1189,6 +1269,19 @@ class KalshiBattleBot:
                     self._last_analysis[market_id] = datetime.utcnow()
                     self._last_analysis_price[market_id] = current_price
                     await asyncio.sleep(2)
+                    
+                # Periodic intel status logging
+                loop_counter += 1
+                if loop_counter >= INTEL_LOG_INTERVAL:
+                    loop_counter = 0
+                    try:
+                        news_stats = self._intelligence._news_service.get_usage_stats()
+                        intel_eff = self._get_intel_effectiveness()
+                        print(f"\n[INTEL STATUS] Brave searches: {news_stats.get('brave_searches', 0)}, Cache size: {news_stats.get('cache_size', 0)}")
+                        if intel_eff.get('with_news', {}).get('trades', 0) > 0 or intel_eff.get('without_news', {}).get('trades', 0) > 0:
+                            print(intel_eff['summary'])
+                    except Exception as e:
+                        print(f"[INTEL STATUS] Error: {e}")
                     
             except Exception as e:
                 print(f"[Trading Error] {e}")
@@ -1520,6 +1613,11 @@ class KalshiBattleBot:
                     print(f"[DB] Failed to log trade entry: {e}")
             self._positions[pos_id] = pos
             # Record trade for dry run
+            # Get intel data from most recent analysis for this market
+            recent_analysis = next((a for a in self._analyses if a.get('market_id') == market_id), None)
+            has_intel = recent_analysis.get('has_intel', False) if recent_analysis else False
+            news_count = recent_analysis.get('news_count', 0) if recent_analysis else 0
+            
             trade = {
                 'id': pos_id,
                 'market_id': market_id,
@@ -1529,12 +1627,24 @@ class KalshiBattleBot:
                 'price': entry_price,
                 'size': size,
                 'category': market.get('category', 'unknown'),  # Track for learning
+                'has_intel': has_intel,  # Track if news was used
+                'news_count': news_count,  # Track how many news items
                 'timestamp': datetime.utcnow().isoformat(),
             }
             self._trades.insert(0, trade)
-            print(f"[DRY RUN] ENTERED: {side} ${size:.2f} @ {int(entry_price*100)}¢ | {market.get('question', '')[:50]}...")
+            news_indicator = f" [NEWS:{news_count}]" if news_count > 0 else ""
+            print(f"[DRY RUN] ENTERED: {side} ${size:.2f} @ {int(entry_price*100)}¢{news_indicator} | {market.get('question', '')[:50]}...")
         else:
             # In LIVE mode, track as pending until we confirm fill from Kalshi
+            # Get intel data from most recent analysis for this market
+            recent_analysis = next((a for a in self._analyses if a.get('market_id') == market_id), None)
+            has_intel = recent_analysis.get('has_intel', False) if recent_analysis else False
+            news_count = recent_analysis.get('news_count', 0) if recent_analysis else 0
+            
+            # Store intel info in order_data so it persists through fill
+            order_data['has_intel'] = has_intel
+            order_data['news_count'] = news_count
+            
             self._pending_orders[order_id] = order_data
             # Record as pending order (not entry yet)
             trade = {
@@ -1545,12 +1655,15 @@ class KalshiBattleBot:
                 'side': side,
                 'price': entry_price,
                 'size': size,
+                'has_intel': has_intel,
+                'news_count': news_count,
                 'timestamp': datetime.utcnow().isoformat(),
                 'order_id': order_id,
                 'status': 'pending',
             }
             self._trades.insert(0, trade)
-            print(f"[PENDING] Order {order_id} placed, waiting to fill...")
+            news_indicator = f" [NEWS:{news_count}]" if news_count > 0 else ""
+            print(f"[PENDING] Order {order_id} placed{news_indicator}, waiting to fill...")
         
         self._save_state()
         await self._broadcast_update()
