@@ -61,6 +61,7 @@ class KalshiBattleBot:
         self._pending_orders: dict[str, dict] = {}  # Orders placed but not yet filled
         self._trades: list[dict] = []
         self._analyses: list[dict] = []
+        self._kalshi_cash = None  # Actual Kalshi balance from API (synced)
         self._load_state()
         
         self._running = False
@@ -264,17 +265,41 @@ class KalshiBattleBot:
         print(f"[Startup] Sync complete: {filled} filled, {canceled} canceled, {still_pending} still pending")
     
     async def _sync_positions_with_kalshi(self):
-        """Sync internal positions with Kalshi's actual positions.
+        """Sync internal positions with Kalshi's actual positions and balance.
         
         This ensures the bot's state matches reality by:
-        1. Fetching actual positions from Kalshi API
-        2. Removing phantom positions that don't exist on Kalshi
-        3. Adding any positions that exist on Kalshi but not in bot state
-        4. Updating entry prices to match Kalshi's records
+        1. Fetching actual balance from Kalshi API
+        2. Fetching actual positions from Kalshi API
+        3. Removing phantom positions that don't exist on Kalshi
+        4. Adding any positions that exist on Kalshi but not in bot state
+        5. Updating entry prices to match Kalshi's records
         """
-        print("[Sync] Fetching actual positions from Kalshi...")
+        print("[Sync] Fetching actual data from Kalshi...")
         
         try:
+            # Fetch actual balance from Kalshi
+            try:
+                balance_result = await self._kalshi.get_balance()
+                # Kalshi returns balance in cents or dollars depending on field
+                cash_cents = balance_result.get('balance', 0)
+                cash_dollars = balance_result.get('balance_dollars', None)
+                if cash_dollars:
+                    self._kalshi_cash = float(cash_dollars)
+                elif cash_cents:
+                    self._kalshi_cash = cash_cents / 100 if cash_cents > 100 else cash_cents
+                else:
+                    self._kalshi_cash = None
+                
+                # Also get portfolio value if available
+                payout_cents = balance_result.get('payout_available', 0)
+                payout_dollars = balance_result.get('payout_available_dollars', None)
+                
+                if self._kalshi_cash is not None:
+                    print(f"[Sync] Kalshi cash balance: ${self._kalshi_cash:.2f}")
+            except Exception as e:
+                print(f"[Sync] Could not fetch balance: {e}")
+                self._kalshi_cash = None
+            
             result = await self._kalshi.get_positions()
             kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
             
@@ -485,9 +510,15 @@ class KalshiBattleBot:
         at_risk = positions_at_risk + pending_at_risk
         
         realized_pnl = sum(t.get('pnl', 0) for t in self._trades if t.get('action') == 'EXIT')
-        available = self.initial_bankroll - at_risk + realized_pnl
         unrealized_pnl = sum(p.get('unrealized_pnl', 0) for p in self._positions.values())
-        total_value = available + at_risk + unrealized_pnl
+        
+        # Use actual Kalshi balance if available, otherwise calculate
+        if self._kalshi_cash is not None:
+            available = self._kalshi_cash
+            total_value = self._kalshi_cash + positions_at_risk + unrealized_pnl
+        else:
+            available = self.initial_bankroll - at_risk + realized_pnl
+            total_value = available + at_risk + unrealized_pnl
         
         # Calculate at-risk by time horizon (positions only)
         at_risk_ultra_short = 0  # ≤24 hours
