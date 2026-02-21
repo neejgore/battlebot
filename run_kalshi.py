@@ -2740,7 +2740,10 @@ class KalshiBattleBot:
             result = await self._kalshi.get_fills(limit=100)
             fills = result.get('fills', [])
             
-            # Simplify for debug output
+            # Show RAW first fill to see actual structure
+            raw_sample = fills[0] if fills else {}
+            
+            # Simplify for debug output - include all relevant fields
             simplified = []
             for f in fills[:50]:
                 simplified.append({
@@ -2748,12 +2751,15 @@ class KalshiBattleBot:
                     'action': f.get('action', ''),
                     'side': f.get('side', ''),
                     'count': f.get('count', 0),
-                    'price': f.get('yes_price', f.get('no_price', 0)),
+                    'yes_price': f.get('yes_price'),
+                    'no_price': f.get('no_price'),
+                    'price': f.get('price'),
                     'created': f.get('created_time', '')[:19],
                 })
             
             return web.json_response({
                 'total_fills': len(fills),
+                'raw_sample': raw_sample,
                 'fills': simplified
             })
         except Exception as e:
