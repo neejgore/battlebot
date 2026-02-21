@@ -782,6 +782,14 @@ class KalshiBattleBot:
         total_closed = winning + losing
         win_rate = winning / total_closed if total_closed > 0 else 0
         
+        # TODAY'S PERFORMANCE - filter by today's date
+        today_str = datetime.utcnow().strftime('%Y-%m-%d')
+        today_exits = [t for t in exits if t.get('timestamp', '').startswith(today_str)]
+        today_pnl = sum(t.get('pnl', 0) for t in today_exits)
+        today_wins = len([t for t in today_exits if t.get('pnl', 0) > 0])
+        today_losses = len([t for t in today_exits if t.get('pnl', 0) < 0])
+        today_trades = today_wins + today_losses
+        
         # Use actual Kalshi return if available, otherwise calculated
         if return_pct_actual is not None:
             return_pct = return_pct_actual
@@ -816,6 +824,11 @@ class KalshiBattleBot:
             'total_pnl': realized_pnl + unrealized_pnl,
             'return_pct': return_pct,
             'kalshi_synced': self._kalshi_total is not None,  # Shows if using real Kalshi data
+            # Today's performance
+            'today_pnl': today_pnl,
+            'today_wins': today_wins,
+            'today_losses': today_losses,
+            'today_trades': today_trades,
             'total_entries': len([t for t in self._trades if t.get('action') == 'ENTRY']),
             'total_exits': len(exits),
             'winning_trades': winning,
@@ -2707,10 +2720,15 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Short (1-7d)</div><div class="card-value" id="atRiskShort">$0.00</div><div class="card-sub">resolves in days</div></div>
                 <div class="card"><div class="card-label">Medium (8+d)</div><div class="card-value" id="atRiskMedium">$0.00</div><div class="card-sub">resolves in weeks+</div></div>
             </div>
-            <div class="section-title">PERFORMANCE</div>
+            <div class="section-title">TODAY'S PERFORMANCE</div>
             <div class="grid">
-                <div class="card"><div class="card-label">Realized P&L</div><div class="card-value green" id="realizedPnl">$0.00</div></div>
+                <div class="card"><div class="card-label">Today's P&L</div><div class="card-value" id="todayPnl">$0.00</div></div>
+                <div class="card"><div class="card-label">Today's Record</div><div class="card-value" id="todayRecord">0W / 0L</div><div class="card-sub" id="todayTrades">0 trades</div></div>
                 <div class="card"><div class="card-label">Unrealized P&L</div><div class="card-value" id="unrealizedPnl">$0.00</div></div>
+            </div>
+            <div class="section-title">OVERALL PERFORMANCE</div>
+            <div class="grid">
+                <div class="card"><div class="card-label">Total Realized P&L</div><div class="card-value" id="realizedPnl">$0.00</div></div>
                 <div class="card"><div class="card-label">Win Rate</div><div class="card-value" id="winRate">0%</div><div class="card-sub" id="winLoss">0W / 0L</div></div>
                 <div class="card"><div class="card-label">Best Trade</div><div class="card-value green" id="bestTrade">$0.00</div></div>
                 <div class="card"><div class="card-label">Worst Trade</div><div class="card-value red" id="worstTrade">$0.00</div></div>
@@ -2790,10 +2808,16 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             document.getElementById('totalValue').textContent = '$' + s.total_value.toFixed(2);
             document.getElementById('returnPct').textContent = (s.return_pct >= 0 ? '+' : '') + s.return_pct.toFixed(2) + '%';
             document.getElementById('returnPct').className = 'card-value ' + (s.return_pct >= 0 ? 'green' : 'red');
-            document.getElementById('realizedPnl').textContent = (s.realized_pnl >= 0 ? '+' : '') + '$' + s.realized_pnl.toFixed(2);
-            document.getElementById('realizedPnl').className = 'card-value ' + (s.realized_pnl >= 0 ? 'green' : 'red');
+            // Today's Performance
+            document.getElementById('todayPnl').textContent = (s.today_pnl >= 0 ? '+' : '') + '$' + (s.today_pnl || 0).toFixed(2);
+            document.getElementById('todayPnl').className = 'card-value ' + (s.today_pnl >= 0 ? 'green' : 'red');
+            document.getElementById('todayRecord').textContent = (s.today_wins || 0) + 'W / ' + (s.today_losses || 0) + 'L';
+            document.getElementById('todayTrades').textContent = (s.today_trades || 0) + ' settled today';
             document.getElementById('unrealizedPnl').textContent = (s.unrealized_pnl >= 0 ? '+' : '') + '$' + s.unrealized_pnl.toFixed(2);
             document.getElementById('unrealizedPnl').className = 'card-value ' + (s.unrealized_pnl >= 0 ? 'green' : 'red');
+            // Overall Performance
+            document.getElementById('realizedPnl').textContent = (s.realized_pnl >= 0 ? '+' : '') + '$' + s.realized_pnl.toFixed(2);
+            document.getElementById('realizedPnl').className = 'card-value ' + (s.realized_pnl >= 0 ? 'green' : 'red');
             document.getElementById('winRate').textContent = (s.win_rate * 100).toFixed(0) + '%';
             document.getElementById('winLoss').textContent = s.winning_trades + 'W / ' + s.losing_trades + 'L';
             document.getElementById('bestTrade').textContent = '+$' + s.best_trade.toFixed(2);
