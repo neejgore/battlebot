@@ -402,7 +402,8 @@ class KalshiBattleBot:
                     
                     print(f"[Reconcile] Checking {ticker[:30]}... | net={net_contracts} | status={status} | result={result}")
                     
-                    if status != 'settled' or not result:
+                    # Kalshi uses 'finalized' or 'settled' for completed markets
+                    if status not in ('settled', 'finalized') or not result:
                         # Market not settled yet - skip
                         continue
                     
