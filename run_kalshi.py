@@ -1310,7 +1310,8 @@ class KalshiBattleBot:
             medium_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         
         # PRIORITIZE: Ultra-short first, then short, then medium
-        selected = ultra_short[:15] + short_term[:10] + medium_term[:5]
+        # Increased limits since strict filtering (NO-only, 15-95¢) reduces opportunities
+        selected = ultra_short[:50] + short_term[:30] + medium_term[:20]
         
         # Log what we found
         print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
@@ -1780,7 +1781,7 @@ class KalshiBattleBot:
         # STRICT LIMITS - prevent runaway orders
         MAX_CONTRACTS_PER_ORDER = 25  # Max 25 contracts - bigger bets on quality opportunities
         MIN_PRICE_CENTS = 15  # Don't trade below 15¢ - cheap contracts have 6% win rate
-        MAX_PRICE_CENTS = 85  # Don't trade above 85¢ - not enough upside
+        MAX_PRICE_CENTS = 95  # Allow up to 95¢ - data shows expensive NO still profitable (+4% ROI)
         
         # Use the correct price for the side we're trading
         if side.upper() == 'YES':
