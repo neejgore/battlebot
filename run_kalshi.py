@@ -1005,6 +1005,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/ws', self._handle_websocket)
         self._app.router.add_get('/api/state', self._handle_state)
         self._app.router.add_get('/api/signals', self._handle_signals)
+        self._app.router.add_get('/api/fills', self._handle_fills)
         
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -2732,6 +2733,31 @@ class KalshiBattleBot:
     async def _handle_signals(self, request):
         """API endpoint for signal backtesting analysis."""
         return web.json_response(self._get_signal_performance())
+    
+    async def _handle_fills(self, request):
+        """Debug endpoint to see Kalshi fills."""
+        try:
+            result = await self._kalshi.get_fills(limit=100)
+            fills = result.get('fills', [])
+            
+            # Simplify for debug output
+            simplified = []
+            for f in fills[:50]:
+                simplified.append({
+                    'ticker': f.get('ticker', ''),
+                    'action': f.get('action', ''),
+                    'side': f.get('side', ''),
+                    'count': f.get('count', 0),
+                    'price': f.get('yes_price', f.get('no_price', 0)),
+                    'created': f.get('created_time', '')[:19],
+                })
+            
+            return web.json_response({
+                'total_fills': len(fills),
+                'fills': simplified
+            })
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
     
     async def _handle_websocket(self, request):
         """Handle WebSocket connections for real-time updates."""
