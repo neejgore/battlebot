@@ -386,16 +386,80 @@ class KalshiBattleBot:
                     print(f"[Sync] Kalshi: {ticker[:30]}... | pos={pos} | exposure={exposure}¢")
             
             # Check for phantom positions (in bot but not on Kalshi)
+            # These may have SETTLED - check market status and record P&L
             phantom_count = 0
+            settled_count = 0
             for pos_id in list(self._positions.keys()):
                 pos = self._positions[pos_id]
                 market_id = pos.get('market_id', '')
                 
                 if market_id not in kalshi_by_ticker:
-                    print(f"[Sync] Removing phantom position: {pos.get('question', '')[:40]}...")
+                    # Position gone from Kalshi - check if market settled
+                    try:
+                        market_result = await self._kalshi.get_market(market_id)
+                        market_data = market_result.get('market', {}) if market_result else {}
+                        status = market_data.get('status', '')
+                        result = market_data.get('result', '')  # 'yes' or 'no'
+                        
+                        if status == 'settled' and result:
+                            # Market settled! Calculate P&L
+                            our_side = pos.get('side', '').lower()
+                            contracts = pos.get('contracts', 0)
+                            entry_price = pos.get('entry_price', 0.5)
+                            
+                            # If our side won, we get $1 per contract (100¢)
+                            # If our side lost, we get $0
+                            if our_side == result:
+                                # WE WON! Payout is $1 per contract
+                                exit_price = 1.0
+                                pnl = (exit_price - entry_price) * contracts
+                                outcome = 'WIN'
+                            else:
+                                # WE LOST - contracts worthless
+                                exit_price = 0.0
+                                pnl = -entry_price * contracts
+                                outcome = 'LOSS'
+                            
+                            print(f"[SETTLED] {outcome}! ${pnl:+.2f} | {pos.get('side')} on '{result.upper()}' result | {pos.get('question', '')[:40]}...")
+                            
+                            # Record EXIT trade
+                            trade = {
+                                'id': pos_id,
+                                'market_id': market_id,
+                                'question': pos.get('question', ''),
+                                'action': 'EXIT',
+                                'side': pos.get('side'),
+                                'entry_price': entry_price,
+                                'exit_price': exit_price,
+                                'contracts': contracts,
+                                'size': pos.get('size', 0),
+                                'pnl': pnl,
+                                'reason': f'SETTLED_{outcome}',
+                                'edge': pos.get('edge'),
+                                'confidence': pos.get('confidence'),
+                                'timestamp': datetime.utcnow().isoformat(),
+                            }
+                            self._trades.insert(0, trade)
+                            
+                            # Record in risk engine
+                            await self._risk_engine.record_trade_result(pnl)
+                            
+                            settled_count += 1
+                        else:
+                            print(f"[Sync] Position gone but market not settled ({status}): {pos.get('question', '')[:40]}...")
+                            phantom_count += 1
+                            
+                    except Exception as e:
+                        print(f"[Sync] Error checking market {market_id}: {e}")
+                        phantom_count += 1
+                    
+                    # Remove position regardless
                     self._positions.pop(pos_id)
-                    phantom_count += 1
             
+            if settled_count:
+                print(f"[Sync] Recorded {settled_count} SETTLED positions with P&L")
+                self._save_state()
+                await self._broadcast_update()
             if phantom_count:
                 print(f"[Sync] Removed {phantom_count} phantom positions")
             
