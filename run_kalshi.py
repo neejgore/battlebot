@@ -319,6 +319,140 @@ class KalshiBattleBot:
         except Exception as e:
             print(f"[Startup] Error fetching resting orders: {e}")
     
+    async def _reconcile_settlements_from_fills(self):
+        """Reconcile settlements by checking fills against trade history.
+        
+        This is critical for Railway deployments where state may be lost.
+        Queries Kalshi fills and backfills any missed settlement P&L.
+        """
+        print("[Reconcile] Checking for missed settlements from Kalshi fills...")
+        
+        try:
+            # Get recent fills from Kalshi (our actual trade history)
+            result = await self._kalshi.get_fills(limit=200)
+            fills = result.get('fills', [])
+            
+            if not fills:
+                print("[Reconcile] No fills found in Kalshi history")
+                return
+            
+            print(f"[Reconcile] Found {len(fills)} fills in Kalshi history")
+            
+            # Group fills by ticker to find net positions
+            fills_by_ticker = {}
+            for fill in fills:
+                ticker = fill.get('ticker', '')
+                if not ticker:
+                    continue
+                if ticker not in fills_by_ticker:
+                    fills_by_ticker[ticker] = []
+                fills_by_ticker[ticker].append(fill)
+            
+            # Get tickers that have EXIT trades in our history
+            exit_tickers = set()
+            entry_by_ticker = {}
+            for trade in self._trades:
+                ticker = trade.get('market_id', '')
+                if trade.get('action') == 'EXIT':
+                    exit_tickers.add(ticker)
+                elif trade.get('action') == 'ENTRY':
+                    entry_by_ticker[ticker] = trade
+            
+            reconciled = 0
+            for ticker, ticker_fills in fills_by_ticker.items():
+                # Skip if we already have an EXIT for this ticker
+                if ticker in exit_tickers:
+                    continue
+                
+                # Calculate net position from fills
+                net_contracts = 0
+                avg_price = 0.0
+                total_cost = 0.0
+                side = None
+                
+                for fill in ticker_fills:
+                    action = fill.get('action', '')
+                    count = fill.get('count', 0)
+                    price = fill.get('yes_price', fill.get('no_price', 50)) / 100.0
+                    fill_side = fill.get('side', '')
+                    
+                    if action == 'buy':
+                        net_contracts += count
+                        total_cost += price * count
+                        side = fill_side
+                    elif action == 'sell':
+                        net_contracts -= count
+                
+                # Skip if no net position (fully closed via sells)
+                if net_contracts <= 0:
+                    continue
+                
+                avg_price = total_cost / net_contracts if net_contracts > 0 else 0.5
+                
+                # Check if this market has settled
+                try:
+                    market_result = await self._kalshi.get_market(ticker)
+                    market_data = market_result.get('market', {}) if market_result else {}
+                    status = market_data.get('status', '')
+                    result = market_data.get('result', '')
+                    title = market_data.get('title', ticker)[:50]
+                    
+                    if status != 'settled' or not result:
+                        # Market not settled yet - skip
+                        continue
+                    
+                    # Market settled! Calculate P&L
+                    our_side = (side or '').lower()
+                    if our_side == result:
+                        exit_price = 1.0
+                        pnl = (exit_price - avg_price) * net_contracts
+                        outcome = 'WIN'
+                    else:
+                        exit_price = 0.0
+                        pnl = -avg_price * net_contracts
+                        outcome = 'LOSS'
+                    
+                    print(f"[Reconcile] FOUND MISSED SETTLEMENT: {outcome}! ${pnl:+.2f} | {our_side.upper()} on '{result.upper()}' result | {title}")
+                    
+                    # Record EXIT trade
+                    trade = {
+                        'id': f"reconciled_{ticker}_{datetime.utcnow().timestamp()}",
+                        'market_id': ticker,
+                        'question': title,
+                        'action': 'EXIT',
+                        'side': side,
+                        'entry_price': avg_price,
+                        'exit_price': exit_price,
+                        'contracts': net_contracts,
+                        'size': avg_price * net_contracts,
+                        'pnl': pnl,
+                        'reason': f'SETTLED_{outcome}',
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'reconciled': True,  # Flag that this was backfilled
+                    }
+                    self._trades.insert(0, trade)
+                    
+                    # Record in risk engine
+                    await self._risk_engine.record_trade_result(pnl)
+                    
+                    reconciled += 1
+                    await asyncio.sleep(0.2)  # Rate limit API calls
+                    
+                except Exception as e:
+                    print(f"[Reconcile] Error checking market {ticker}: {e}")
+                    continue
+            
+            if reconciled > 0:
+                self._save_state()
+                print(f"[Reconcile] Backfilled {reconciled} missed settlements!")
+            else:
+                print("[Reconcile] No missed settlements found - all trades accounted for")
+                
+        except Exception as e:
+            print(f"[Reconcile] Error during reconciliation: {e}")
+            import traceback
+            traceback.print_exc()
+    
     async def _sync_positions_with_kalshi(self):
         """Sync internal positions with Kalshi's actual positions and balance.
         
@@ -929,6 +1063,10 @@ class KalshiBattleBot:
         # Sync positions with Kalshi to ensure accuracy (LIVE mode only)
         if not self.dry_run:
             await self._sync_positions_with_kalshi()
+        
+        # CRITICAL: Reconcile missed settlements from fills (Railway state loss protection)
+        if not self.dry_run:
+            await self._reconcile_settlements_from_fills()
         
         # Start background tasks
         asyncio.create_task(self._market_loop())
