@@ -1012,6 +1012,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/api/state', self._handle_state)
         self._app.router.add_get('/api/signals', self._handle_signals)
         self._app.router.add_get('/api/fills', self._handle_fills)
+        self._app.router.add_get('/api/debug-reconcile', self._handle_debug_reconcile)
         
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -2768,6 +2769,82 @@ class KalshiBattleBot:
                 'raw_sample': raw_sample,
                 'fills': simplified
             })
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
+    
+    async def _handle_debug_reconcile(self, request):
+        """Debug endpoint to trace reconciliation logic."""
+        debug_output = []
+        
+        try:
+            # Get fills
+            result = await self._kalshi.get_fills(limit=200)
+            fills = result.get('fills', [])
+            debug_output.append(f"Total fills: {len(fills)}")
+            
+            # Group by ticker
+            fills_by_ticker = {}
+            for fill in fills:
+                ticker = fill.get('ticker', '')
+                if not ticker:
+                    continue
+                if ticker not in fills_by_ticker:
+                    fills_by_ticker[ticker] = []
+                fills_by_ticker[ticker].append(fill)
+            
+            debug_output.append(f"Unique tickers: {len(fills_by_ticker)}")
+            
+            # Get exit tickers from trades
+            exit_tickers = set()
+            for trade in self._trades:
+                ticker = trade.get('market_id', '')
+                if trade.get('action') == 'EXIT':
+                    exit_tickers.add(ticker)
+            
+            debug_output.append(f"Exit tickers in history: {len(exit_tickers)}")
+            
+            # Check Feb 20 tickers specifically
+            feb20_checks = []
+            for ticker in ['KXBTCD-26FEB2017-T65749.99', 'KXBTCD-26FEB2017-T66249.99', 
+                          'KXBTC-26FEB2017-B66000', 'KXBTC-26FEB2017-B66500']:
+                check = {'ticker': ticker}
+                
+                # Is it in fills?
+                check['in_fills'] = ticker in fills_by_ticker
+                
+                # Is it in exit_tickers?
+                check['has_exit'] = ticker in exit_tickers
+                
+                if ticker in fills_by_ticker:
+                    # Calculate net position
+                    net = 0
+                    side = None
+                    for f in fills_by_ticker[ticker]:
+                        if f.get('action') == 'buy':
+                            net += f.get('count', 0)
+                            side = f.get('side')
+                        elif f.get('action') == 'sell':
+                            net -= f.get('count', 0)
+                    check['net_contracts'] = net
+                    check['side'] = side
+                    
+                    # Check market status
+                    try:
+                        market_result = await self._kalshi.get_market(ticker)
+                        market_data = market_result.get('market', {}) if market_result else {}
+                        check['market_status'] = market_data.get('status', 'unknown')
+                        check['market_result'] = market_data.get('result', 'none')
+                        check['market_title'] = market_data.get('title', '')[:40]
+                    except Exception as e:
+                        check['market_error'] = str(e)
+                
+                feb20_checks.append(check)
+            
+            return web.json_response({
+                'debug': debug_output,
+                'feb20_checks': feb20_checks
+            })
+            
         except Exception as e:
             return web.json_response({'error': str(e)}, status=500)
     
