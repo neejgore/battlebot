@@ -359,6 +359,7 @@ class KalshiBattleBot:
                     entry_by_ticker[ticker] = trade
             
             reconciled = 0
+            checked = 0
             for ticker, ticker_fills in fills_by_ticker.items():
                 # Skip if we already have an EXIT for this ticker
                 if ticker in exit_tickers:
@@ -373,7 +374,8 @@ class KalshiBattleBot:
                 for fill in ticker_fills:
                     action = fill.get('action', '')
                     count = fill.get('count', 0)
-                    price = fill.get('yes_price', fill.get('no_price', 50)) / 100.0
+                    # Kalshi fills API uses 'price' field (in cents), not yes_price/no_price
+                    price = fill.get('price', 50) / 100.0
                     fill_side = fill.get('side', '')
                     
                     if action == 'buy':
@@ -390,12 +392,15 @@ class KalshiBattleBot:
                 avg_price = total_cost / net_contracts if net_contracts > 0 else 0.5
                 
                 # Check if this market has settled
+                checked += 1
                 try:
                     market_result = await self._kalshi.get_market(ticker)
                     market_data = market_result.get('market', {}) if market_result else {}
                     status = market_data.get('status', '')
                     result = market_data.get('result', '')
                     title = market_data.get('title', ticker)[:50]
+                    
+                    print(f"[Reconcile] Checking {ticker[:30]}... | net={net_contracts} | status={status} | result={result}")
                     
                     if status != 'settled' or not result:
                         # Market not settled yet - skip
@@ -442,6 +447,7 @@ class KalshiBattleBot:
                     print(f"[Reconcile] Error checking market {ticker}: {e}")
                     continue
             
+            print(f"[Reconcile] Checked {checked} positions with net buys")
             if reconciled > 0:
                 self._save_state()
                 print(f"[Reconcile] Backfilled {reconciled} missed settlements!")
