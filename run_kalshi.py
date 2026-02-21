@@ -38,10 +38,10 @@ class KalshiBattleBot:
         
         # Config from env - STRICT defaults for profitability
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
-        self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 1000))
+        self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
         self.min_edge = max(0.10, float(os.getenv('MIN_EDGE', 0.10)))  # 10% min edge - enforce minimum
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.30))  # 30% confidence - Claude is honest about uncertainty
-        self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 30))  # $30 max - fewer bets = bigger size
+        self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 10))  # $10 max - appropriate for $100 bankroll
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.20))  # 20% Kelly - higher conviction on filtered bets
         self.max_oi_pct = float(os.getenv('MAX_OI_PCT', 0.10))  # Max 10% of open interest
         self.simulate_prices = os.getenv('SIMULATE_PRICES', 'false').lower() == 'true'
