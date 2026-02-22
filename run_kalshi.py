@@ -3092,9 +3092,9 @@ class KalshiBattleBot:
             settlements = []
             today_str = datetime.utcnow().strftime('%Y-%m-%d')
             
-            # Process each ticker
+            # Process each ticker: include every ticker we BOUGHT that has since settled
+            # (After settlement, Kalshi may show sells that zero the position — we still want the settlement.)
             for ticker, ticker_fills in fills_by_ticker.items():
-                # Calculate net position and average entry price
                 total_bought = 0
                 total_cost = 0.0
                 total_sold = 0
@@ -3104,8 +3104,7 @@ class KalshiBattleBot:
                 for fill in ticker_fills:
                     action = fill.get('action', '')
                     count = fill.get('count', 0)
-                    # IMPORTANT: Kalshi 'price' in fills is in DOLLARS (e.g., 0.25 = 25¢)
-                    price = fill.get('price', 0.50)
+                    price = fill.get('price', 0.50)  # Kalshi fills: price in DOLLARS
                     fill_side = fill.get('side', '')
                     fill_time = fill.get('created_time', '')
                     
@@ -3118,17 +3117,13 @@ class KalshiBattleBot:
                     elif action == 'sell':
                         total_sold += count
                 
-                # Net contracts (buys - sells)
-                net_contracts = total_bought - total_sold
-                
-                # Skip if no net position (fully closed via sells)
-                if net_contracts <= 0:
+                # Skip if we never bought
+                if total_bought <= 0:
                     continue
                 
-                # Calculate average entry price
-                avg_entry_price = total_cost / total_bought if total_bought > 0 else 0.50
+                avg_entry_price = total_cost / total_bought
+                our_side = (side or '').lower()
                 
-                # Check market status
                 try:
                     market_result = await self._kalshi.get_market(ticker)
                     market = market_result.get('market', {}) if market_result else {}
@@ -3137,35 +3132,31 @@ class KalshiBattleBot:
                     title = market.get('title', ticker)
                     close_time = market.get('close_time', '')
                     
-                    # Only process settled markets
+                    # Only include settled markets
                     if status not in ('settled', 'finalized') or not result:
                         continue
                     
-                    # Calculate P&L
-                    # Our side is what we bought (stored in 'side' variable)
-                    our_side = (side or '').lower()
+                    # Contracts that settled = what we bought (sells may be settlement payout)
+                    contracts_settled = total_bought
                     market_result_lower = result.lower()
                     
                     if our_side == market_result_lower:
-                        # WIN: We get $1 per contract
-                        pnl = net_contracts * (1.0 - avg_entry_price)
+                        pnl = contracts_settled * (1.0 - avg_entry_price)
                         outcome = 'WIN'
                     else:
-                        # LOSS: We get $0 per contract
-                        pnl = net_contracts * (-avg_entry_price)
+                        pnl = contracts_settled * (-avg_entry_price)
                         outcome = 'LOSS'
                     
-                    # Determine settlement date (use close_time if available)
                     settlement_date = close_time[:10] if close_time else today_str
                     
                     settlements.append({
                         'ticker': ticker,
                         'question': title,
                         'side': our_side.upper(),
-                        'contracts': net_contracts,
+                        'contracts': contracts_settled,
                         'entry_price': round(avg_entry_price, 4),
-                        'entry_price_cents': int(avg_entry_price * 100),
-                        'cost': round(net_contracts * avg_entry_price, 2),
+                        'entry_price_cents': int(round(avg_entry_price * 100)),
+                        'cost': round(contracts_settled * avg_entry_price, 2),
                         'result': market_result_lower.upper(),
                         'outcome': outcome,
                         'pnl': round(pnl, 2),
@@ -3177,7 +3168,6 @@ class KalshiBattleBot:
                     print(f"[Settlements] Error checking market {ticker}: {e}")
                     continue
                 
-                # Rate limit API calls
                 await asyncio.sleep(0.1)
             
             # Sort by settlement date (newest first)
@@ -3203,8 +3193,11 @@ class KalshiBattleBot:
             best_pnl = max(pnls) if pnls else 0
             worst_pnl = min(pnls) if pnls else 0
             
+            total_deposits = float(os.getenv('TOTAL_DEPOSITS', '150'))
+            
             return web.json_response({
                 'settlements': settlements,
+                'total_deposits': total_deposits,
                 'summary': {
                     'total': len(settlements),
                     'wins': len(wins),
@@ -3436,15 +3429,15 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             </div>
             <div class="section-title">ACCOUNT VALUE <span style="font-size:10px;opacity:0.6;font-weight:normal;">(from Kalshi API)</span></div>
             <div class="grid">
-                <div class="card"><div class="card-label">Total Value</div><div class="card-value" id="accountValue">$0.00</div><div class="card-sub" id="accountSource">syncing...</div></div>
+                <div class="card"><div class="card-label">Total Value</div><div class="card-value" id="accountValue">$0.00</div><div class="card-sub" id="accountSource">syncing...</div><div class="card-sub" id="changeSinceYesterday" style="font-size:10px;margin-top:2px;"></div></div>
                 <div class="card"><div class="card-label">Cash Available</div><div class="card-value" id="cashAvailable">$0.00</div></div>
                 <div class="card"><div class="card-label">In Positions</div><div class="card-value" id="positionsValue">$0.00</div><div class="card-sub" id="positionsSummary">0 bets</div></div>
             </div>
-            <div class="section-title">PERFORMANCE <span style="font-size:10px;opacity:0.6;font-weight:normal;">(vs deposits)</span></div>
+            <div class="section-title">PERFORMANCE</div>
             <div class="grid">
-                <div class="card"><div class="card-label">Total Return</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
-                <div class="card"><div class="card-label">Unrealized P&L</div><div class="card-value" id="unrealizedPnl">$0.00</div><div class="card-sub" id="unrealizedDetail">open positions</div></div>
-                <div class="card"><div class="card-label">Position Status</div><div class="card-value" id="positionStatus">0W / 0L</div><div class="card-sub">winning vs losing</div></div>
+                <div class="card"><div class="card-label">Total return vs deposited</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
+                <div class="card"><div class="card-label">Unrealized P&L</div><div class="card-value" id="unrealizedPnl">$0.00</div><div class="card-sub" id="unrealizedDetail">on open positions</div></div>
+                <div class="card"><div class="card-label">Open positions</div><div class="card-value" id="positionStatus">0</div><div class="card-sub" id="positionStatusSub">ahead / behind by price</div></div>
             </div>
             <div class="section-title">TODAY'S ACTIVITY</div>
             <div class="grid">
@@ -3458,30 +3451,21 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Crypto</div><div class="card-value" id="expCrypto">$0.00</div></div>
                 <div class="card"><div class="card-label">Other</div><div class="card-value" id="expOther">$0.00</div></div>
             </div>
+            <div class="section-title">ACCOUNT VALUE (last 7 days)</div>
+            <div id="historyChart" style="padding:10px 0;"></div>
             <div class="section-title">Active Positions <span id="positionCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="positions"></div>
             <div class="section-title" style="margin-top:20px">Recent Trades <span id="tradeCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="trades"></div>
         </div>
         <div id="txlog" class="tab-content hidden">
-            <div class="section-title">TODAY'S SETTLEMENTS</div>
+            <div class="section-title">SETTLEMENTS <span style="font-size:10px;opacity:0.6;">(from Kalshi)</span></div>
             <div class="grid">
-                <div class="card"><div class="card-label">Today's P&L</div><div class="card-value" id="todaySettlePnl">$0.00</div></div>
-                <div class="card"><div class="card-label">Today's Record</div><div class="card-value" id="todaySettleRecord">0W / 0L</div></div>
-                <div class="card"><div class="card-label">Settled Today</div><div class="card-value" id="todaySettleCount">0</div></div>
+                <div class="card"><div class="card-label">Total realized P&L</div><div class="card-value" id="totalSettlePnl">$0.00</div><div class="card-sub">all settled bets</div></div>
+                <div class="card"><div class="card-label">Record</div><div class="card-value" id="settleWinLoss">0W / 0L</div><div class="card-sub" id="settleWinRate">0% win rate</div></div>
+                <div class="card"><div class="card-label">Today</div><div class="card-value" id="todaySettlePnl">$0.00</div><div class="card-sub" id="todaySettleRecord">0 settled</div></div>
             </div>
-            <div class="section-title">ALL-TIME SETTLEMENT STATS</div>
-            <div class="grid">
-                <div class="card"><div class="card-label">Total Realized P&L</div><div class="card-value" id="totalSettlePnl">$0.00</div></div>
-                <div class="card"><div class="card-label">Win Rate</div><div class="card-value" id="settleWinRate">0%</div><div class="card-sub" id="settleWinLoss">0W / 0L</div></div>
-                <div class="card"><div class="card-label">Best Trade</div><div class="card-value green" id="bestSettleTrade">$0.00</div></div>
-                <div class="card"><div class="card-label">Worst Trade</div><div class="card-value red" id="worstSettleTrade">$0.00</div></div>
-                <div class="card"><div class="card-label">Avg Win</div><div class="card-value green" id="avgWin">$0.00</div></div>
-                <div class="card"><div class="card-label">Avg Loss</div><div class="card-value red" id="avgLoss">$0.00</div></div>
-            </div>
-            <div class="section-title">PERFORMANCE HISTORY <span style="font-size:10px;opacity:0.6;font-weight:normal;">(last 7 days)</span></div>
-            <div id="historyChart" style="padding:10px 0;"></div>
-            <div class="section-title">SETTLEMENT LOG <span id="settlementCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
+            <div class="section-title">EVERY SETTLED BET <span id="settlementCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="settlementList"></div>
         </div>
         <div id="activity" class="tab-content hidden">
@@ -3502,6 +3486,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 tab.classList.add('active');
                 document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
                 document.getElementById(tab.dataset.tab).classList.remove('hidden');
+                if (tab.dataset.tab === 'txlog') fetchSettlements();
             });
         });
         
@@ -3589,18 +3574,21 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('positionsValue').textContent = '$' + p.account.positions_value.toFixed(2);
                 document.getElementById('positionsSummary').textContent = p.positions.count + ' active bets';
                 
-                // Performance section
+                // Performance: negative = red, positive = green (everywhere)
                 const ret = p.performance.total_return;
+                const returnPctVal = p.performance.return_pct;
                 document.getElementById('totalReturn').textContent = (ret >= 0 ? '+' : '') + '$' + ret.toFixed(2);
                 document.getElementById('totalReturn').className = 'card-value ' + (ret >= 0 ? 'green' : 'red');
-                document.getElementById('returnPct').textContent = (p.performance.return_pct >= 0 ? '+' : '') + p.performance.return_pct.toFixed(1) + '% vs $' + p.account.total_deposits + ' deposited';
+                document.getElementById('returnPct').textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '% vs $' + p.account.total_deposits + ' deposited';
+                document.getElementById('returnPct').className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red');
                 
                 const unr = p.performance.unrealized_pnl;
                 document.getElementById('unrealizedPnl').textContent = (unr >= 0 ? '+' : '') + '$' + unr.toFixed(2);
                 document.getElementById('unrealizedPnl').className = 'card-value ' + (unr >= 0 ? 'green' : 'red');
                 document.getElementById('unrealizedDetail').textContent = p.positions.count + ' open positions';
                 
-                document.getElementById('positionStatus').textContent = p.positions.winning + 'W / ' + p.positions.losing + 'L';
+                document.getElementById('positionStatus').textContent = p.positions.winning + ' / ' + p.positions.losing;
+                document.getElementById('positionStatusSub').textContent = 'positions ahead / behind (by current price)';
                 
                 // Today's Activity
                 document.getElementById('todayBets').textContent = p.today.new_bets;
@@ -3612,6 +3600,24 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('expWeather').textContent = '$' + (p.exposure_by_category.Weather || 0).toFixed(2);
                 document.getElementById('expCrypto').textContent = '$' + (p.exposure_by_category.Crypto || 0).toFixed(2);
                 document.getElementById('expOther').textContent = '$' + (p.exposure_by_category.Other || 0).toFixed(2);
+                
+                // Change vs yesterday (explicit timeframe — not vague "recently")
+                const history = p.history || [];
+                const todayStr = new Date().toISOString().slice(0, 10);
+                const yesterdaySnapshot = history.find(h => h.date && h.date !== todayStr && h.account_value != null);
+                const changeEl = document.getElementById('changeSinceYesterday');
+                if (yesterdaySnapshot && yesterdaySnapshot.account_value != null) {
+                    const nowVal = p.account.total_value;
+                    const change = nowVal - yesterdaySnapshot.account_value;
+                    const pct = yesterdaySnapshot.account_value > 0 ? (change / yesterdaySnapshot.account_value * 100) : 0;
+                    const dayLabel = yesterdaySnapshot.date === todayStr ? '' : ' vs ' + yesterdaySnapshot.date;
+                    changeEl.textContent = (change >= 0 ? '+' : '') + '$' + change.toFixed(2) + ' (' + (change >= 0 ? '+' : '') + pct.toFixed(1) + '%)' + dayLabel;
+                    changeEl.className = 'card-sub ' + (change >= 0 ? 'green' : 'red');
+                    changeEl.style.display = '';
+                } else {
+                    changeEl.textContent = 'Compare to prior day once we have yesterday\'s snapshot';
+                    changeEl.style.display = '';
+                }
                 
                 // Render performance history chart
                 if (p.history) {
@@ -3714,35 +3720,34 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 const todayPnl = today.pnl || 0;
                 document.getElementById('todaySettlePnl').textContent = (todayPnl >= 0 ? '+' : '') + '$' + todayPnl.toFixed(2);
                 document.getElementById('todaySettlePnl').className = 'card-value ' + (todayPnl >= 0 ? 'green' : 'red');
-                document.getElementById('todaySettleRecord').textContent = (today.wins || 0) + 'W / ' + (today.losses || 0) + 'L';
+                document.getElementById('todaySettleRecord').textContent = (today.settlements || 0) + ' settled today';
                 document.getElementById('todaySettleCount').textContent = today.settlements || 0;
                 
                 // All-time stats
                 const totalPnl = summary.total_pnl || 0;
                 document.getElementById('totalSettlePnl').textContent = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2);
                 document.getElementById('totalSettlePnl').className = 'card-value ' + (totalPnl >= 0 ? 'green' : 'red');
-                document.getElementById('settleWinRate').textContent = (summary.win_rate || 0).toFixed(0) + '%';
+                document.getElementById('settleWinRate').textContent = (summary.win_rate || 0).toFixed(0) + '% win rate';
                 document.getElementById('settleWinLoss').textContent = (summary.wins || 0) + 'W / ' + (summary.losses || 0) + 'L';
-                document.getElementById('bestSettleTrade').textContent = '+$' + (summary.best_trade || 0).toFixed(2);
-                document.getElementById('worstSettleTrade').textContent = '$' + (summary.worst_trade || 0).toFixed(2);
-                document.getElementById('avgWin').textContent = '+$' + (summary.avg_win || 0).toFixed(2);
-                document.getElementById('avgLoss').textContent = '$' + (summary.avg_loss || 0).toFixed(2);
-                
                 // Settlement count
                 document.getElementById('settlementCount').textContent = settlements.length;
                 
-                // Render settlement list
+                // Render settlement list (flag any trade where cost exceeded stated deposits)
+                const totalDeposits = data.total_deposits || 150;
                 const html = settlements.map(s => {
                     const isWin = s.outcome === 'WIN';
                     const pnlClass = s.pnl > 0 ? 'green' : (s.pnl < 0 ? 'red' : '');
                     const pnlSign = s.pnl >= 0 ? '+' : '';
                     const outcomeIcon = isWin ? '✓' : '✗';
                     const outcomeClass = isWin ? 'green' : 'red';
+                    const costExceedsDeposits = s.cost > totalDeposits;
+                    const warningLine = costExceedsDeposits ? '<div style="font-size:10px;color:#f85149;margin-top:2px;">Cost $' + s.cost.toFixed(2) + ' &gt; $' + totalDeposits + ' deposited — verify on Kalshi</div>' : '';
                     return `
                         <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;border-bottom:1px solid #30363d;">
                             <div style="flex:1;min-width:0;">
                                 <div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${s.question}</div>
                                 <div style="font-size:11px;color:#8b949e;margin-top:2px;">${s.settlement_date} · Result: ${s.result}</div>
+                                ${warningLine}
                             </div>
                             <div style="text-align:center;padding:0 16px;min-width:70px;">
                                 <div style="font-size:13px;font-weight:600;color:#58a6ff;">${s.side}</div>
