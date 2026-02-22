@@ -3579,11 +3579,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     console.error('Performance API error:', p.error);
                     return;
                 }
+                if (!p.account || !p.performance) {
+                    console.error('Performance API: missing account or performance');
+                    return;
+                }
                 
                 // Account Value section
                 document.getElementById('accountValue').textContent = '$' + p.account.total_value.toFixed(2);
                 document.getElementById('accountValue').className = 'card-value';
-                document.getElementById('accountSource').textContent = 'from Kalshi API';
                 document.getElementById('cashAvailable').textContent = '$' + p.account.cash.toFixed(2);
                 document.getElementById('positionsValue').textContent = '$' + p.account.positions_value.toFixed(2);
                 document.getElementById('positionsSummary').textContent = p.positions.count + ' active bets';
@@ -3625,24 +3628,15 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('expCrypto').textContent = '$' + (p.exposure_by_category.Crypto || 0).toFixed(2);
                 document.getElementById('expOther').textContent = '$' + (p.exposure_by_category.Other || 0).toFixed(2);
                 
-                // Settlements tab: same truth (so it matches when user switches tab)
+                // Settlements tab: same truth (optional elements)
                 const tv = document.getElementById('truthValue');
                 const tp = document.getElementById('truthPnl');
                 const tpc = document.getElementById('truthPct');
                 const tt = document.getElementById('truthToday');
-                if (tv) { tv.textContent = '$' + p.account.total_value.toFixed(2); }
-                if (tp) {
-                    tp.textContent = (ret >= 0 ? '+' : '') + '$' + ret.toFixed(2);
-                    tp.className = 'card-value ' + (ret >= 0 ? 'green' : 'red');
-                }
-                if (tpc) {
-                    tpc.textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%';
-                    tpc.className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red');
-                }
-                if (tt && todayPn != null) {
-                    tt.textContent = (todayPn >= 0 ? '+' : '') + '$' + todayPn.toFixed(2);
-                    tt.className = 'card-value ' + (todayPn >= 0 ? 'green' : 'red');
-                } else if (tt) { tt.textContent = '—'; tt.className = 'card-value'; }
+                if (tv) tv.textContent = '$' + p.account.total_value.toFixed(2);
+                if (tp) { tp.textContent = (ret >= 0 ? '+' : '') + '$' + ret.toFixed(2); tp.className = 'card-value ' + (ret >= 0 ? 'green' : 'red'); }
+                if (tpc) { tpc.textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%'; tpc.className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red'); }
+                if (tt) { tt.textContent = (todayPn != null ? (todayPn >= 0 ? '+' : '') + '$' + todayPn.toFixed(2) : '—'); tt.className = 'card-value' + (todayPn != null ? ' ' + (todayPn >= 0 ? 'green' : 'red') : ''); }
                 
                 // Render performance history chart
                 if (p.history) {
