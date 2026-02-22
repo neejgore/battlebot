@@ -98,7 +98,7 @@ class KalshiBattleBot:
             max_position_size=self.max_position_size,  # $30 max
             max_percent_bankroll_per_market=0.25,  # 25% per market - fewer bets = bigger size
             max_total_open_risk=0.90,  # 90% max exposure - 10% reserve
-            max_positions=15,  # Max 15 positions - more opportunities
+            max_positions=20,  # Max 20 positions - deploy more capital
             profit_take_pct=999.0,  # DISABLED - let bets settle naturally
             stop_loss_pct=999.0,  # DISABLED - let bets settle naturally
             time_stop_hours=720,  # 30 days max - but prefer settlement
