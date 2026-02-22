@@ -1033,6 +1033,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/api/state', self._handle_state)
         self._app.router.add_get('/api/signals', self._handle_signals)
         self._app.router.add_get('/api/fills', self._handle_fills)
+        self._app.router.add_get('/api/performance', self._handle_performance)
         self._app.router.add_get('/api/debug-reconcile', self._handle_debug_reconcile)
         
         self._runner = web.AppRunner(self._app)
@@ -2832,6 +2833,146 @@ class KalshiBattleBot:
         except Exception as e:
             return web.json_response({'error': str(e)}, status=500)
     
+    async def _handle_performance(self, request):
+        """API endpoint for real performance data from Kalshi.
+        
+        This calculates performance directly from Kalshi API data,
+        not from internal trade tracking which can be buggy.
+        """
+        try:
+            # 1. Get actual account balance from Kalshi (ground truth)
+            balance_result = await self._kalshi.get_balance()
+            cash = balance_result.get('balance', 0) / 100.0  # cents to dollars
+            
+            # 2. Get positions value from Kalshi
+            positions_result = await self._kalshi.get_positions()
+            kalshi_positions = positions_result.get('market_positions', [])
+            
+            # Calculate position values
+            total_position_cost = 0
+            total_position_value = 0
+            positions_detail = []
+            
+            for pos in kalshi_positions:
+                contracts = pos.get('position', 0)
+                if contracts == 0:
+                    continue
+                    
+                ticker = pos.get('ticker', '')
+                side = 'yes' if contracts > 0 else 'no'
+                contracts = abs(contracts)
+                
+                # Get current market price
+                market_result = await self._kalshi.get_market(ticker)
+                market = market_result.get('market', {}) if market_result else {}
+                
+                yes_price = market.get('yes_bid', 50) / 100.0
+                no_price = market.get('no_bid', 50) / 100.0
+                current_price = yes_price if side == 'yes' else no_price
+                
+                # Get entry price from our fills
+                entry_price = 0.50  # default
+                for p in self._positions.values():
+                    if p.get('market_id') == ticker:
+                        entry_price = p.get('entry_price', 0.50)
+                        break
+                
+                cost = contracts * entry_price
+                value = contracts * current_price
+                unrealized = value - cost if side == 'yes' else cost - value
+                
+                total_position_cost += cost
+                total_position_value += value
+                
+                positions_detail.append({
+                    'ticker': ticker,
+                    'question': market.get('title', ticker)[:50],
+                    'side': side.upper(),
+                    'contracts': contracts,
+                    'entry_price': entry_price,
+                    'current_price': current_price,
+                    'cost': cost,
+                    'unrealized_pnl': unrealized,
+                })
+            
+            # 3. Calculate account metrics
+            total_deposits = float(os.getenv('TOTAL_DEPOSITS', '150'))  # User's total deposits
+            account_value = cash + total_position_value
+            total_return = account_value - total_deposits
+            return_pct = (total_return / total_deposits * 100) if total_deposits > 0 else 0
+            
+            # 4. Calculate unrealized P&L
+            unrealized_pnl = sum(p['unrealized_pnl'] for p in positions_detail)
+            
+            # 5. Count winning vs losing positions
+            winning_positions = len([p for p in positions_detail if p['unrealized_pnl'] > 0])
+            losing_positions = len([p for p in positions_detail if p['unrealized_pnl'] < 0])
+            
+            # 6. Get today's activity
+            today_str = datetime.utcnow().strftime('%Y-%m-%d')
+            today_entries = [t for t in self._trades 
+                           if t.get('action') == 'ENTRY' and 
+                           t.get('timestamp', '').startswith(today_str)]
+            
+            # 7. Calculate exposure breakdown
+            exposure_by_category = {}
+            for p in positions_detail:
+                ticker = p['ticker']
+                cost = p['cost']
+                
+                # Categorize by ticker prefix
+                if 'SNOW' in ticker or 'RAIN' in ticker:
+                    cat = 'Weather'
+                elif 'BTC' in ticker or 'ETH' in ticker or 'SOL' in ticker:
+                    cat = 'Crypto'
+                elif 'NBA' in ticker or 'NFL' in ticker or 'MLB' in ticker:
+                    cat = 'Sports'
+                else:
+                    cat = 'Other'
+                
+                exposure_by_category[cat] = exposure_by_category.get(cat, 0) + cost
+            
+            return web.json_response({
+                # Account Overview (from Kalshi API)
+                'account': {
+                    'cash': round(cash, 2),
+                    'positions_value': round(total_position_value, 2),
+                    'total_value': round(account_value, 2),
+                    'total_deposits': total_deposits,
+                },
+                # Performance
+                'performance': {
+                    'total_return': round(total_return, 2),
+                    'return_pct': round(return_pct, 1),
+                    'unrealized_pnl': round(unrealized_pnl, 2),
+                },
+                # Positions Summary
+                'positions': {
+                    'count': len(positions_detail),
+                    'winning': winning_positions,
+                    'losing': losing_positions,
+                    'total_cost': round(total_position_cost, 2),
+                    'details': positions_detail[:10],  # Top 10
+                },
+                # Today's Activity
+                'today': {
+                    'new_bets': len(today_entries),
+                    'total_deployed': sum(t.get('size', 0) for t in today_entries),
+                },
+                # Exposure by Category
+                'exposure_by_category': {k: round(v, 2) for k, v in exposure_by_category.items()},
+                # Data source confirmation
+                'data_source': 'kalshi_api',
+                'timestamp': datetime.utcnow().isoformat(),
+            })
+            
+        except Exception as e:
+            import traceback
+            return web.json_response({
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            }, status=500)
+    
     async def _handle_debug_reconcile(self, request):
         """Debug endpoint to trace reconciliation logic."""
         debug_output = []
@@ -3033,19 +3174,29 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Short (1-7d)</div><div class="card-value" id="atRiskShort">$0.00</div><div class="card-sub">resolves in days</div></div>
                 <div class="card"><div class="card-label">Medium (8+d)</div><div class="card-value" id="atRiskMedium">$0.00</div><div class="card-sub">resolves in weeks+</div></div>
             </div>
-            <div class="section-title">TODAY'S PERFORMANCE</div>
+            <div class="section-title">ACCOUNT VALUE <span style="font-size:10px;opacity:0.6;font-weight:normal;">(from Kalshi API)</span></div>
             <div class="grid">
-                <div class="card"><div class="card-label">Today's P&L</div><div class="card-value" id="todayPnl">$0.00</div></div>
-                <div class="card"><div class="card-label">Today's Record</div><div class="card-value" id="todayRecord">0W / 0L</div><div class="card-sub" id="todayTrades">0 trades</div></div>
-                <div class="card"><div class="card-label">Unrealized P&L</div><div class="card-value" id="unrealizedPnl">$0.00</div></div>
+                <div class="card"><div class="card-label">Total Value</div><div class="card-value" id="accountValue">$0.00</div><div class="card-sub" id="accountSource">syncing...</div></div>
+                <div class="card"><div class="card-label">Cash Available</div><div class="card-value" id="cashAvailable">$0.00</div></div>
+                <div class="card"><div class="card-label">In Positions</div><div class="card-value" id="positionsValue">$0.00</div><div class="card-sub" id="positionsSummary">0 bets</div></div>
             </div>
-            <div class="section-title">OVERALL PERFORMANCE</div>
+            <div class="section-title">PERFORMANCE <span style="font-size:10px;opacity:0.6;font-weight:normal;">(vs deposits)</span></div>
             <div class="grid">
-                <div class="card"><div class="card-label">Total Realized P&L</div><div class="card-value" id="realizedPnl">$0.00</div></div>
-                <div class="card"><div class="card-label">Win Rate</div><div class="card-value" id="winRate">0%</div><div class="card-sub" id="winLoss">0W / 0L</div></div>
-                <div class="card"><div class="card-label">Best Trade</div><div class="card-value green" id="bestTrade">$0.00</div></div>
-                <div class="card"><div class="card-label">Worst Trade</div><div class="card-value red" id="worstTrade">$0.00</div></div>
-                <div class="card"><div class="card-label">Total Trades</div><div class="card-value" id="totalTrades">0</div><div class="card-sub" id="tradeBreakdown">0 entries / 0 exits</div></div>
+                <div class="card"><div class="card-label">Total Return</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
+                <div class="card"><div class="card-label">Unrealized P&L</div><div class="card-value" id="unrealizedPnl">$0.00</div><div class="card-sub" id="unrealizedDetail">open positions</div></div>
+                <div class="card"><div class="card-label">Position Status</div><div class="card-value" id="positionStatus">0W / 0L</div><div class="card-sub">winning vs losing</div></div>
+            </div>
+            <div class="section-title">TODAY'S ACTIVITY</div>
+            <div class="grid">
+                <div class="card"><div class="card-label">New Bets</div><div class="card-value" id="todayBets">0</div><div class="card-sub" id="todayDeployed">$0 deployed</div></div>
+                <div class="card"><div class="card-label">Open Positions</div><div class="card-value" id="openPositions">0</div><div class="card-sub" id="positionLimit">of 25 max</div></div>
+                <div class="card"><div class="card-label">Bot Status</div><div class="card-value" id="botStatus">Active</div><div class="card-sub" id="botRuntime">0h 0m</div></div>
+            </div>
+            <div class="section-title">EXPOSURE BY CATEGORY</div>
+            <div class="grid" id="exposureGrid">
+                <div class="card"><div class="card-label">Weather</div><div class="card-value" id="expWeather">$0.00</div></div>
+                <div class="card"><div class="card-label">Crypto</div><div class="card-value" id="expCrypto">$0.00</div></div>
+                <div class="card"><div class="card-label">Other</div><div class="card-value" id="expOther">$0.00</div></div>
             </div>
             <div class="section-title">Active Positions <span id="positionCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="positions"></div>
@@ -3102,41 +3253,27 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 }
                 if (data.analyses) renderAnalyses(data.analyses);
                 if (data.monitored) renderMarkets(data.monitored);
+                
+                // Fetch real performance from Kalshi API
+                fetchPerformance();
             };
         }
         
         function updateStats(s) {
+            // Legacy stats (At Risk section)
             document.getElementById('available').textContent = '$' + s.available.toFixed(2);
             document.getElementById('atRisk').textContent = '$' + s.at_risk.toFixed(2);
             document.getElementById('posCount').textContent = s.open_positions + ' positions + ' + (s.pending_orders || 0) + ' resting';
-            // At Risk Breakdown
             document.getElementById('positionsAtRisk').textContent = '$' + (s.positions_at_risk || 0).toFixed(2);
             document.getElementById('filledCount').textContent = s.open_positions + ' filled';
             document.getElementById('pendingAtRisk').textContent = '$' + (s.pending_at_risk || 0).toFixed(2);
             document.getElementById('restingCount').textContent = (s.pending_orders || 0) + ' resting';
-            // Time Horizon
             document.getElementById('atRiskUltra').textContent = '$' + (s.at_risk_ultra_short || 0).toFixed(2);
             document.getElementById('atRiskShort').textContent = '$' + (s.at_risk_short || 0).toFixed(2);
             document.getElementById('atRiskMedium').textContent = '$' + (s.at_risk_medium || 0).toFixed(2);
             document.getElementById('totalValue').textContent = '$' + s.total_value.toFixed(2);
-            document.getElementById('returnPct').textContent = (s.return_pct >= 0 ? '+' : '') + s.return_pct.toFixed(2) + '%';
-            document.getElementById('returnPct').className = 'card-value ' + (s.return_pct >= 0 ? 'green' : 'red');
-            // Today's Performance
-            document.getElementById('todayPnl').textContent = (s.today_pnl >= 0 ? '+' : '') + '$' + (s.today_pnl || 0).toFixed(2);
-            document.getElementById('todayPnl').className = 'card-value ' + (s.today_pnl >= 0 ? 'green' : 'red');
-            document.getElementById('todayRecord').textContent = (s.today_wins || 0) + 'W / ' + (s.today_losses || 0) + 'L';
-            document.getElementById('todayTrades').textContent = (s.today_trades || 0) + ' settled today';
-            document.getElementById('unrealizedPnl').textContent = (s.unrealized_pnl >= 0 ? '+' : '') + '$' + s.unrealized_pnl.toFixed(2);
-            document.getElementById('unrealizedPnl').className = 'card-value ' + (s.unrealized_pnl >= 0 ? 'green' : 'red');
-            // Overall Performance
-            document.getElementById('realizedPnl').textContent = (s.realized_pnl >= 0 ? '+' : '') + '$' + s.realized_pnl.toFixed(2);
-            document.getElementById('realizedPnl').className = 'card-value ' + (s.realized_pnl >= 0 ? 'green' : 'red');
-            document.getElementById('winRate').textContent = (s.win_rate * 100).toFixed(0) + '%';
-            document.getElementById('winLoss').textContent = s.winning_trades + 'W / ' + s.losing_trades + 'L';
-            document.getElementById('bestTrade').textContent = '+$' + s.best_trade.toFixed(2);
-            document.getElementById('worstTrade').textContent = '$' + s.worst_trade.toFixed(2);
-            document.getElementById('totalTrades').textContent = s.total_entries + s.total_exits;
-            document.getElementById('tradeBreakdown').textContent = s.total_entries + ' entries / ' + s.total_exits + ' exits';
+            
+            // Header badges
             document.getElementById('runtime').textContent = s.runtime;
             document.getElementById('modeBadge').textContent = s.dry_run ? 'DRY RUN' : 'LIVE';
             document.getElementById('modeBadge').className = 'badge ' + (s.dry_run ? 'dry' : 'live');
@@ -3152,6 +3289,58 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             } else {
                 aiBadge.textContent = 'AI: OFF';
                 aiBadge.style.background = '#f85149';
+            }
+            
+            // Bot Status in Today's Activity
+            document.getElementById('botStatus').textContent = s.trading_allowed ? 'Active' : 'Paused';
+            document.getElementById('botStatus').className = 'card-value ' + (s.trading_allowed ? 'green' : 'red');
+            document.getElementById('botRuntime').textContent = s.runtime;
+        }
+        
+        // Fetch real performance data from Kalshi API
+        async function fetchPerformance() {
+            try {
+                const res = await fetch('/api/performance');
+                const p = await res.json();
+                if (p.error) {
+                    console.error('Performance API error:', p.error);
+                    return;
+                }
+                
+                // Account Value section
+                document.getElementById('accountValue').textContent = '$' + p.account.total_value.toFixed(2);
+                document.getElementById('accountValue').className = 'card-value';
+                document.getElementById('accountSource').textContent = 'from Kalshi API';
+                document.getElementById('cashAvailable').textContent = '$' + p.account.cash.toFixed(2);
+                document.getElementById('positionsValue').textContent = '$' + p.account.positions_value.toFixed(2);
+                document.getElementById('positionsSummary').textContent = p.positions.count + ' active bets';
+                
+                // Performance section
+                const ret = p.performance.total_return;
+                document.getElementById('totalReturn').textContent = (ret >= 0 ? '+' : '') + '$' + ret.toFixed(2);
+                document.getElementById('totalReturn').className = 'card-value ' + (ret >= 0 ? 'green' : 'red');
+                document.getElementById('returnPct').textContent = (p.performance.return_pct >= 0 ? '+' : '') + p.performance.return_pct.toFixed(1) + '% vs $' + p.account.total_deposits + ' deposited';
+                
+                const unr = p.performance.unrealized_pnl;
+                document.getElementById('unrealizedPnl').textContent = (unr >= 0 ? '+' : '') + '$' + unr.toFixed(2);
+                document.getElementById('unrealizedPnl').className = 'card-value ' + (unr >= 0 ? 'green' : 'red');
+                document.getElementById('unrealizedDetail').textContent = p.positions.count + ' open positions';
+                
+                document.getElementById('positionStatus').textContent = p.positions.winning + 'W / ' + p.positions.losing + 'L';
+                
+                // Today's Activity
+                document.getElementById('todayBets').textContent = p.today.new_bets;
+                document.getElementById('todayDeployed').textContent = '$' + (p.today.total_deployed || 0).toFixed(2) + ' deployed';
+                document.getElementById('openPositions').textContent = p.positions.count;
+                document.getElementById('positionLimit').textContent = 'of 25 max';
+                
+                // Exposure by Category
+                document.getElementById('expWeather').textContent = '$' + (p.exposure_by_category.Weather || 0).toFixed(2);
+                document.getElementById('expCrypto').textContent = '$' + (p.exposure_by_category.Crypto || 0).toFixed(2);
+                document.getElementById('expOther').textContent = '$' + (p.exposure_by_category.Other || 0).toFixed(2);
+                
+            } catch (e) {
+                console.error('Failed to fetch performance:', e);
             }
         }
         
@@ -3260,6 +3449,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         
         connect();
+        
+        // Initial performance fetch and regular updates
+        fetchPerformance();
+        setInterval(fetchPerformance, 15000); // Update every 15 seconds
     </script>
 </body>
 </html>
