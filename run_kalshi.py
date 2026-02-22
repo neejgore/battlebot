@@ -457,8 +457,10 @@ class KalshiBattleBot:
                     }
                     self._trades.insert(0, trade)
                     
-                    # Record in risk engine
-                    await self._risk_engine.record_trade_result(pnl)
+                    # DON'T record historical settlements in risk engine's daily stats
+                    # These losses already happened - they shouldn't trigger today's kill switch
+                    # The P&L is already reflected in Kalshi account balance
+                    # await self._risk_engine.record_trade_result(pnl)  # DISABLED
                     
                     reconciled += 1
                     await asyncio.sleep(0.2)  # Rate limit API calls
