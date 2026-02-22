@@ -148,15 +148,14 @@ class KalshiBattleBot:
                     self._signal_log = state.get('signal_log', [])
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals")
                     
-                    # Clear buggy reconciled trades if enabled
+                    # Clear ALL reconciled trades - they have corrupted P&L data
                     if clear_buggy:
                         before = len(self._trades)
-                        # Remove trades with reconciled=True OR entry_price=0 (buggy)
-                        self._trades = [t for t in self._trades 
-                                       if not t.get('reconciled') and t.get('entry_price', 0.5) > 0.01]
+                        # Remove ALL reconciled trades (they have wrong P&L calculations)
+                        self._trades = [t for t in self._trades if not t.get('reconciled')]
                         removed = before - len(self._trades)
                         if removed > 0:
-                            print(f"[State] Removed {removed} buggy reconciled trades")
+                            print(f"[State] Removed {removed} buggy reconciled trades with corrupted P&L")
                             self._save_state()
                             
             elif os.path.exists(self._state_file + '.backup'):
@@ -1094,9 +1093,10 @@ class KalshiBattleBot:
         if not self.dry_run:
             await self._sync_positions_with_kalshi()
         
-        # CRITICAL: Reconcile missed settlements from fills (Railway state loss protection)
-        if not self.dry_run:
-            await self._reconcile_settlements_from_fills()
+        # DISABLED: Reconciliation was creating buggy P&L data that corrupted dashboard
+        # The bot will track trades going forward; historical trades are in Kalshi account
+        # if not self.dry_run:
+        #     await self._reconcile_settlements_from_fills()
         
         # Start background tasks
         asyncio.create_task(self._market_loop())
