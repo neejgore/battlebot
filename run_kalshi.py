@@ -111,12 +111,6 @@ class KalshiBattleBot:
             limits=self._risk_limits,
         )
         
-        # RESET kill switch on startup - previous P&L bug caused false trigger
-        # The kill switch resets daily anyway, and we've fixed the P&L calculation
-        if os.getenv('RESET_KILL_SWITCH', 'true').lower() == 'true':
-            self._risk_engine.daily_stats.kill_switch_triggered = False
-            print("[Startup] Kill switch reset - trading enabled")
-        
         # Market Intelligence Service (news, domain data, inefficiency detection)
         self._intelligence = get_intelligence_service()
         self._use_intelligence = os.getenv('USE_INTELLIGENCE', 'true').lower() == 'true'
@@ -136,6 +130,13 @@ class KalshiBattleBot:
             self._trades = []
             self._save_state()
             return
+        
+        # TEMPORARY: Clear buggy reconciled trades that had wrong P&L (entry_price=0)
+        # This fixes the kill switch being triggered by false losses
+        # Remove this after Feb 23, 2026
+        clear_buggy = os.getenv('CLEAR_BUGGY_TRADES', 'true').lower() == 'true'
+        if clear_buggy:
+            print("[State] Clearing buggy reconciled trades with wrong P&L...")
             
         try:
             if os.path.exists(self._state_file):
@@ -146,6 +147,18 @@ class KalshiBattleBot:
                     self._trades = state.get('trades', [])
                     self._signal_log = state.get('signal_log', [])
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals")
+                    
+                    # Clear buggy reconciled trades if enabled
+                    if clear_buggy:
+                        before = len(self._trades)
+                        # Remove trades with reconciled=True OR entry_price=0 (buggy)
+                        self._trades = [t for t in self._trades 
+                                       if not t.get('reconciled') and t.get('entry_price', 0.5) > 0.01]
+                        removed = before - len(self._trades)
+                        if removed > 0:
+                            print(f"[State] Removed {removed} buggy reconciled trades")
+                            self._save_state()
+                            
             elif os.path.exists(self._state_file + '.backup'):
                 print(f"[State] Main file missing, loading from backup...")
                 with open(self._state_file + '.backup', 'r') as f:
