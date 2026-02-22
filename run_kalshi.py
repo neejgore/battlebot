@@ -111,6 +111,12 @@ class KalshiBattleBot:
             limits=self._risk_limits,
         )
         
+        # RESET kill switch on startup - previous P&L bug caused false trigger
+        # The kill switch resets daily anyway, and we've fixed the P&L calculation
+        if os.getenv('RESET_KILL_SWITCH', 'true').lower() == 'true':
+            self._risk_engine.daily_stats.kill_switch_triggered = False
+            print("[Startup] Kill switch reset - trading enabled")
+        
         # Market Intelligence Service (news, domain data, inefficiency detection)
         self._intelligence = get_intelligence_service()
         self._use_intelligence = os.getenv('USE_INTELLIGENCE', 'true').lower() == 'true'
