@@ -8,7 +8,7 @@ Uses same AI strategy as Polymarket version.
 import asyncio
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from aiohttp import web
 import httpx
 from dotenv import load_dotenv
@@ -182,11 +182,15 @@ class KalshiBattleBot:
         try:
             os.makedirs(os.path.dirname(self._state_file) or '.', exist_ok=True)
             
+            # Get daily snapshots if available
+            daily_snapshots = getattr(self, '_daily_snapshots', {})
+            
             state_data = {
                 'positions': self._positions,
                 'pending_orders': self._pending_orders,
                 'trades': self._trades[-100:],
                 'signal_log': self._signal_log[-500:],  # Keep last 500 signals for backtesting
+                'daily_snapshots': daily_snapshots,  # Performance history
                 'saved_at': datetime.utcnow().isoformat(),
             }
             
@@ -1034,6 +1038,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/api/signals', self._handle_signals)
         self._app.router.add_get('/api/fills', self._handle_fills)
         self._app.router.add_get('/api/performance', self._handle_performance)
+        self._app.router.add_get('/api/settlements', self._handle_settlements)
         self._app.router.add_get('/api/debug-reconcile', self._handle_debug_reconcile)
         
         self._runner = web.AppRunner(self._app)
@@ -2932,6 +2937,12 @@ class KalshiBattleBot:
                 
                 exposure_by_category[cat] = exposure_by_category.get(cat, 0) + cost
             
+            # 8. Save daily snapshot for history tracking
+            await self._save_daily_snapshot(account_value, cash, total_position_value)
+            
+            # 9. Get performance history (last 7 days)
+            history = self._get_performance_history()
+            
             return web.json_response({
                 # Account Overview (from Kalshi API)
                 'account': {
@@ -2961,8 +2972,257 @@ class KalshiBattleBot:
                 },
                 # Exposure by Category
                 'exposure_by_category': {k: round(v, 2) for k, v in exposure_by_category.items()},
+                # Performance History (last 7 days)
+                'history': history,
                 # Data source confirmation
                 'data_source': 'kalshi_api',
+                'timestamp': datetime.utcnow().isoformat(),
+            })
+            
+        except Exception as e:
+            import traceback
+            return web.json_response({
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            }, status=500)
+    
+    async def _save_daily_snapshot(self, account_value: float, cash: float, positions_value: float):
+        """Save daily account snapshot for performance history tracking."""
+        today_str = datetime.utcnow().strftime('%Y-%m-%d')
+        
+        # Initialize history dict if needed
+        if not hasattr(self, '_daily_snapshots'):
+            self._daily_snapshots = {}
+            # Try to load from state file
+            try:
+                if os.path.exists(self._state_file):
+                    with open(self._state_file, 'r') as f:
+                        state = json.load(f)
+                        self._daily_snapshots = state.get('daily_snapshots', {})
+            except:
+                pass
+        
+        # Only save once per hour to avoid spam
+        last_save_key = f'_last_snapshot_save_{today_str}'
+        if hasattr(self, last_save_key):
+            return
+        setattr(self, last_save_key, True)
+        
+        # Save today's snapshot (overwrites previous same-day snapshots)
+        self._daily_snapshots[today_str] = {
+            'account_value': round(account_value, 2),
+            'cash': round(cash, 2),
+            'positions_value': round(positions_value, 2),
+            'timestamp': datetime.utcnow().isoformat(),
+        }
+        
+        # Keep only last 30 days
+        sorted_dates = sorted(self._daily_snapshots.keys(), reverse=True)
+        if len(sorted_dates) > 30:
+            for old_date in sorted_dates[30:]:
+                del self._daily_snapshots[old_date]
+        
+        # Save to state file
+        self._save_state()
+    
+    def _get_performance_history(self) -> list:
+        """Get performance history for the last 7 days."""
+        if not hasattr(self, '_daily_snapshots'):
+            self._daily_snapshots = {}
+        
+        history = []
+        today = datetime.utcnow().date()
+        
+        for i in range(7):
+            date = today - timedelta(days=i)
+            date_str = date.strftime('%Y-%m-%d')
+            
+            if date_str in self._daily_snapshots:
+                snapshot = self._daily_snapshots[date_str]
+                history.append({
+                    'date': date_str,
+                    'account_value': snapshot.get('account_value', 0),
+                    'cash': snapshot.get('cash', 0),
+                    'positions_value': snapshot.get('positions_value', 0),
+                })
+            else:
+                history.append({
+                    'date': date_str,
+                    'account_value': None,
+                    'cash': None,
+                    'positions_value': None,
+                })
+        
+        return history
+    
+    async def _handle_settlements(self, request):
+        """API endpoint for accurate settlement log from Kalshi fills.
+        
+        This calculates P&L for each settled bet directly from Kalshi data:
+        - Gets all fills (buy/sell history)
+        - Groups by ticker
+        - For settled markets, calculates exact P&L based on result
+        
+        P&L Calculation:
+        - WIN (our side == result): P&L = contracts * (1.0 - avg_entry_price)
+        - LOSS (our side != result): P&L = contracts * (-avg_entry_price)
+        """
+        try:
+            # Get all fills from Kalshi (our trade history)
+            result = await self._kalshi.get_fills(limit=500)
+            fills = result.get('fills', [])
+            
+            if not fills:
+                return web.json_response({
+                    'settlements': [],
+                    'summary': {'total': 0, 'wins': 0, 'losses': 0, 'total_pnl': 0},
+                    'today': {'wins': 0, 'losses': 0, 'pnl': 0},
+                })
+            
+            # Group fills by ticker
+            fills_by_ticker = {}
+            for fill in fills:
+                ticker = fill.get('ticker', '')
+                if not ticker:
+                    continue
+                if ticker not in fills_by_ticker:
+                    fills_by_ticker[ticker] = []
+                fills_by_ticker[ticker].append(fill)
+            
+            settlements = []
+            today_str = datetime.utcnow().strftime('%Y-%m-%d')
+            
+            # Process each ticker
+            for ticker, ticker_fills in fills_by_ticker.items():
+                # Calculate net position and average entry price
+                total_bought = 0
+                total_cost = 0.0
+                total_sold = 0
+                side = None
+                earliest_fill_time = None
+                
+                for fill in ticker_fills:
+                    action = fill.get('action', '')
+                    count = fill.get('count', 0)
+                    # IMPORTANT: Kalshi 'price' in fills is in DOLLARS (e.g., 0.25 = 25¢)
+                    price = fill.get('price', 0.50)
+                    fill_side = fill.get('side', '')
+                    fill_time = fill.get('created_time', '')
+                    
+                    if action == 'buy':
+                        total_bought += count
+                        total_cost += price * count
+                        side = fill_side
+                        if not earliest_fill_time or fill_time < earliest_fill_time:
+                            earliest_fill_time = fill_time
+                    elif action == 'sell':
+                        total_sold += count
+                
+                # Net contracts (buys - sells)
+                net_contracts = total_bought - total_sold
+                
+                # Skip if no net position (fully closed via sells)
+                if net_contracts <= 0:
+                    continue
+                
+                # Calculate average entry price
+                avg_entry_price = total_cost / total_bought if total_bought > 0 else 0.50
+                
+                # Check market status
+                try:
+                    market_result = await self._kalshi.get_market(ticker)
+                    market = market_result.get('market', {}) if market_result else {}
+                    status = market.get('status', '')
+                    result = market.get('result', '')
+                    title = market.get('title', ticker)
+                    close_time = market.get('close_time', '')
+                    
+                    # Only process settled markets
+                    if status not in ('settled', 'finalized') or not result:
+                        continue
+                    
+                    # Calculate P&L
+                    # Our side is what we bought (stored in 'side' variable)
+                    our_side = (side or '').lower()
+                    market_result_lower = result.lower()
+                    
+                    if our_side == market_result_lower:
+                        # WIN: We get $1 per contract
+                        pnl = net_contracts * (1.0 - avg_entry_price)
+                        outcome = 'WIN'
+                    else:
+                        # LOSS: We get $0 per contract
+                        pnl = net_contracts * (-avg_entry_price)
+                        outcome = 'LOSS'
+                    
+                    # Determine settlement date (use close_time if available)
+                    settlement_date = close_time[:10] if close_time else today_str
+                    
+                    settlements.append({
+                        'ticker': ticker,
+                        'question': title,
+                        'side': our_side.upper(),
+                        'contracts': net_contracts,
+                        'entry_price': round(avg_entry_price, 4),
+                        'entry_price_cents': int(avg_entry_price * 100),
+                        'cost': round(net_contracts * avg_entry_price, 2),
+                        'result': market_result_lower.upper(),
+                        'outcome': outcome,
+                        'pnl': round(pnl, 2),
+                        'settlement_date': settlement_date,
+                        'fill_time': earliest_fill_time,
+                    })
+                    
+                except Exception as e:
+                    print(f"[Settlements] Error checking market {ticker}: {e}")
+                    continue
+                
+                # Rate limit API calls
+                await asyncio.sleep(0.1)
+            
+            # Sort by settlement date (newest first)
+            settlements.sort(key=lambda x: x.get('settlement_date', ''), reverse=True)
+            
+            # Calculate summary stats
+            wins = [s for s in settlements if s['outcome'] == 'WIN']
+            losses = [s for s in settlements if s['outcome'] == 'LOSS']
+            total_pnl = sum(s['pnl'] for s in settlements)
+            
+            # Today's stats
+            today_settlements = [s for s in settlements if s.get('settlement_date', '').startswith(today_str)]
+            today_wins = len([s for s in today_settlements if s['outcome'] == 'WIN'])
+            today_losses = len([s for s in today_settlements if s['outcome'] == 'LOSS'])
+            today_pnl = sum(s['pnl'] for s in today_settlements)
+            
+            # Calculate win rate
+            total_settled = len(wins) + len(losses)
+            win_rate = (len(wins) / total_settled * 100) if total_settled > 0 else 0
+            
+            # Best and worst trades
+            pnls = [s['pnl'] for s in settlements]
+            best_pnl = max(pnls) if pnls else 0
+            worst_pnl = min(pnls) if pnls else 0
+            
+            return web.json_response({
+                'settlements': settlements,
+                'summary': {
+                    'total': len(settlements),
+                    'wins': len(wins),
+                    'losses': len(losses),
+                    'win_rate': round(win_rate, 1),
+                    'total_pnl': round(total_pnl, 2),
+                    'best_trade': round(best_pnl, 2),
+                    'worst_trade': round(worst_pnl, 2),
+                    'avg_win': round(sum(s['pnl'] for s in wins) / len(wins), 2) if wins else 0,
+                    'avg_loss': round(sum(s['pnl'] for s in losses) / len(losses), 2) if losses else 0,
+                },
+                'today': {
+                    'settlements': len(today_settlements),
+                    'wins': today_wins,
+                    'losses': today_losses,
+                    'pnl': round(today_pnl, 2),
+                },
+                'data_source': 'kalshi_fills_api',
                 'timestamp': datetime.utcnow().isoformat(),
             })
             
@@ -3150,7 +3410,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     </div>
     <div class="tabs">
         <div class="tab active" data-tab="portfolio">Portfolio</div>
-        <div class="tab" data-tab="txlog">Transaction Log</div>
+        <div class="tab" data-tab="txlog">Settlements</div>
         <div class="tab" data-tab="activity">Activity</div>
         <div class="tab" data-tab="markets">Markets</div>
     </div>
@@ -3204,8 +3464,25 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div id="trades"></div>
         </div>
         <div id="txlog" class="tab-content hidden">
-            <div class="section-title">Settled Bets <span id="txlogCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
-            <div id="txlogList"></div>
+            <div class="section-title">TODAY'S SETTLEMENTS</div>
+            <div class="grid">
+                <div class="card"><div class="card-label">Today's P&L</div><div class="card-value" id="todaySettlePnl">$0.00</div></div>
+                <div class="card"><div class="card-label">Today's Record</div><div class="card-value" id="todaySettleRecord">0W / 0L</div></div>
+                <div class="card"><div class="card-label">Settled Today</div><div class="card-value" id="todaySettleCount">0</div></div>
+            </div>
+            <div class="section-title">ALL-TIME SETTLEMENT STATS</div>
+            <div class="grid">
+                <div class="card"><div class="card-label">Total Realized P&L</div><div class="card-value" id="totalSettlePnl">$0.00</div></div>
+                <div class="card"><div class="card-label">Win Rate</div><div class="card-value" id="settleWinRate">0%</div><div class="card-sub" id="settleWinLoss">0W / 0L</div></div>
+                <div class="card"><div class="card-label">Best Trade</div><div class="card-value green" id="bestSettleTrade">$0.00</div></div>
+                <div class="card"><div class="card-label">Worst Trade</div><div class="card-value red" id="worstSettleTrade">$0.00</div></div>
+                <div class="card"><div class="card-label">Avg Win</div><div class="card-value green" id="avgWin">$0.00</div></div>
+                <div class="card"><div class="card-label">Avg Loss</div><div class="card-value red" id="avgLoss">$0.00</div></div>
+            </div>
+            <div class="section-title">PERFORMANCE HISTORY <span style="font-size:10px;opacity:0.6;font-weight:normal;">(last 7 days)</span></div>
+            <div id="historyChart" style="padding:10px 0;"></div>
+            <div class="section-title">SETTLEMENT LOG <span id="settlementCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
+            <div id="settlementList"></div>
         </div>
         <div id="activity" class="tab-content hidden">
             <div class="section-title">AI Analyses</div>
@@ -3247,14 +3524,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 const data = JSON.parse(e.data);
                 if (data.stats) updateStats(data.stats);
                 if (data.positions) renderPositions(data.positions);
-                if (data.trades) {
-                    renderTrades(data.trades);
-                    renderTransactionLog(data.trades);
-                }
+                if (data.trades) renderTrades(data.trades);
                 if (data.analyses) renderAnalyses(data.analyses);
                 if (data.monitored) renderMarkets(data.monitored);
                 
-                // Fetch real performance from Kalshi API
+                // Fetch real performance and settlements from Kalshi API
                 fetchPerformance();
             };
         }
@@ -3339,6 +3613,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('expCrypto').textContent = '$' + (p.exposure_by_category.Crypto || 0).toFixed(2);
                 document.getElementById('expOther').textContent = '$' + (p.exposure_by_category.Other || 0).toFixed(2);
                 
+                // Render performance history chart
+                if (p.history) {
+                    renderHistoryChart(p.history);
+                }
+                
             } catch (e) {
                 console.error('Failed to fetch performance:', e);
             }
@@ -3417,42 +3696,121 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             document.getElementById('marketList').innerHTML = html || '<div style="color:#8b949e;font-size:13px;padding:12px;">No markets monitored</div>';
         }
         
-        function renderTransactionLog(trades) {
-            const exits = trades.filter(t => t.action === 'EXIT').sort((a, b) => 
-                new Date(b.timestamp) - new Date(a.timestamp)
-            );
-            document.getElementById('txlogCount').textContent = exits.length;
-            const html = exits.map(t => {
-                const isWin = t.pnl > 0;
-                const pnlClass = t.pnl > 0 ? 'green' : (t.pnl < 0 ? 'red' : '');
-                const pnlSign = t.pnl >= 0 ? '+' : '';
-                const date = new Date(t.timestamp);
-                const dateStr = date.toLocaleDateString('en-US', {month:'short', day:'numeric'}) + ' ' + date.toLocaleTimeString('en-US', {hour:'2-digit', minute:'2-digit'});
-                return `
-                    <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;border-bottom:1px solid #30363d;">
-                        <div style="flex:1;min-width:0;">
-                            <div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${t.question}</div>
-                            <div style="font-size:11px;color:#8b949e;margin-top:2px;">${dateStr} · ${t.reason || 'SETTLED'}</div>
+        // Fetch and render settlements from Kalshi API
+        async function fetchSettlements() {
+            try {
+                const res = await fetch('/api/settlements');
+                const data = await res.json();
+                if (data.error) {
+                    console.error('Settlements API error:', data.error);
+                    return;
+                }
+                
+                const summary = data.summary || {};
+                const today = data.today || {};
+                const settlements = data.settlements || [];
+                
+                // Today's settlements
+                const todayPnl = today.pnl || 0;
+                document.getElementById('todaySettlePnl').textContent = (todayPnl >= 0 ? '+' : '') + '$' + todayPnl.toFixed(2);
+                document.getElementById('todaySettlePnl').className = 'card-value ' + (todayPnl >= 0 ? 'green' : 'red');
+                document.getElementById('todaySettleRecord').textContent = (today.wins || 0) + 'W / ' + (today.losses || 0) + 'L';
+                document.getElementById('todaySettleCount').textContent = today.settlements || 0;
+                
+                // All-time stats
+                const totalPnl = summary.total_pnl || 0;
+                document.getElementById('totalSettlePnl').textContent = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2);
+                document.getElementById('totalSettlePnl').className = 'card-value ' + (totalPnl >= 0 ? 'green' : 'red');
+                document.getElementById('settleWinRate').textContent = (summary.win_rate || 0).toFixed(0) + '%';
+                document.getElementById('settleWinLoss').textContent = (summary.wins || 0) + 'W / ' + (summary.losses || 0) + 'L';
+                document.getElementById('bestSettleTrade').textContent = '+$' + (summary.best_trade || 0).toFixed(2);
+                document.getElementById('worstSettleTrade').textContent = '$' + (summary.worst_trade || 0).toFixed(2);
+                document.getElementById('avgWin').textContent = '+$' + (summary.avg_win || 0).toFixed(2);
+                document.getElementById('avgLoss').textContent = '$' + (summary.avg_loss || 0).toFixed(2);
+                
+                // Settlement count
+                document.getElementById('settlementCount').textContent = settlements.length;
+                
+                // Render settlement list
+                const html = settlements.map(s => {
+                    const isWin = s.outcome === 'WIN';
+                    const pnlClass = s.pnl > 0 ? 'green' : (s.pnl < 0 ? 'red' : '');
+                    const pnlSign = s.pnl >= 0 ? '+' : '';
+                    const outcomeIcon = isWin ? '✓' : '✗';
+                    const outcomeClass = isWin ? 'green' : 'red';
+                    return `
+                        <div style="display:flex;justify-content:space-between;align-items:center;padding:12px;border-bottom:1px solid #30363d;">
+                            <div style="flex:1;min-width:0;">
+                                <div style="font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${s.question}</div>
+                                <div style="font-size:11px;color:#8b949e;margin-top:2px;">${s.settlement_date} · Result: ${s.result}</div>
+                            </div>
+                            <div style="text-align:center;padding:0 16px;min-width:70px;">
+                                <div style="font-size:13px;font-weight:600;color:#58a6ff;">${s.side}</div>
+                                <div style="font-size:11px;color:#8b949e;">${s.contracts} @ ${s.entry_price_cents}¢</div>
+                            </div>
+                            <div style="text-align:right;min-width:90px;">
+                                <div style="font-size:15px;font-weight:600;" class="${pnlClass}">${pnlSign}$${Math.abs(s.pnl).toFixed(2)}</div>
+                                <div style="font-size:11px;" class="${outcomeClass}">${outcomeIcon} ${s.outcome}</div>
+                            </div>
                         </div>
-                        <div style="text-align:center;padding:0 16px;min-width:60px;">
-                            <div style="font-size:13px;font-weight:600;color:#58a6ff;">${t.side}</div>
-                            <div style="font-size:11px;color:#8b949e;">@ ${((t.entry_price || t.price)*100).toFixed(0)}¢</div>
-                        </div>
-                        <div style="text-align:right;min-width:80px;">
-                            <div style="font-size:15px;font-weight:600;" class="${pnlClass}">${pnlSign}$${Math.abs(t.pnl).toFixed(2)}</div>
-                            <div style="font-size:11px;color:#8b949e;">${isWin ? 'WIN' : (t.pnl < 0 ? 'LOSS' : 'BREAK EVEN')}</div>
-                        </div>
-                    </div>
-                `;
-            }).join('');
-            document.getElementById('txlogList').innerHTML = html || '<div style="color:#8b949e;font-size:13px;padding:12px;">No settled bets yet</div>';
+                    `;
+                }).join('');
+                document.getElementById('settlementList').innerHTML = html || '<div style="color:#8b949e;font-size:13px;padding:12px;">No settled bets yet - positions will appear here when markets resolve</div>';
+                
+            } catch (e) {
+                console.error('Failed to fetch settlements:', e);
+            }
+        }
+        
+        // Render performance history chart
+        function renderHistoryChart(history) {
+            if (!history || history.length === 0) {
+                document.getElementById('historyChart').innerHTML = '<div style="color:#8b949e;font-size:12px;">No history data yet</div>';
+                return;
+            }
+            
+            // Filter to days with data and reverse to show oldest first
+            const validHistory = history.filter(h => h.account_value !== null).reverse();
+            if (validHistory.length === 0) {
+                document.getElementById('historyChart').innerHTML = '<div style="color:#8b949e;font-size:12px;">No history data yet - check back tomorrow</div>';
+                return;
+            }
+            
+            const deposits = 150; // Total deposits
+            const maxVal = Math.max(...validHistory.map(h => h.account_value), deposits);
+            const minVal = Math.min(...validHistory.map(h => h.account_value), deposits * 0.5);
+            const range = maxVal - minVal || 1;
+            
+            const chartHtml = `
+                <div style="display:flex;align-items:flex-end;height:100px;gap:8px;padding:10px 0;">
+                    ${validHistory.map(h => {
+                        const height = ((h.account_value - minVal) / range) * 80 + 20;
+                        const isUp = h.account_value >= deposits;
+                        const color = isUp ? '#238636' : '#f85149';
+                        const dayName = new Date(h.date + 'T12:00:00').toLocaleDateString('en-US', {weekday: 'short'});
+                        return `
+                            <div style="flex:1;display:flex;flex-direction:column;align-items:center;">
+                                <div style="font-size:10px;color:#8b949e;margin-bottom:4px;">$${h.account_value.toFixed(0)}</div>
+                                <div style="width:100%;height:${height}px;background:${color};border-radius:4px 4px 0 0;"></div>
+                                <div style="font-size:10px;color:#8b949e;margin-top:4px;">${dayName}</div>
+                            </div>
+                        `;
+                    }).join('')}
+                </div>
+                <div style="border-top:1px dashed #30363d;margin-top:8px;padding-top:8px;font-size:11px;color:#8b949e;text-align:center;">
+                    Dashed line = $${deposits} deposited
+                </div>
+            `;
+            document.getElementById('historyChart').innerHTML = chartHtml;
         }
         
         connect();
         
         // Initial performance fetch and regular updates
         fetchPerformance();
+        fetchSettlements();
         setInterval(fetchPerformance, 15000); // Update every 15 seconds
+        setInterval(fetchSettlements, 30000); // Update settlements every 30 seconds
     </script>
 </body>
 </html>
