@@ -2937,24 +2937,38 @@ class KalshiBattleBot:
                 
                 exposure_by_category[cat] = exposure_by_category.get(cat, 0) + cost
             
-            # 8. Save daily snapshot for history tracking
+            # 8. Save daily snapshot (and start-of-day value for today's P&L)
             await self._save_daily_snapshot(account_value, cash, total_position_value)
             
-            # 9. Get performance history (last 7 days)
+            # 9. Today's P&L = current account value - start of day value (single source of truth)
+            today_str = datetime.utcnow().strftime('%Y-%m-%d')
+            today_snapshot = self._daily_snapshots.get(today_str, {})
+            start_of_day_value = today_snapshot.get('start_of_day_value')
+            if start_of_day_value is not None:
+                today_pnl = round(account_value - start_of_day_value, 2)
+                today_pnl_pct = round((today_pnl / start_of_day_value * 100), 1) if start_of_day_value else 0
+            else:
+                today_pnl = None
+                today_pnl_pct = None
+            
+            # 10. Get performance history (last 7 days)
             history = self._get_performance_history()
             
             return web.json_response({
-                # Account Overview (from Kalshi API)
+                # SINGLE SOURCE OF TRUTH: Kalshi account value only
                 'account': {
                     'cash': round(cash, 2),
                     'positions_value': round(total_position_value, 2),
                     'total_value': round(account_value, 2),
                     'total_deposits': total_deposits,
                 },
-                # Performance
+                # All P&L derived from account value (no fill-based totals)
                 'performance': {
-                    'total_return': round(total_return, 2),
+                    'total_return': round(total_return, 2),       # total_value - total_deposits
                     'return_pct': round(return_pct, 1),
+                    'today_pnl': today_pnl,                       # total_value - start_of_day
+                    'today_pnl_pct': today_pnl_pct,
+                    'start_of_day_value': start_of_day_value,
                     'unrealized_pnl': round(unrealized_pnl, 2),
                 },
                 # Positions Summary
@@ -2987,34 +3001,32 @@ class KalshiBattleBot:
             }, status=500)
     
     async def _save_daily_snapshot(self, account_value: float, cash: float, positions_value: float):
-        """Save daily account snapshot for performance history tracking."""
+        """Save daily account snapshot. First value of the day = start-of-day (for today's P&L)."""
         today_str = datetime.utcnow().strftime('%Y-%m-%d')
         
-        # Initialize history dict if needed
         if not hasattr(self, '_daily_snapshots'):
             self._daily_snapshots = {}
-            # Try to load from state file
             try:
                 if os.path.exists(self._state_file):
                     with open(self._state_file, 'r') as f:
                         state = json.load(f)
                         self._daily_snapshots = state.get('daily_snapshots', {})
-            except:
+            except Exception:
                 pass
         
-        # Only save once per hour to avoid spam
-        last_save_key = f'_last_snapshot_save_{today_str}'
-        if hasattr(self, last_save_key):
-            return
-        setattr(self, last_save_key, True)
+        # First account value we see today = start-of-day (for "today's change")
+        snapshot = self._daily_snapshots.get(today_str, {})
+        start_of_day = snapshot.get('start_of_day_value')
+        if start_of_day is None:
+            start_of_day = round(account_value, 2)
+            snapshot['start_of_day_value'] = start_of_day
         
-        # Save today's snapshot (overwrites previous same-day snapshots)
-        self._daily_snapshots[today_str] = {
-            'account_value': round(account_value, 2),
-            'cash': round(cash, 2),
-            'positions_value': round(positions_value, 2),
-            'timestamp': datetime.utcnow().isoformat(),
-        }
+        # Update snapshot (overwrite with latest)
+        snapshot['account_value'] = round(account_value, 2)
+        snapshot['cash'] = round(cash, 2)
+        snapshot['positions_value'] = round(positions_value, 2)
+        snapshot['timestamp'] = datetime.utcnow().isoformat()
+        self._daily_snapshots[today_str] = snapshot
         
         # Keep only last 30 days
         sorted_dates = sorted(self._daily_snapshots.keys(), reverse=True)
@@ -3022,8 +3034,10 @@ class KalshiBattleBot:
             for old_date in sorted_dates[30:]:
                 del self._daily_snapshots[old_date]
         
-        # Save to state file
-        self._save_state()
+        # Throttle state file writes
+        if not hasattr(self, '_last_snapshot_file_save') or (datetime.utcnow() - self._last_snapshot_file_save).total_seconds() > 300:
+            self._save_state()
+            self._last_snapshot_file_save = datetime.utcnow()
     
     def _get_performance_history(self) -> list:
         """Get performance history for the last 7 days."""
@@ -3427,17 +3441,17 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Short (1-7d)</div><div class="card-value" id="atRiskShort">$0.00</div><div class="card-sub">resolves in days</div></div>
                 <div class="card"><div class="card-label">Medium (8+d)</div><div class="card-value" id="atRiskMedium">$0.00</div><div class="card-sub">resolves in weeks+</div></div>
             </div>
-            <div class="section-title">ACCOUNT VALUE <span style="font-size:10px;opacity:0.6;font-weight:normal;">(from Kalshi API)</span></div>
+            <div class="section-title">YOUR ACCOUNT <span style="font-size:10px;opacity:0.6;">(live from Kalshi)</span></div>
             <div class="grid">
-                <div class="card"><div class="card-label">Total Value</div><div class="card-value" id="accountValue">$0.00</div><div class="card-sub" id="accountSource">syncing...</div><div class="card-sub" id="changeSinceYesterday" style="font-size:10px;margin-top:2px;"></div></div>
-                <div class="card"><div class="card-label">Cash Available</div><div class="card-value" id="cashAvailable">$0.00</div></div>
-                <div class="card"><div class="card-label">In Positions</div><div class="card-value" id="positionsValue">$0.00</div><div class="card-sub" id="positionsSummary">0 bets</div></div>
+                <div class="card"><div class="card-label">Account value</div><div class="card-value" id="accountValue">$0.00</div><div class="card-sub">cash + positions</div></div>
+                <div class="card"><div class="card-label">Cash</div><div class="card-value" id="cashAvailable">$0.00</div></div>
+                <div class="card"><div class="card-label">In positions</div><div class="card-value" id="positionsValue">$0.00</div><div class="card-sub" id="positionsSummary">0 bets</div></div>
             </div>
-            <div class="section-title">PERFORMANCE</div>
+            <div class="section-title">REAL P&L <span style="font-size:10px;opacity:0.6;">(value minus what you deposited)</span></div>
             <div class="grid">
-                <div class="card"><div class="card-label">Total return vs deposited</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
-                <div class="card"><div class="card-label">Unrealized P&L</div><div class="card-value" id="unrealizedPnl">$0.00</div><div class="card-sub" id="unrealizedDetail">on open positions</div></div>
-                <div class="card"><div class="card-label">Open positions</div><div class="card-value" id="positionStatus">0</div><div class="card-sub" id="positionStatusSub">ahead / behind by price</div></div>
+                <div class="card"><div class="card-label">Total vs $150 deposited</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
+                <div class="card"><div class="card-label">Today</div><div class="card-value" id="todayPnl">—</div><div class="card-sub" id="todayPnlSub">vs start of day</div></div>
+                <div class="card"><div class="card-label">Open positions</div><div class="card-value" id="positionStatus">0</div><div class="card-sub" id="positionStatusSub">ahead / behind</div></div>
             </div>
             <div class="section-title">TODAY'S ACTIVITY</div>
             <div class="grid">
@@ -3459,13 +3473,13 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div id="trades"></div>
         </div>
         <div id="txlog" class="tab-content hidden">
-            <div class="section-title">SETTLEMENTS <span style="font-size:10px;opacity:0.6;">(from Kalshi)</span></div>
+            <div class="section-title">YOUR ACCOUNT <span style="font-size:10px;opacity:0.6;">(same as Portfolio — from Kalshi)</span></div>
             <div class="grid">
-                <div class="card"><div class="card-label">Total realized P&L</div><div class="card-value" id="totalSettlePnl">$0.00</div><div class="card-sub">all settled bets</div></div>
-                <div class="card"><div class="card-label">Record</div><div class="card-value" id="settleWinLoss">0W / 0L</div><div class="card-sub" id="settleWinRate">0% win rate</div></div>
-                <div class="card"><div class="card-label">Today</div><div class="card-value" id="todaySettlePnl">$0.00</div><div class="card-sub" id="todaySettleRecord">0 settled</div></div>
+                <div class="card"><div class="card-label">Account value</div><div class="card-value" id="truthValue">$0.00</div></div>
+                <div class="card"><div class="card-label">Real P&L vs $150</div><div class="card-value" id="truthPnl">$0.00</div><div class="card-sub" id="truthPct">0%</div></div>
+                <div class="card"><div class="card-label">Today</div><div class="card-value" id="truthToday">—</div><div class="card-sub">vs start of day</div></div>
             </div>
-            <div class="section-title">EVERY SETTLED BET <span id="settlementCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
+            <div class="section-title">SETTLED BETS <span style="font-size:10px;opacity:0.6;">(list only — true P&L is above)</span> <span id="settlementCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="settlementList"></div>
         </div>
         <div id="activity" class="tab-content hidden">
@@ -3574,21 +3588,31 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('positionsValue').textContent = '$' + p.account.positions_value.toFixed(2);
                 document.getElementById('positionsSummary').textContent = p.positions.count + ' active bets';
                 
-                // Performance: negative = red, positive = green (everywhere)
+                // Real P&L: only from account value (negative = red, positive = green)
                 const ret = p.performance.total_return;
                 const returnPctVal = p.performance.return_pct;
                 document.getElementById('totalReturn').textContent = (ret >= 0 ? '+' : '') + '$' + ret.toFixed(2);
                 document.getElementById('totalReturn').className = 'card-value ' + (ret >= 0 ? 'green' : 'red');
-                document.getElementById('returnPct').textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '% vs $' + p.account.total_deposits + ' deposited';
+                document.getElementById('returnPct').textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%';
                 document.getElementById('returnPct').className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red');
                 
-                const unr = p.performance.unrealized_pnl;
-                document.getElementById('unrealizedPnl').textContent = (unr >= 0 ? '+' : '') + '$' + unr.toFixed(2);
-                document.getElementById('unrealizedPnl').className = 'card-value ' + (unr >= 0 ? 'green' : 'red');
-                document.getElementById('unrealizedDetail').textContent = p.positions.count + ' open positions';
+                // Today's change = account value now - start of day (from Kalshi)
+                const todayPn = p.performance.today_pnl;
+                const todayPct = p.performance.today_pnl_pct;
+                const todayEl = document.getElementById('todayPnl');
+                const todaySubEl = document.getElementById('todayPnlSub');
+                if (todayPn != null && todayPct != null) {
+                    todayEl.textContent = (todayPn >= 0 ? '+' : '') + '$' + todayPn.toFixed(2);
+                    todayEl.className = 'card-value ' + (todayPn >= 0 ? 'green' : 'red');
+                    todaySubEl.textContent = (todayPct >= 0 ? '+' : '') + todayPct.toFixed(1) + '% vs start of day';
+                } else {
+                    todayEl.textContent = '—';
+                    todayEl.className = 'card-value';
+                    todaySubEl.textContent = 'vs start of day (set tomorrow)';
+                }
                 
                 document.getElementById('positionStatus').textContent = p.positions.winning + ' / ' + p.positions.losing;
-                document.getElementById('positionStatusSub').textContent = 'positions ahead / behind (by current price)';
+                document.getElementById('positionStatusSub').textContent = 'positions ahead / behind';
                 
                 // Today's Activity
                 document.getElementById('todayBets').textContent = p.today.new_bets;
@@ -3601,23 +3625,24 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('expCrypto').textContent = '$' + (p.exposure_by_category.Crypto || 0).toFixed(2);
                 document.getElementById('expOther').textContent = '$' + (p.exposure_by_category.Other || 0).toFixed(2);
                 
-                // Change vs yesterday (explicit timeframe — not vague "recently")
-                const history = p.history || [];
-                const todayStr = new Date().toISOString().slice(0, 10);
-                const yesterdaySnapshot = history.find(h => h.date && h.date !== todayStr && h.account_value != null);
-                const changeEl = document.getElementById('changeSinceYesterday');
-                if (yesterdaySnapshot && yesterdaySnapshot.account_value != null) {
-                    const nowVal = p.account.total_value;
-                    const change = nowVal - yesterdaySnapshot.account_value;
-                    const pct = yesterdaySnapshot.account_value > 0 ? (change / yesterdaySnapshot.account_value * 100) : 0;
-                    const dayLabel = yesterdaySnapshot.date === todayStr ? '' : ' vs ' + yesterdaySnapshot.date;
-                    changeEl.textContent = (change >= 0 ? '+' : '') + '$' + change.toFixed(2) + ' (' + (change >= 0 ? '+' : '') + pct.toFixed(1) + '%)' + dayLabel;
-                    changeEl.className = 'card-sub ' + (change >= 0 ? 'green' : 'red');
-                    changeEl.style.display = '';
-                } else {
-                    changeEl.textContent = 'Compare to prior day once we have yesterday\'s snapshot';
-                    changeEl.style.display = '';
+                // Settlements tab: same truth (so it matches when user switches tab)
+                const tv = document.getElementById('truthValue');
+                const tp = document.getElementById('truthPnl');
+                const tpc = document.getElementById('truthPct');
+                const tt = document.getElementById('truthToday');
+                if (tv) { tv.textContent = '$' + p.account.total_value.toFixed(2); }
+                if (tp) {
+                    tp.textContent = (ret >= 0 ? '+' : '') + '$' + ret.toFixed(2);
+                    tp.className = 'card-value ' + (ret >= 0 ? 'green' : 'red');
                 }
+                if (tpc) {
+                    tpc.textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%';
+                    tpc.className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red');
+                }
+                if (tt && todayPn != null) {
+                    tt.textContent = (todayPn >= 0 ? '+' : '') + '$' + todayPn.toFixed(2);
+                    tt.className = 'card-value ' + (todayPn >= 0 ? 'green' : 'red');
+                } else if (tt) { tt.textContent = '—'; tt.className = 'card-value'; }
                 
                 // Render performance history chart
                 if (p.history) {
@@ -3712,24 +3737,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     return;
                 }
                 
-                const summary = data.summary || {};
-                const today = data.today || {};
                 const settlements = data.settlements || [];
-                
-                // Today's settlements
-                const todayPnl = today.pnl || 0;
-                document.getElementById('todaySettlePnl').textContent = (todayPnl >= 0 ? '+' : '') + '$' + todayPnl.toFixed(2);
-                document.getElementById('todaySettlePnl').className = 'card-value ' + (todayPnl >= 0 ? 'green' : 'red');
-                document.getElementById('todaySettleRecord').textContent = (today.settlements || 0) + ' settled today';
-                document.getElementById('todaySettleCount').textContent = today.settlements || 0;
-                
-                // All-time stats
-                const totalPnl = summary.total_pnl || 0;
-                document.getElementById('totalSettlePnl').textContent = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(2);
-                document.getElementById('totalSettlePnl').className = 'card-value ' + (totalPnl >= 0 ? 'green' : 'red');
-                document.getElementById('settleWinRate').textContent = (summary.win_rate || 0).toFixed(0) + '% win rate';
-                document.getElementById('settleWinLoss').textContent = (summary.wins || 0) + 'W / ' + (summary.losses || 0) + 'L';
-                // Settlement count
                 document.getElementById('settlementCount').textContent = settlements.length;
                 
                 // Render settlement list (flag any trade where cost exceeded stated deposits)
@@ -3781,30 +3789,34 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 return;
             }
             
-            const deposits = 150; // Total deposits
-            const maxVal = Math.max(...validHistory.map(h => h.account_value), deposits);
-            const minVal = Math.min(...validHistory.map(h => h.account_value), deposits * 0.5);
+            const deposits = 150;
+            const maxVal = Math.max(...validHistory.map(h => h.account_value), deposits, 160);
+            const minVal = Math.min(...validHistory.map(h => h.account_value), deposits - 50, 80);
             const range = maxVal - minVal || 1;
+            const barAreaHeight = 84;
+            const depositY = Math.max(2, Math.min(barAreaHeight - 2, 4 + (barAreaHeight - 8) * (1 - (deposits - minVal) / range)));
             
             const chartHtml = `
-                <div style="display:flex;align-items:flex-end;height:100px;gap:8px;padding:10px 0;">
-                    ${validHistory.map(h => {
-                        const height = ((h.account_value - minVal) / range) * 80 + 20;
-                        const isUp = h.account_value >= deposits;
-                        const color = isUp ? '#238636' : '#f85149';
-                        const dayName = new Date(h.date + 'T12:00:00').toLocaleDateString('en-US', {weekday: 'short'});
-                        return `
-                            <div style="flex:1;display:flex;flex-direction:column;align-items:center;">
-                                <div style="font-size:10px;color:#8b949e;margin-bottom:4px;">$${h.account_value.toFixed(0)}</div>
-                                <div style="width:100%;height:${height}px;background:${color};border-radius:4px 4px 0 0;"></div>
-                                <div style="font-size:10px;color:#8b949e;margin-top:4px;">${dayName}</div>
-                            </div>
-                        `;
-                    }).join('')}
+                <div style="position:relative;height:${barAreaHeight + 28}px;">
+                    <div style="position:absolute;left:0;right:0;bottom:${depositY + 22}px;height:0;border-top:2px dashed #8b949e;z-index:1;"></div>
+                    <div style="position:absolute;left:4px;bottom:${depositY + 18}px;font-size:10px;color:#8b949e;z-index:2;">$${deposits}</div>
+                    <div style="display:flex;align-items:flex-end;height:${barAreaHeight}px;gap:6px;padding:10px 0 4px;">
+                        ${validHistory.map(h => {
+                            const height = 8 + (barAreaHeight - 16) * ((h.account_value - minVal) / range);
+                            const isUp = h.account_value >= deposits;
+                            const color = isUp ? '#238636' : '#f85149';
+                            const dayName = new Date(h.date + 'T12:00:00').toLocaleDateString('en-US', {weekday: 'short'});
+                            return `
+                                <div style="flex:1;display:flex;flex-direction:column;align-items:center;">
+                                    <div style="font-size:10px;color:#8b949e;">$${h.account_value.toFixed(0)}</div>
+                                    <div style="width:100%;height:${height}px;background:${color};border-radius:4px 4px 0 0;"></div>
+                                    <div style="font-size:10px;color:#8b949e;">${dayName}</div>
+                                </div>
+                            `;
+                        }).join('')}
+                    </div>
                 </div>
-                <div style="border-top:1px dashed #30363d;margin-top:8px;padding-top:8px;font-size:11px;color:#8b949e;text-align:center;">
-                    Dashed line = $${deposits} deposited
-                </div>
+                <div style="font-size:11px;color:#8b949e;text-align:center;margin-top:4px;">Bars = account value. Dashed = $150 deposited.</div>
             `;
             document.getElementById('historyChart').innerHTML = chartHtml;
         }
