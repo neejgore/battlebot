@@ -182,15 +182,16 @@ class KalshiBattleBot:
         try:
             os.makedirs(os.path.dirname(self._state_file) or '.', exist_ok=True)
             
-            # Get daily snapshots if available
             daily_snapshots = getattr(self, '_daily_snapshots', {})
+            portfolio_hourly = getattr(self, '_portfolio_hourly', {})
             
             state_data = {
                 'positions': self._positions,
                 'pending_orders': self._pending_orders,
                 'trades': self._trades[-100:],
-                'signal_log': self._signal_log[-500:],  # Keep last 500 signals for backtesting
-                'daily_snapshots': daily_snapshots,  # Performance history
+                'signal_log': self._signal_log[-500:],
+                'daily_snapshots': daily_snapshots,
+                'portfolio_hourly': portfolio_hourly,
                 'saved_at': datetime.utcnow().isoformat(),
             }
             
@@ -551,82 +552,19 @@ class KalshiBattleBot:
                     print(f"[Sync] Kalshi: {ticker[:30]}... | pos={pos} | exposure={exposure}¢")
             
             # Check for phantom positions (in bot but not on Kalshi)
-            # These may have SETTLED - check market status and record P&L
-            phantom_count = 0
-            settled_count = 0
+            # Positions gone from Kalshi: remove only. Do NOT infer P&L or record EXIT.
+            # Settled P&L is only from Kalshi fills (Settlements tab). This avoids phantom losses.
+            removed = 0
             for pos_id in list(self._positions.keys()):
                 pos = self._positions[pos_id]
                 market_id = pos.get('market_id', '')
-                
                 if market_id not in kalshi_by_ticker:
-                    # Position gone from Kalshi - check if market settled
-                    try:
-                        market_result = await self._kalshi.get_market(market_id)
-                        market_data = market_result.get('market', {}) if market_result else {}
-                        status = market_data.get('status', '')
-                        result = market_data.get('result', '')  # 'yes' or 'no'
-                        
-                        if status == 'settled' and result:
-                            # Market settled! Calculate P&L
-                            our_side = pos.get('side', '').lower()
-                            contracts = pos.get('contracts', 0)
-                            entry_price = pos.get('entry_price', 0.5)
-                            
-                            # If our side won, we get $1 per contract (100¢)
-                            # If our side lost, we get $0
-                            if our_side == result:
-                                # WE WON! Payout is $1 per contract
-                                exit_price = 1.0
-                                pnl = (exit_price - entry_price) * contracts
-                                outcome = 'WIN'
-                            else:
-                                # WE LOST - contracts worthless
-                                exit_price = 0.0
-                                pnl = -entry_price * contracts
-                                outcome = 'LOSS'
-                            
-                            print(f"[SETTLED] {outcome}! ${pnl:+.2f} | {pos.get('side')} on '{result.upper()}' result | {pos.get('question', '')[:40]}...")
-                            
-                            # Record EXIT trade
-                            trade = {
-                                'id': pos_id,
-                                'market_id': market_id,
-                                'question': pos.get('question', ''),
-                                'action': 'EXIT',
-                                'side': pos.get('side'),
-                                'entry_price': entry_price,
-                                'exit_price': exit_price,
-                                'contracts': contracts,
-                                'size': pos.get('size', 0),
-                                'pnl': pnl,
-                                'reason': f'SETTLED_{outcome}',
-                                'edge': pos.get('edge'),
-                                'confidence': pos.get('confidence'),
-                                'timestamp': datetime.utcnow().isoformat(),
-                            }
-                            self._trades.insert(0, trade)
-                            
-                            # Record in risk engine
-                            await self._risk_engine.record_trade_result(pnl)
-                            
-                            settled_count += 1
-                        else:
-                            print(f"[Sync] Position gone but market not settled ({status}): {pos.get('question', '')[:40]}...")
-                            phantom_count += 1
-                            
-                    except Exception as e:
-                        print(f"[Sync] Error checking market {market_id}: {e}")
-                        phantom_count += 1
-                    
-                    # Remove position regardless
+                    print(f"[Sync] Position no longer on Kalshi, removing (use Settlements for P&L): {pos.get('question', '')[:40]}...")
                     self._positions.pop(pos_id)
-            
-            if settled_count:
-                print(f"[Sync] Recorded {settled_count} SETTLED positions with P&L")
+                    removed += 1
+            if removed:
                 self._save_state()
                 await self._broadcast_update()
-            if phantom_count:
-                print(f"[Sync] Removed {phantom_count} phantom positions")
             
             # Check for missing positions (on Kalshi but not in bot)
             # and update entry prices for existing positions
@@ -705,9 +643,9 @@ class KalshiBattleBot:
                                 updated_count += 1
                             break
             
-            if added_count or updated_count or phantom_count:
+            if added_count or updated_count or removed:
                 self._save_state()
-                print(f"[Sync] Complete: {added_count} added, {updated_count} updated, {phantom_count} removed")
+                print(f"[Sync] Complete: {added_count} added, {updated_count} updated, {removed} removed")
             else:
                 print("[Sync] Positions already in sync with Kalshi")
                 
@@ -2951,8 +2889,8 @@ class KalshiBattleBot:
                 today_pnl = None
                 today_pnl_pct = None
             
-            # 10. Get performance history (last 7 days)
-            history = self._get_performance_history()
+            # 10. Portfolio history: daily (14 days) + today's hourly for chart
+            history_daily, history_today_hourly = self._get_performance_history()
             
             return web.json_response({
                 # SINGLE SOURCE OF TRUTH: Kalshi account value only
@@ -2986,8 +2924,9 @@ class KalshiBattleBot:
                 },
                 # Exposure by Category
                 'exposure_by_category': {k: round(v, 2) for k, v in exposure_by_category.items()},
-                # Performance History (last 7 days)
-                'history': history,
+                # Portfolio value history (Kalshi): 14 days + hourly for today
+                'history': history_daily,
+                'today_hourly': history_today_hourly,
                 # Data source confirmation
                 'data_source': 'kalshi_api',
                 'timestamp': datetime.utcnow().isoformat(),
@@ -3001,73 +2940,82 @@ class KalshiBattleBot:
             }, status=500)
     
     async def _save_daily_snapshot(self, account_value: float, cash: float, positions_value: float):
-        """Save daily account snapshot. First value of the day = start-of-day (for today's P&L)."""
-        today_str = datetime.utcnow().strftime('%Y-%m-%d')
+        """Save portfolio value for history. First value of the day = start-of-day. Hourly points for today."""
+        now = datetime.utcnow()
+        today_str = now.strftime('%Y-%m-%d')
+        hour_str = now.strftime('%H')
+        val = round(account_value, 2)
         
         if not hasattr(self, '_daily_snapshots'):
             self._daily_snapshots = {}
+            self._portfolio_hourly = {}
             try:
                 if os.path.exists(self._state_file):
                     with open(self._state_file, 'r') as f:
                         state = json.load(f)
                         self._daily_snapshots = state.get('daily_snapshots', {})
+                        self._portfolio_hourly = state.get('portfolio_hourly', {})
             except Exception:
                 pass
         
-        # First account value we see today = start-of-day (for "today's change")
+        # Start-of-day value (first we see today)
         snapshot = self._daily_snapshots.get(today_str, {})
-        start_of_day = snapshot.get('start_of_day_value')
-        if start_of_day is None:
-            start_of_day = round(account_value, 2)
-            snapshot['start_of_day_value'] = start_of_day
-        
-        # Update snapshot (overwrite with latest)
-        snapshot['account_value'] = round(account_value, 2)
+        if snapshot.get('start_of_day_value') is None:
+            snapshot['start_of_day_value'] = val
+        snapshot['account_value'] = val
         snapshot['cash'] = round(cash, 2)
         snapshot['positions_value'] = round(positions_value, 2)
-        snapshot['timestamp'] = datetime.utcnow().isoformat()
+        snapshot['timestamp'] = now.isoformat()
         self._daily_snapshots[today_str] = snapshot
         
-        # Keep only last 30 days
-        sorted_dates = sorted(self._daily_snapshots.keys(), reverse=True)
-        if len(sorted_dates) > 30:
-            for old_date in sorted_dates[30:]:
-                del self._daily_snapshots[old_date]
+        # Hourly series for today (Kalshi portfolio value)
+        if today_str not in self._portfolio_hourly:
+            self._portfolio_hourly[today_str] = {}
+        self._portfolio_hourly[today_str][hour_str] = val
+        # Keep only last 14 days of hourly
+        sorted_dates = sorted(self._portfolio_hourly.keys(), reverse=True)
+        for old in sorted_dates[14:]:
+            del self._portfolio_hourly[old]
         
-        # Throttle state file writes
-        if not hasattr(self, '_last_snapshot_file_save') or (datetime.utcnow() - self._last_snapshot_file_save).total_seconds() > 300:
+        # Prune daily to 30 days
+        sorted_dates = sorted(self._daily_snapshots.keys(), reverse=True)
+        for old in sorted_dates[30:]:
+            del self._daily_snapshots[old]
+        
+        if not hasattr(self, '_last_snapshot_file_save') or (now - self._last_snapshot_file_save).total_seconds() > 300:
             self._save_state()
-            self._last_snapshot_file_save = datetime.utcnow()
+            self._last_snapshot_file_save = now
     
-    def _get_performance_history(self) -> list:
-        """Get performance history for the last 7 days."""
+    def _get_performance_history(self) -> tuple:
+        """Return (daily history for last 14 days, today's hourly points for chart)."""
         if not hasattr(self, '_daily_snapshots'):
             self._daily_snapshots = {}
+        if not hasattr(self, '_portfolio_hourly'):
+            self._portfolio_hourly = {}
         
-        history = []
+        daily = []
         today = datetime.utcnow().date()
-        
-        for i in range(7):
+        for i in range(14):
             date = today - timedelta(days=i)
             date_str = date.strftime('%Y-%m-%d')
-            
             if date_str in self._daily_snapshots:
-                snapshot = self._daily_snapshots[date_str]
-                history.append({
+                s = self._daily_snapshots[date_str]
+                daily.append({
                     'date': date_str,
-                    'account_value': snapshot.get('account_value', 0),
-                    'cash': snapshot.get('cash', 0),
-                    'positions_value': snapshot.get('positions_value', 0),
+                    'account_value': s.get('account_value'),
+                    'cash': s.get('cash'),
+                    'positions_value': s.get('positions_value'),
                 })
             else:
-                history.append({
-                    'date': date_str,
-                    'account_value': None,
-                    'cash': None,
-                    'positions_value': None,
-                })
+                daily.append({'date': date_str, 'account_value': None, 'cash': None, 'positions_value': None})
         
-        return history
+        today_str = today.strftime('%Y-%m-%d')
+        today_hourly = []
+        if today_str in self._portfolio_hourly:
+            for h in sorted(self._portfolio_hourly[today_str].keys()):
+                today_hourly.append({'hour': int(h), 'value': self._portfolio_hourly[today_str][h]})
+        
+        return daily, today_hourly
     
     async def _handle_settlements(self, request):
         """API endpoint for accurate settlement log from Kalshi fills.
@@ -3465,8 +3413,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Crypto</div><div class="card-value" id="expCrypto">$0.00</div></div>
                 <div class="card"><div class="card-label">Other</div><div class="card-value" id="expOther">$0.00</div></div>
             </div>
-            <div class="section-title">ACCOUNT VALUE (last 7 days)</div>
-            <div id="historyChart" style="padding:10px 0;"></div>
+            <div class="section-title">PORTFOLIO VALUE (Kalshi) <span style="font-size:10px;opacity:0.6;">day-over-day, updates hourly</span></div>
+            <div id="historyChart" style="padding:10px 0;min-height:180px;"></div>
             <div class="section-title">Active Positions <span id="positionCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="positions"></div>
             <div class="section-title" style="margin-top:20px">Recent Trades <span id="tradeCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
@@ -3638,9 +3586,9 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 if (tpc) { tpc.textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%'; tpc.className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red'); }
                 if (tt) { tt.textContent = (todayPn != null ? (todayPn >= 0 ? '+' : '') + '$' + todayPn.toFixed(2) : '—'); tt.className = 'card-value' + (todayPn != null ? ' ' + (todayPn >= 0 ? 'green' : 'red') : ''); }
                 
-                // Render performance history chart
+                // Portfolio value chart (day-over-day, hourly for today)
                 if (p.history) {
-                    renderHistoryChart(p.history);
+                    renderHistoryChart(p.history, p.today_hourly || []);
                 }
                 
             } catch (e) {
@@ -3769,50 +3717,56 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             }
         }
         
-        // Render performance history chart
-        function renderHistoryChart(history) {
+        // Portfolio value (Kalshi) day-over-day: line + bar chart, updates hourly
+        function renderHistoryChart(history, todayHourly) {
             if (!history || history.length === 0) {
-                document.getElementById('historyChart').innerHTML = '<div style="color:#8b949e;font-size:12px;">No history data yet</div>';
+                document.getElementById('historyChart').innerHTML = '<div style="color:#8b949e;font-size:12px;">No history yet. Data updates hourly.</div>';
                 return;
             }
-            
-            // Filter to days with data and reverse to show oldest first
-            const validHistory = history.filter(h => h.account_value !== null).reverse();
-            if (validHistory.length === 0) {
-                document.getElementById('historyChart').innerHTML = '<div style="color:#8b949e;font-size:12px;">No history data yet - check back tomorrow</div>';
-                return;
-            }
-            
             const deposits = 150;
-            const maxVal = Math.max(...validHistory.map(h => h.account_value), deposits, 160);
-            const minVal = Math.min(...validHistory.map(h => h.account_value), deposits - 50, 80);
+            // history[0] = today, history[1] = yesterday, ...; show oldest left, newest right
+            const ordered = history.slice().reverse();
+            const valid = ordered.filter(h => h.account_value != null);
+            if (valid.length === 0) {
+                document.getElementById('historyChart').innerHTML = '<div style="color:#8b949e;font-size:12px;">No portfolio values yet. Values update hourly.</div>';
+                return;
+            }
+            const values = ordered.map(h => h.account_value != null ? h.account_value : null);
+            const minVal = Math.min(...valid.map(h => h.account_value), deposits) - 10;
+            const maxVal = Math.max(...valid.map(h => h.account_value), deposits) + 10;
             const range = maxVal - minVal || 1;
-            const barAreaHeight = 84;
-            const depositY = Math.max(2, Math.min(barAreaHeight - 2, 4 + (barAreaHeight - 8) * (1 - (deposits - minVal) / range)));
-            
-            const chartHtml = `
-                <div style="position:relative;height:${barAreaHeight + 28}px;">
-                    <div style="position:absolute;left:0;right:0;bottom:${depositY + 22}px;height:0;border-top:2px dashed #8b949e;z-index:1;"></div>
-                    <div style="position:absolute;left:4px;bottom:${depositY + 18}px;font-size:10px;color:#8b949e;z-index:2;">$${deposits}</div>
-                    <div style="display:flex;align-items:flex-end;height:${barAreaHeight}px;gap:6px;padding:10px 0 4px;">
-                        ${validHistory.map(h => {
-                            const height = 8 + (barAreaHeight - 16) * ((h.account_value - minVal) / range);
-                            const isUp = h.account_value >= deposits;
-                            const color = isUp ? '#238636' : '#f85149';
-                            const dayName = new Date(h.date + 'T12:00:00').toLocaleDateString('en-US', {weekday: 'short'});
-                            return `
-                                <div style="flex:1;display:flex;flex-direction:column;align-items:center;">
-                                    <div style="font-size:10px;color:#8b949e;">$${h.account_value.toFixed(0)}</div>
-                                    <div style="width:100%;height:${height}px;background:${color};border-radius:4px 4px 0 0;"></div>
-                                    <div style="font-size:10px;color:#8b949e;">${dayName}</div>
-                                </div>
-                            `;
-                        }).join('')}
-                    </div>
-                </div>
-                <div style="font-size:11px;color:#8b949e;text-align:center;margin-top:4px;">Bars = account value. Dashed = $150 deposited.</div>
+            const w = 560, h = 160, pad = { top: 8, right: 8, bottom: 28, left: 36 };
+            const xScale = (i) => pad.left + (i / (values.length - 1 || 1)) * (w - pad.left - pad.right);
+            const yScale = (v) => pad.top + (1 - (v - minVal) / range) * (h - pad.top - pad.bottom);
+            const depositY = yScale(deposits);
+            let path = '';
+            let prev = null;
+            for (let i = 0; i < values.length; i++) {
+                if (values[i] == null) continue;
+                const x = xScale(i);
+                const y = yScale(values[i]);
+                path += (prev === null ? 'M' : 'L') + x + ',' + y;
+                prev = { x, y };
+            }
+            const areaPath = path ? path + ' L' + xScale(values.length - 1) + ',' + (h - pad.bottom) + ' L' + pad.left + ',' + (h - pad.bottom) + ' Z' : '';
+            const labels = ordered.map((d, i) => {
+                const day = new Date(d.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+                const val = values[i];
+                const x = xScale(i);
+                return { day, val, x };
+            });
+            const svg = `
+                <svg viewBox="0 0 ${w} ${h}" style="max-width:100%;height:auto;">
+                    <line x1="${pad.left}" y1="${depositY}" x2="${w - pad.right}" y2="${depositY}" stroke="#8b949e" stroke-width="1" stroke-dasharray="4,4"/>
+                    <text x="${pad.left - 4}" y="${depositY + 4}" font-size="10" fill="#8b949e" text-anchor="end">$${deposits}</text>
+                    ${areaPath ? '<path d="' + areaPath + '" fill="rgba(35,134,54,0.15)" stroke="none"/>' : ''}
+                    ${path ? '<path d="' + path + '" fill="none" stroke="#238636" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' : ''}
+                    ${labels.filter(l => l.val != null).map(l => '<circle cx="' + l.x + '" cy="' + yScale(l.val) + '" r="3" fill="' + (l.val >= deposits ? '#238636' : '#f85149') + '"/>').join('')}
+                    ${labels.map((l, i) => '<text x="' + l.x + '" y="' + (h - 4) + '" font-size="9" fill="#8b949e" text-anchor="middle">' + (new Date(ordered[i].date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short' })) + '</text>').join('')}
+                </svg>
+                <div style="font-size:11px;color:#8b949e;text-align:center;margin-top:4px;">Portfolio value from Kalshi. Dashed line = $150 deposited. Updates hourly.</div>
             `;
-            document.getElementById('historyChart').innerHTML = chartHtml;
+            document.getElementById('historyChart').innerHTML = svg;
         }
         
         connect();
