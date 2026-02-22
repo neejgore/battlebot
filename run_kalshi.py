@@ -374,8 +374,8 @@ class KalshiBattleBot:
                 for fill in ticker_fills:
                     action = fill.get('action', '')
                     count = fill.get('count', 0)
-                    # Kalshi fills API uses 'price' field (in cents), not yes_price/no_price
-                    price = fill.get('price', 50) / 100.0
+                    # Kalshi fills API 'price' field is in DOLLARS (e.g., 0.18 = 18 cents)
+                    price = fill.get('price', 0.50)
                     fill_side = fill.get('side', '')
                     
                     if action == 'buy':
