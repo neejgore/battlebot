@@ -1584,6 +1584,44 @@ class KalshiBattleBot:
                     if any(pattern in question_lower for pattern in point_spread_patterns):
                         continue
                     
+                    # FILTER 2c: HARD BLOCK ALL SPORTS - historically poor (28% win rate, -$32 losses)
+                    # Sports outcomes are too unpredictable, no sustainable edge
+                    sports_patterns = [
+                        # Basketball
+                        'nba', 'ncaa', 'basketball', 'wnba', 'nbl',
+                        # Football
+                        'nfl', 'football', 'touchdown', 'quarterback',
+                        # Baseball
+                        'mlb', 'baseball',
+                        # Hockey
+                        'nhl', 'hockey',
+                        # Soccer
+                        'soccer', 'premier league', 'champions league', 'mls',
+                        # Golf
+                        'golf', 'pga', 'lpga', 'genesis invitational',
+                        # Tennis
+                        'tennis', 'atp', 'wta',
+                        # Fighting
+                        'ufc', 'boxing', 'mma',
+                        # Other sports
+                        'f1', 'nascar', 'olympics', 'world cup',
+                        # Generic sports terms
+                        'wins the', 'win the game', 'beat', 'defeat',
+                        'rebounds', 'assists', 'three-pointers', '3-pointers',
+                    ]
+                    if any(pattern in question_lower for pattern in sports_patterns):
+                        continue  # SKIP ALL SPORTS - no edge, high losses
+                    
+                    # Also check ticker patterns for sports
+                    ticker_upper = market_id.upper()
+                    sports_ticker_patterns = [
+                        'KXNBA', 'KXNFL', 'KXMLB', 'KXNHL', 'KXNCAA', 'KXPGA', 'KXLPGA',
+                        'KXUFC', 'KXBOX', 'KXTEN', 'KXSOC', 'KXWNH', 'KXWOH',
+                        'KXDPWORLD', 'KXNBL', 'KXBRASIL',
+                    ]
+                    if any(pattern in ticker_upper for pattern in sports_ticker_patterns):
+                        continue  # SKIP sports by ticker pattern
+                    
                     # FILTER 3: Skip markets where probability is extreme (< 10% or > 90%)
                     # These have low expected value and high variance
                     market_price = market.get('price', 0.5)
