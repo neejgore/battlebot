@@ -3546,14 +3546,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Crypto</div><div class="card-value" id="expCrypto">$0.00</div></div>
                 <div class="card"><div class="card-label">Other</div><div class="card-value" id="expOther">$0.00</div></div>
             </div>
-            <div class="section-title">BOT FILTERS ACTIVE <span style="font-size:10px;opacity:0.6;">live values — these gates control every trade decision</span></div>
+            <div class="section-title">TRADE ENTRY THRESHOLDS <span style="font-size:10px;opacity:0.6;">a market must clear every threshold to get a bet — see Activity tab for per-market pass/fail</span></div>
             <div id="filtersGrid" class="grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-bottom:16px;">
-                <div class="card"><div class="card-label">Min Edge</div><div class="card-value" id="cfgMinEdge">—</div><div class="card-sub">skip if AI edge below</div></div>
-                <div class="card"><div class="card-label">Min Confidence</div><div class="card-value" id="cfgMinConf">—</div><div class="card-sub">skip if AI unsure</div></div>
-                <div class="card"><div class="card-label">Max Horizon</div><div class="card-value" id="cfgMaxDays">—</div><div class="card-sub">skip far-out markets</div></div>
-                <div class="card"><div class="card-label">Profit-Lock</div><div class="card-value" id="cfgProfitLock">—</div><div class="card-sub">sell on % gain</div></div>
-                <div class="card"><div class="card-label">Cluster Cap</div><div class="card-value" id="cfgCluster">—</div><div class="card-sub">max per theme</div></div>
-                <div class="card"><div class="card-label">Max Bet Size</div><div class="card-value" id="cfgMaxBet">—</div><div class="card-sub">per position</div></div>
+                <div class="card"><div class="card-label">Min Edge</div><div class="card-value" id="cfgMinEdge">—</div><div class="card-sub">AI edge must exceed</div></div>
+                <div class="card"><div class="card-label">Min Confidence</div><div class="card-value" id="cfgMinConf">—</div><div class="card-sub">AI certainty must exceed</div></div>
+                <div class="card"><div class="card-label">Max Horizon</div><div class="card-value" id="cfgMaxDays">—</div><div class="card-sub">market must resolve within</div></div>
+                <div class="card"><div class="card-label">Profit-Lock Exit</div><div class="card-value" id="cfgProfitLock">—</div><div class="card-sub">auto-sell at this gain</div></div>
+                <div class="card"><div class="card-label">Cluster Cap</div><div class="card-value" id="cfgCluster">—</div><div class="card-sub">max bets per news theme</div></div>
+                <div class="card"><div class="card-label">Max Bet Size</div><div class="card-value" id="cfgMaxBet">—</div><div class="card-sub">per position ceiling</div></div>
                 <div class="card"><div class="card-label">Kelly Fraction</div><div class="card-value" id="cfgKelly">—</div><div class="card-sub">sizing conservatism</div></div>
                 <div class="card"><div class="card-label">Trading</div><div class="card-value" id="cfgTrading">—</div><div class="card-sub" id="cfgTradingSub">kill-switch status</div></div>
             </div>
@@ -3861,22 +3861,52 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         
         function renderAnalyses(analyses) {
-            const html = analyses.map(a => `
+            // Pull live thresholds from the filter cards so comparison is always current
+            const threshEdge = parseFloat((document.getElementById('cfgMinEdge') || {}).textContent) / 100 || 0.12;
+            const threshConf = parseFloat((document.getElementById('cfgMinConf') || {}).textContent) / 100 || 0.50;
+
+            const html = analyses.map(a => {
+                const isTrade   = a.decision === 'TRADE';
+                const edge      = a.edge != null ? a.edge : 0;
+                const conf      = a.confidence != null ? a.confidence : null;
+                const edgePass  = edge >= threshEdge;
+                const confPass  = conf == null || conf >= threshConf;
+                const edgeCol   = edgePass ? '#3fb950' : '#f85149';
+                const confCol   = confPass ? '#3fb950' : '#f85149';
+
+                // Rejection reason — humanised
+                const rawReason = a.reason || '';
+                let rejLabel = '';
+                if (!isTrade && rawReason) {
+                    const parts = [];
+                    if (rawReason.includes('LOW_EDGE'))        parts.push(`Edge ${(edge*100).toFixed(1)}% < ${(threshEdge*100).toFixed(0)}% min`);
+                    if (rawReason.includes('LOW_CONFIDENCE'))  parts.push(`Conf ${conf != null ? (conf*100).toFixed(0)+'%' : '?'} < ${(threshConf*100).toFixed(0)}% min`);
+                    if (rawReason.includes('YES_BETS_DISABLED')) parts.push('YES side disabled');
+                    if (rawReason.includes('MAX_POSITIONS'))   parts.push('Position limit reached');
+                    if (rawReason.includes('CLUSTER_CAP'))     parts.push('Cluster cap hit');
+                    if (rawReason.includes('RECENTLY_EXITED')) parts.push('Cooldown after exit');
+                    if (rawReason.includes('ALREADY_IN'))      parts.push('Already in this market');
+                    if (parts.length === 0)                    parts.push(rawReason.slice(0, 60));
+                    rejLabel = parts.join(' · ');
+                }
+
+                return `
                 <div class="analysis">
                     <div class="analysis-header">
-                        <div style="flex:1">${a.question}</div>
-                        <span class="analysis-decision ${a.decision === 'TRADE' ? 'trade' : 'skip'}">${a.decision}</span>
+                        <div style="flex:1;font-size:13px;">${a.question}</div>
+                        <span class="analysis-decision ${isTrade ? 'trade' : 'skip'}">${isTrade ? '✓ TRADE' : '✗ SKIP'}</span>
                     </div>
-                    <div style="font-size:12px;color:#8b949e;margin-bottom:8px;">
-                        AI: ${(a.ai_probability*100).toFixed(0)}% → Adj: ${(a.adjusted_probability*100).toFixed(0)}% | 
-                        Market: ${(a.market_price*100).toFixed(0)}¢ | 
-                        Edge: ${a.edge >= 0 ? '+' : ''}${(a.edge*100).toFixed(1)}% |
-                        ${a.side} |
-                        ${a.latency_ms}ms
+                    <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin:6px 0 4px 0;">
+                        <span>AI: <strong>${a.ai_probability != null ? (a.ai_probability*100).toFixed(0)+'%' : '—'}</strong></span>
+                        <span>Market: <strong>${(a.market_price*100).toFixed(0)}¢</strong></span>
+                        <span style="color:${edgeCol};">Edge: <strong>${edge >= 0 ? '+' : ''}${(edge*100).toFixed(1)}%</strong> ${edgePass ? '✓' : '✗ need '+((threshEdge)*100).toFixed(0)+'%'}</span>
+                        ${conf != null ? `<span style="color:${confCol};">Conf: <strong>${(conf*100).toFixed(0)}%</strong> ${confPass ? '✓' : '✗ need '+(threshConf*100).toFixed(0)+'%'}</span>` : ''}
+                        <span style="color:#8b949e;">${a.side || ''} · ${a.latency_ms != null ? a.latency_ms+'ms' : ''}</span>
                     </div>
-                    ${a.key_reasons ? `<div style="font-size:12px;color:#58a6ff;">• ${a.key_reasons.slice(0,2).join('<br>• ')}</div>` : ''}
-                </div>
-            `).join('');
+                    ${rejLabel ? `<div style="font-size:11px;color:#f85149;margin-bottom:4px;">↳ Skipped: ${rejLabel}</div>` : ''}
+                    ${a.key_reasons && a.key_reasons.length ? `<div style="font-size:11px;color:#58a6ff;line-height:1.5;">• ${a.key_reasons.slice(0,2).join('<br>• ')}</div>` : ''}
+                </div>`;
+            }).join('');
             document.getElementById('analyses').innerHTML = html || '<div style="color:#8b949e;font-size:13px;padding:12px;">No analyses yet</div>';
         }
         
