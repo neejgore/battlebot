@@ -3539,8 +3539,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Crypto</div><div class="card-value" id="expCrypto">$0.00</div></div>
                 <div class="card"><div class="card-label">Other</div><div class="card-value" id="expOther">$0.00</div></div>
             </div>
-            <div class="section-title">PORTFOLIO VALUE (Kalshi) <span style="font-size:10px;opacity:0.6;">day-over-day, updates hourly</span></div>
-            <div id="historyChart" style="padding:10px 0;min-height:180px;"></div>
+            <div class="section-title">PORTFOLIO VALUE (Kalshi) <span style="font-size:10px;opacity:0.6;">day-over-day · hourly for today · <span style="color:#3fb950;">green</span> = above $150 · <span style="color:#f85149;">red</span> = below</span></div>
+            <div id="historyChart" style="padding:12px 0 4px 0;min-height:230px;"></div>
             <div class="section-title">Active Positions <span id="positionCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="positions"></div>
             <div class="section-title" style="margin-top:20px">Recent Trades <span id="tradeCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
@@ -3900,54 +3900,250 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         
         // Portfolio value (Kalshi) day-over-day: line + bar chart, updates hourly
         function renderHistoryChart(history, todayHourly) {
+            const container = document.getElementById('historyChart');
             if (!history || history.length === 0) {
-                document.getElementById('historyChart').innerHTML = '<div style="color:#8b949e;font-size:12px;">No history yet. Data updates hourly.</div>';
+                container.innerHTML = '<div style="color:#8b949e;font-size:13px;padding:24px 0;text-align:center;">No history yet — data updates hourly once the bot syncs with Kalshi.</div>';
                 return;
             }
-            const deposits = 150;
-            // history[0] = today, history[1] = yesterday, ...; show oldest left, newest right
-            const ordered = history.slice().reverse();
-            const valid = ordered.filter(h => h.account_value != null);
-            if (valid.length === 0) {
-                document.getElementById('historyChart').innerHTML = '<div style="color:#8b949e;font-size:12px;">No portfolio values yet. Values update hourly.</div>';
-                return;
-            }
-            const values = ordered.map(h => h.account_value != null ? h.account_value : null);
-            const minVal = Math.min(...valid.map(h => h.account_value), deposits) - 10;
-            const maxVal = Math.max(...valid.map(h => h.account_value), deposits) + 10;
-            const range = maxVal - minVal || 1;
-            const w = 560, h = 160, pad = { top: 8, right: 8, bottom: 28, left: 36 };
-            const xScale = (i) => pad.left + (i / (values.length - 1 || 1)) * (w - pad.left - pad.right);
-            const yScale = (v) => pad.top + (1 - (v - minVal) / range) * (h - pad.top - pad.bottom);
-            const depositY = yScale(deposits);
-            let path = '';
-            let prev = null;
-            for (let i = 0; i < values.length; i++) {
-                if (values[i] == null) continue;
-                const x = xScale(i);
-                const y = yScale(values[i]);
-                path += (prev === null ? 'M' : 'L') + x + ',' + y;
-                prev = { x, y };
-            }
-            const areaPath = path ? path + ' L' + xScale(values.length - 1) + ',' + (h - pad.bottom) + ' L' + pad.left + ',' + (h - pad.bottom) + ' Z' : '';
-            const labels = ordered.map((d, i) => {
-                const day = new Date(d.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
-                const val = values[i];
-                const x = xScale(i);
-                return { day, val, x };
+
+            const DEPOSITS = parseFloat(document.getElementById('totalReturn') ? 150 : 150);
+            const ordered = history.slice().reverse(); // oldest → newest
+            const todayStr = new Date().toISOString().slice(0, 10);
+
+            // Build unified series: past days (daily) + today (hourly if available)
+            const pastDays = ordered.filter(h => h.date < todayStr && h.account_value != null);
+            const todayDay  = ordered.find(h => h.date === todayStr);
+
+            let points = [];
+            pastDays.forEach(h => {
+                const d = new Date(h.date + 'T12:00:00');
+                points.push({
+                    label:     d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+                    dayLabel:  d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+                    value:     h.account_value,
+                    isToday:   false, isHourly: false,
+                    high:      h.intraday_high, low: h.intraday_low,
+                });
             });
+
+            const todaySepIdx = points.length; // index where today starts
+
+            if (todayHourly && todayHourly.length > 0) {
+                todayHourly.forEach((pt, i) => {
+                    const hh = String(pt.hour).padStart(2,'0');
+                    points.push({
+                        label:    hh + ':00',
+                        dayLabel: 'Today ' + hh + ':00',
+                        value:    pt.value,
+                        isToday:  true, isHourly: true,
+                        isLatest: i === todayHourly.length - 1,
+                    });
+                });
+            } else if (todayDay && todayDay.account_value != null) {
+                points.push({
+                    label: 'Today', dayLabel: 'Today',
+                    value: todayDay.account_value,
+                    isToday: true, isHourly: false,
+                    high: todayDay.intraday_high, low: todayDay.intraday_low,
+                    isLatest: true,
+                });
+            }
+
+            if (points.length === 0) {
+                container.innerHTML = '<div style="color:#8b949e;font-size:13px;padding:24px 0;text-align:center;">No portfolio values recorded yet. Check back soon.</div>';
+                return;
+            }
+            // Ensure at least 2 points for a visible line
+            if (points.length === 1) {
+                points.unshift({ label: '', dayLabel: '', value: DEPOSITS, isToday: false, isHourly: false, ghost: true });
+            }
+
+            // ── Dimensions ────────────────────────────────────────────────────
+            const W = 780, H = 220;
+            const pad = { top: 28, right: 78, bottom: 38, left: 54 };
+            const cW = W - pad.left - pad.right;
+            const cH = H - pad.top - pad.bottom;
+
+            const allVals = points.map(p => p.value).filter(v => v != null);
+            const highVals = points.filter(p => p.high).map(p => p.high);
+            const spread = Math.max(...[...allVals, ...highVals, DEPOSITS]) - Math.min(...allVals, DEPOSITS);
+            const vPad = Math.max(spread * 0.18, 3);
+            const minY = Math.max(0, Math.min(...allVals, DEPOSITS) - vPad);
+            const maxY = Math.max(...allVals, ...highVals, DEPOSITS) + vPad;
+            const yRange = maxY - minY || 1;
+
+            const xS = i  => pad.left + (i / Math.max(points.length - 1, 1)) * cW;
+            const yS = v  => pad.top  + (1 - (v - minY) / yRange) * cH;
+            const depY    = yS(DEPOSITS);
+            const botY    = pad.top + cH;
+
+            // ── Y-axis ticks ──────────────────────────────────────────────────
+            const rawStep = (maxY - minY) / 4;
+            const mag = Math.pow(10, Math.floor(Math.log10(rawStep || 1)));
+            const niceStep = [1,2,5,10].map(f => f * mag).find(s => s >= rawStep) || mag;
+            const ticks = [];
+            for (let t = Math.ceil(minY / niceStep) * niceStep; t <= maxY + 0.001; t = Math.round((t + niceStep) * 1e6) / 1e6) {
+                ticks.push(Math.round(t * 100) / 100);
+            }
+            if (!ticks.some(t => Math.abs(t - DEPOSITS) < 0.01)) ticks.push(DEPOSITS);
+
+            // ── Smooth Catmull-Rom path through valid points ──────────────────
+            const vpts = points
+                .map((p, i) => ({ ...p, x: xS(i), y: p.value != null ? yS(p.value) : null }))
+                .filter(p => p.y != null);
+
+            function catmull(pts) {
+                if (pts.length === 1) return `M${pts[0].x},${pts[0].y}`;
+                let d = `M${pts[0].x.toFixed(2)},${pts[0].y.toFixed(2)}`;
+                for (let i = 0; i < pts.length - 1; i++) {
+                    const p0 = pts[Math.max(0, i-1)], p1 = pts[i],
+                          p2 = pts[i+1],               p3 = pts[Math.min(pts.length-1, i+2)];
+                    const t = 0.35;
+                    const cx1 = (p1.x + (p2.x - p0.x) * t).toFixed(2);
+                    const cy1 = (p1.y + (p2.y - p0.y) * t).toFixed(2);
+                    const cx2 = (p2.x - (p3.x - p1.x) * t).toFixed(2);
+                    const cy2 = (p2.y - (p3.y - p1.y) * t).toFixed(2);
+                    d += ` C${cx1},${cy1} ${cx2},${cy2} ${p2.x.toFixed(2)},${p2.y.toFixed(2)}`;
+                }
+                return d;
+            }
+
+            const linePath = catmull(vpts);
+            const fp = vpts[0], lp = vpts[vpts.length - 1];
+            const areaPath = linePath + ` L${lp.x.toFixed(2)},${botY} L${fp.x.toFixed(2)},${botY} Z`;
+
+            const curVal  = lp.value;
+            const curY    = lp.y;
+            const curCol  = curVal >= DEPOSITS ? '#3fb950' : '#f85149';
+            const uid     = 'c' + Date.now();
+
+            // ── Today high watermark ──────────────────────────────────────────
+            const todayHigh    = todayDay ? todayDay.intraday_high  : null;
+            const todayLow     = todayDay ? todayDay.intraday_low   : null;
+            const todayStart   = todayDay ? todayDay.start_of_day_value : null;
+            const peakGiveback = todayHigh && curVal ? (todayHigh - curVal) : 0;
+            const todayHighY   = todayHigh ? yS(todayHigh) : null;
+            const todaySepX    = (todaySepIdx > 0 && todaySepIdx < points.length) ? xS(todaySepIdx) : null;
+
+            // ── X labels: pick at most 12, always include first & last ────────
+            const maxLbls = 12;
+            const step    = Math.max(1, Math.floor(points.length / maxLbls));
+            const lblIdxs = new Set();
+            for (let i = 0; i < points.length; i += step) lblIdxs.add(i);
+            lblIdxs.add(points.length - 1);
+
+            // ── Build SVG ─────────────────────────────────────────────────────
             const svg = `
-                <svg viewBox="0 0 ${w} ${h}" style="max-width:100%;height:auto;">
-                    <line x1="${pad.left}" y1="${depositY}" x2="${w - pad.right}" y2="${depositY}" stroke="#8b949e" stroke-width="1" stroke-dasharray="4,4"/>
-                    <text x="${pad.left - 4}" y="${depositY + 4}" font-size="10" fill="#8b949e" text-anchor="end">$${deposits}</text>
-                    ${areaPath ? '<path d="' + areaPath + '" fill="rgba(35,134,54,0.15)" stroke="none"/>' : ''}
-                    ${path ? '<path d="' + path + '" fill="none" stroke="#238636" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>' : ''}
-                    ${labels.filter(l => l.val != null).map(l => '<circle cx="' + l.x + '" cy="' + yScale(l.val) + '" r="3" fill="' + (l.val >= deposits ? '#238636' : '#f85149') + '"/>').join('')}
-                    ${labels.map((l, i) => '<text x="' + l.x + '" y="' + (h - 4) + '" font-size="9" fill="#8b949e" text-anchor="middle">' + (new Date(ordered[i].date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short' })) + '</text>').join('')}
-                </svg>
-                <div style="font-size:11px;color:#8b949e;text-align:center;margin-top:4px;">Portfolio value from Kalshi. Dashed line = $150 deposited. Updates hourly.</div>
-            `;
-            document.getElementById('historyChart').innerHTML = svg;
+<svg viewBox="0 0 ${W} ${H}" style="max-width:100%;height:auto;display:block;overflow:visible;" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="${uid}gA" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3fb950" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#3fb950" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="${uid}gB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f85149" stop-opacity="0.03"/>
+      <stop offset="100%" stop-color="#f85149" stop-opacity="0.55"/>
+    </linearGradient>
+    <clipPath id="${uid}ca"><rect x="${pad.left}" y="${pad.top}" width="${cW}" height="${Math.max(0,(depY-pad.top).toFixed(2))}"/></clipPath>
+    <clipPath id="${uid}cb"><rect x="${pad.left}" y="${depY.toFixed(2)}" width="${cW}" height="${Math.max(0,(botY-depY).toFixed(2))}"/></clipPath>
+    <filter id="${uid}glow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+
+  <!-- Background chart area -->
+  <rect x="${pad.left}" y="${pad.top}" width="${cW}" height="${cH}" fill="#0d1117" rx="2" opacity="0.4"/>
+
+  <!-- Y grid lines + labels -->
+  ${ticks.map(t => {
+    const ty = yS(t).toFixed(2);
+    const isDep = Math.abs(t - DEPOSITS) < 0.01;
+    return `<line x1="${pad.left}" y1="${ty}" x2="${pad.left+cW}" y2="${ty}"
+              stroke="${isDep ? '#58a6ff' : '#21262d'}" stroke-width="${isDep ? 1.2 : 0.5}"
+              stroke-dasharray="${isDep ? '5,3' : 'none'}" opacity="${isDep ? 0.9 : 1}"/>
+    <text x="${(pad.left-7).toFixed(1)}" y="${(parseFloat(ty)+4).toFixed(1)}"
+          font-size="10" fill="${isDep ? '#58a6ff' : '#484f58'}" text-anchor="end"
+          font-weight="${isDep ? 'bold' : 'normal'}">$${t%1===0?t:t.toFixed(0)}</text>`;
+  }).join('')}
+
+  <!-- Deposit label on right -->
+  <text x="${(pad.left+cW+5).toFixed(1)}" y="${(depY+4).toFixed(1)}"
+        font-size="9" fill="#58a6ff" opacity="0.8">deposited</text>
+
+  <!-- Area fills (split green above / red below deposit line) -->
+  <path d="${areaPath}" clip-path="url(#${uid}ca)" fill="url(#${uid}gA)" stroke="none"/>
+  <path d="${areaPath}" clip-path="url(#${uid}cb)" fill="url(#${uid}gB)" stroke="none"/>
+
+  <!-- Today separator -->
+  ${todaySepX != null ? `
+  <line x1="${todaySepX.toFixed(2)}" y1="${pad.top}" x2="${todaySepX.toFixed(2)}" y2="${botY}"
+        stroke="#58a6ff" stroke-width="0.7" stroke-dasharray="3,3" opacity="0.5"/>
+  <rect x="${(todaySepX-16).toFixed(1)}" y="${(pad.top-20).toFixed(1)}" width="32" height="14" rx="3"
+        fill="#1f2937" stroke="#58a6ff" stroke-width="0.5" opacity="0.8"/>
+  <text x="${todaySepX.toFixed(1)}" y="${(pad.top-9).toFixed(1)}"
+        font-size="9" fill="#58a6ff" text-anchor="middle" font-weight="bold">TODAY</text>` : ''}
+
+  <!-- Today intraday high watermark (peak giveback indicator) -->
+  ${todayHighY != null && peakGiveback > 0.5 && todaySepX != null ? `
+  <line x1="${todaySepX.toFixed(1)}" y1="${todayHighY.toFixed(1)}" x2="${(lp.x+4).toFixed(1)}" y2="${todayHighY.toFixed(1)}"
+        stroke="#e3b341" stroke-width="1" stroke-dasharray="3,2" opacity="0.75"/>
+  <circle cx="${todaySepX.toFixed(1)}" cy="${todayHighY.toFixed(1)}" r="2.5" fill="#e3b341" opacity="0.8"/>
+  <text x="${((todaySepX + lp.x)/2).toFixed(1)}" y="${(todayHighY-5).toFixed(1)}"
+        font-size="9" fill="#e3b341" text-anchor="middle" opacity="0.9">↑ peak $${todayHigh.toFixed(2)}</text>
+  <line x1="${lp.x.toFixed(1)}" y1="${todayHighY.toFixed(1)}" x2="${lp.x.toFixed(1)}" y2="${curY.toFixed(1)}"
+        stroke="#e3b341" stroke-width="0.8" stroke-dasharray="2,2" opacity="0.6"/>
+  <text x="${(lp.x+6).toFixed(1)}" y="${((todayHighY+curY)/2+4).toFixed(1)}"
+        font-size="9" fill="#e3b341" opacity="0.85">-$${peakGiveback.toFixed(2)}</text>` : ''}
+
+  <!-- Coloured line (above deposit = green, below = red) -->
+  <path d="${linePath}" clip-path="url(#${uid}ca)" fill="none" stroke="#3fb950" stroke-width="2.2"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${linePath}" clip-path="url(#${uid}cb)" fill="none" stroke="#f85149" stroke-width="2.2"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Past day data points -->
+  ${vpts.filter(p => !p.isToday && !p.ghost).map(p => {
+    const col = p.value >= DEPOSITS ? '#3fb950' : '#f85149';
+    return `<circle cx="${p.x.toFixed(2)}" cy="${p.y.toFixed(2)}" r="4"
+              fill="${col}" stroke="#0d1117" stroke-width="1.5">
+              <title>${p.dayLabel}: $${p.value.toFixed(2)}</title></circle>`;
+  }).join('')}
+
+  <!-- Today hourly dots (smaller) -->
+  ${vpts.filter(p => p.isToday && !p.isLatest).map(p => {
+    const col = p.value >= DEPOSITS ? '#3fb950' : '#f85149';
+    return `<circle cx="${p.x.toFixed(2)}" cy="${p.y.toFixed(2)}" r="2.5"
+              fill="${col}" stroke="#0d1117" stroke-width="1" opacity="0.65">
+              <title>${p.dayLabel}: $${p.value.toFixed(2)}</title></circle>`;
+  }).join('')}
+
+  <!-- Current value dot (highlighted) -->
+  <circle cx="${lp.x.toFixed(2)}" cy="${curY.toFixed(2)}" r="9" fill="${curCol}" opacity="0.12"/>
+  <circle cx="${lp.x.toFixed(2)}" cy="${curY.toFixed(2)}" r="5" fill="${curCol}"
+          stroke="#0d1117" stroke-width="2" filter="url(#${uid}glow)"/>
+
+  <!-- Current value badge -->
+  <rect x="${(pad.left+cW+8).toFixed(1)}" y="${(curY-11).toFixed(1)}" width="56" height="20" rx="5"
+        fill="${curVal >= DEPOSITS ? '#238636' : '#da3633'}"/>
+  <text x="${(pad.left+cW+36).toFixed(1)}" y="${(curY+3.5).toFixed(1)}"
+        font-size="11.5" fill="white" text-anchor="middle" font-weight="bold">$${curVal.toFixed(2)}</text>
+
+  <!-- X-axis labels -->
+  ${points.map((p, i) => {
+    if (!lblIdxs.has(i) || p.ghost) return '';
+    const col = p.isToday ? '#58a6ff' : '#484f58';
+    return `<text x="${xS(i).toFixed(1)}" y="${(H-6).toFixed(1)}"
+              font-size="9.5" fill="${col}" text-anchor="middle">${p.label}</text>`;
+  }).join('')}
+
+  <!-- Chart border -->
+  <rect x="${pad.left}" y="${pad.top}" width="${cW}" height="${cH}"
+        fill="none" stroke="#21262d" stroke-width="0.5" rx="2"/>
+</svg>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding:0 ${pad.left}px;">
+  <span style="font-size:10px;color:#484f58;">Portfolio value from Kalshi API · <span style="color:#58a6ff;">── $${DEPOSITS} deposited</span> · Updates every ~5 min</span>
+  ${peakGiveback > 0.5 ? `<span style="font-size:10px;color:#e3b341;">⚠ Today's peak was $${(todayHigh||0).toFixed(2)} · gave back $${peakGiveback.toFixed(2)}</span>` : ''}
+</div>`;
+
+            container.innerHTML = svg;
         }
         
         connect();
