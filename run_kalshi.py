@@ -517,6 +517,9 @@ class KalshiBattleBot:
                 self._kalshi_total = self._kalshi_cash + self._kalshi_portfolio
                 
                 print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, Positions=${self._kalshi_portfolio:.2f}, Total=${self._kalshi_total:.2f}")
+                
+                # Keep intraday peak in sync with the same number the user sees on the dashboard
+                await self._save_daily_snapshot(self._kalshi_total, self._kalshi_cash, self._kalshi_portfolio)
             except Exception as e:
                 print(f"[Sync] Could not fetch balance: {e}")
                 import traceback
@@ -3022,7 +3025,9 @@ class KalshiBattleBot:
             
             # 3. Calculate account metrics
             total_deposits = float(os.getenv('TOTAL_DEPOSITS', '150'))  # User's total deposits
-            account_value = cash + total_position_value
+            # Prefer Kalshi's own portfolio valuation (same number shown in the ACCOUNT section)
+            # so that Today's Peak tracks the same figure the user sees.
+            account_value = self._kalshi_total if self._kalshi_total is not None else (cash + total_position_value)
             total_return = account_value - total_deposits
             return_pct = (total_return / total_deposits * 100) if total_deposits > 0 else 0
             
