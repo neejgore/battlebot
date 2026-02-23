@@ -1570,12 +1570,17 @@ class KalshiBattleBot:
                         # Tennis
                         'tennis', 'atp', 'wta',
                         # Fighting
-                        'ufc', 'boxing', 'mma',
+                        'ufc', 'boxing', 'mma', 'fight', 'bout', 'knockout', 'k.o.',
+                        'heavyweight', 'lightweight', 'middleweight', 'welterweight',
+                        # Generic vs. matchup (two fighters/teams)
+                        ' vs ', ' vs. ',
                         # Other sports
-                        'f1', 'nascar', 'olympics', 'world cup',
+                        'f1', 'nascar', 'olympics', 'world cup', 'world series',
+                        'super bowl', 'championship', 'tournament', 'playoffs',
                         # Generic sports terms
-                        'wins the', 'win the game', 'beat', 'defeat',
+                        'wins the match', 'win the game', 'beat ', 'defeats ',
                         'rebounds', 'assists', 'three-pointers', '3-pointers',
+                        'pitcher', 'batter', 'innings', 'overtime', 'penalty kick',
                     ]
                     if any(pattern in question_lower for pattern in sports_patterns):
                         continue  # SKIP ALL SPORTS - no edge, high losses
@@ -1585,7 +1590,8 @@ class KalshiBattleBot:
                     sports_ticker_patterns = [
                         'KXNBA', 'KXNFL', 'KXMLB', 'KXNHL', 'KXNCAA', 'KXPGA', 'KXLPGA',
                         'KXUFC', 'KXBOX', 'KXTEN', 'KXSOC', 'KXWNH', 'KXWOH',
-                        'KXDPWORLD', 'KXNBL', 'KXBRASIL',
+                        'KXDPWORLD', 'KXNBL', 'KXBRASIL', 'KXWCC', 'KXFIGHT',
+                        'KXMATCH', 'KXBOUT', 'KXCHAMP',
                     ]
                     if any(pattern in ticker_upper for pattern in sports_ticker_patterns):
                         continue  # SKIP sports by ticker pattern
