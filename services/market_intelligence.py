@@ -139,6 +139,23 @@ class NewsService:
         terms = self._extract_search_terms(question)
         question_lower = question.lower()
         
+        # DOGE / federal spending cuts — highly specific to current events
+        if any(k in question_lower for k in ['doge', 'elon', 'federal spending', 'budget cut',
+                                              'cut between', 'cut less', 'cut more', 'cut the budget']):
+            import re as _re
+            amounts = _re.findall(r'\$[\d,]+[bBmM]?', question)
+            if amounts:
+                return f'DOGE federal spending cuts {" ".join(amounts[:2])} update 2025'
+            return 'DOGE federal spending cuts total amount 2025 latest'
+
+        # Deportation / immigration enforcement
+        if any(k in question_lower for k in ['deport', 'immigr', 'border', 'ice ', 'removed']):
+            import re as _re
+            nums = _re.findall(r'[\d,]+,\d{3}', question)
+            if nums:
+                return f'Trump deportation total numbers {nums[0]} 2025'
+            return 'Trump deportation total numbers 2025 latest update'
+
         # Politics: Focus on specific names and actions
         if category and category.lower() == 'politics':
             # Extract person names (capitalized words)
@@ -347,6 +364,55 @@ class NewsService:
         
         return news_items
     
+    async def _fetch_reddit_rss(self, question: str, max_results: int = 5) -> list[NewsItem]:
+        """Fetch top posts from relevant subreddits via free RSS — no API key needed."""
+        question_lower = question.lower()
+
+        # Pick subreddits based on market topic
+        subreddits = []
+        if any(k in question_lower for k in ['doge', 'elon', 'federal spending', 'budget cut']):
+            subreddits = ['DOGE', 'elonmusk', 'politics']
+        elif any(k in question_lower for k in ['deport', 'immigr', 'border', 'ice ']):
+            subreddits = ['immigration', 'politics', 'worldnews']
+        elif any(k in question_lower for k in ['trump', 'maga', 'executive order', 'white house']):
+            subreddits = ['politics', 'Conservative', 'worldnews']
+        elif any(k in question_lower for k in ['fed', 'rate', 'cpi', 'inflation', 'gdp', 'recession']):
+            subreddits = ['Economics', 'investing', 'wallstreetbets']
+        elif any(k in question_lower for k in ['bitcoin', 'btc', 'crypto', 'eth']):
+            subreddits = ['Bitcoin', 'CryptoCurrency', 'investing']
+        elif any(k in question_lower for k in ['ukraine', 'russia', 'china', 'taiwan', 'israel', 'iran']):
+            subreddits = ['worldnews', 'geopolitics']
+        else:
+            subreddits = ['news', 'worldnews']
+
+        news_items = []
+        seen_titles: set[str] = set()
+
+        for sub in subreddits[:2]:  # Max 2 subreddits
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    resp = await client.get(
+                        f"https://www.reddit.com/r/{sub}/hot.rss",
+                        params={"limit": 10},
+                        headers={"User-Agent": "battlebot/1.0 (prediction market research)"},
+                        follow_redirects=True,
+                    )
+                    if resp.status_code == 200:
+                        titles = re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>', resp.text)
+                        titles = [t for t in titles if len(t) > 10 and t not in seen_titles]
+                        for title in titles[:3]:
+                            seen_titles.add(title)
+                            news_items.append(NewsItem(
+                                title=title[:200],
+                                snippet=title[:500],
+                                source=f"r/{sub}",
+                                url=f"https://reddit.com/r/{sub}",
+                            ))
+            except Exception as e:
+                logger.debug(f"[Reddit RSS] r/{sub} failed: {e}")
+
+        return news_items[:max_results]
+
     async def _fetch_google_rss(self, query: str, max_results: int = 5) -> list[NewsItem]:
         """Fetch news using Google News RSS (free fallback)."""
         from urllib.parse import quote
@@ -422,13 +488,31 @@ class NewsService:
         query = self._build_search_query(question, category)
         logger.info(f"[News] Query: '{query}' | Category: {category or 'none'}")
         news_items = []
-        
-        # Try Brave first (if configured)
-        if self._brave_api_key:
+
+        # Determine if Reddit RSS would add signal for this market type
+        reddit_categories = {'politics', 'world', 'economics', 'crypto'}
+        use_reddit = (
+            (category and category.lower() in reddit_categories) or
+            any(k in question.lower() for k in [
+                'doge', 'elon', 'trump', 'deport', 'fed', 'rate', 'bitcoin',
+                'ukraine', 'china', 'taiwan', 'israel', 'congress', 'senate',
+            ])
+        )
+
+        # Run Brave/Google and Reddit in parallel where useful
+        if self._brave_api_key and use_reddit:
+            brave_task = self._fetch_brave(query, max_results)
+            reddit_task = self._fetch_reddit_rss(question, 3)
+            brave_results, reddit_results = await asyncio.gather(brave_task, reddit_task)
+            news_items = brave_results + reddit_results
+        elif self._brave_api_key:
             news_items = await self._fetch_brave(query, max_results)
-        
-        # Fallback to Google News RSS
-        if not news_items:
+        elif use_reddit:
+            google_task = self._fetch_google_rss(query, max_results)
+            reddit_task = self._fetch_reddit_rss(question, 3)
+            google_results, reddit_results = await asyncio.gather(google_task, reddit_task)
+            news_items = google_results + reddit_results
+        else:
             news_items = await self._fetch_google_rss(query, max_results)
         
         # Dedupe and limit
@@ -643,36 +727,60 @@ class DomainDataService:
         return data_items
     
     async def _fetch_economics_data(self, question: str) -> list[DomainData]:
-        """Fetch economic indicator context."""
-        # For economics, we mainly rely on news but can add structured data
-        # from FRED API if available in the future
+        """Fetch real economic data from FRED API (free, no key required)."""
         data_items = []
-        
-        # Detect economic indicators mentioned
-        indicators = {
-            'inflation': 'Consumer Price Index (CPI)',
-            'cpi': 'Consumer Price Index (CPI)',
-            'unemployment': 'Unemployment Rate',
-            'jobs': 'Nonfarm Payrolls',
-            'gdp': 'Gross Domestic Product',
-            'interest rate': 'Federal Funds Rate',
-            'fed': 'Federal Reserve Policy',
-        }
-        
         question_lower = question.lower()
-        for keyword, indicator_name in indicators.items():
-            if keyword in question_lower:
-                data_items.append(DomainData(
-                    category="economics",
-                    data_type="indicator_context",
-                    data={
-                        "indicator": indicator_name,
-                        "note": f"Market relates to {indicator_name}. Check latest economic releases.",
-                    },
-                    source="Internal",
-                ))
-                break
-        
+
+        # Map market keywords to FRED series IDs
+        # FRED API is completely free and requires no API key for these public series
+        fred_series = []
+        if any(k in question_lower for k in ['fed', 'interest rate', 'rate hike', 'rate cut', 'fomc']):
+            fred_series.append(('FEDFUNDS', 'Federal Funds Rate'))
+        if any(k in question_lower for k in ['inflation', 'cpi', 'consumer price']):
+            fred_series.append(('CPIAUCSL', 'CPI (All Urban Consumers)'))
+        if any(k in question_lower for k in ['unemployment', 'jobs', 'payroll', 'employment']):
+            fred_series.append(('UNRATE', 'Unemployment Rate'))
+        if any(k in question_lower for k in ['gdp', 'recession', 'growth']):
+            fred_series.append(('GDP', 'US GDP'))
+        if any(k in question_lower for k in ['10 year', '10-year', 'treasury', 'yield']):
+            fred_series.append(('DGS10', '10-Year Treasury Yield'))
+
+        for series_id, series_name in fred_series[:2]:  # Max 2 series per market
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    resp = await client.get(
+                        "https://fred.stlouisfed.org/graph/fredgraph.csv",
+                        params={"id": series_id, "vintage_date": datetime.utcnow().strftime('%Y-%m-%d')},
+                        headers={"User-Agent": "battlebot/1.0"},
+                    )
+                    if resp.status_code == 200:
+                        lines = [l for l in resp.text.strip().splitlines() if l and not l.startswith('DATE')]
+                        if lines:
+                            # Last two non-empty data rows
+                            rows = [r for r in lines[-5:] if '.' in r]
+                            if rows:
+                                last = rows[-1].split(',')
+                                prev = rows[-2].split(',') if len(rows) >= 2 else last
+                                last_date, last_val = last[0], last[1]
+                                prev_val = prev[1] if len(prev) > 1 else last_val
+                                try:
+                                    change = float(last_val) - float(prev_val)
+                                    data_items.append(DomainData(
+                                        category="economics",
+                                        data_type="fred_indicator",
+                                        data={
+                                            "series": series_name,
+                                            "latest_value": last_val,
+                                            "as_of": last_date,
+                                            "change_from_prior": f"{change:+.3f}",
+                                        },
+                                        source="FRED (St. Louis Fed)",
+                                    ))
+                                except ValueError:
+                                    pass
+            except Exception as e:
+                logger.debug(f"[FRED] {series_id} fetch failed: {e}")
+
         return data_items
     
     async def _fetch_sports_context(self, question: str) -> list[DomainData]:
@@ -970,7 +1078,7 @@ class MarketIntelligenceService:
         # Build domain summary
         domain_summary = ""
         if domain_data:
-            for item in domain_data[:2]:
+            for item in domain_data[:3]:
                 if item.data_type == "price":
                     d = item.data
                     price_usd = d.get('price_usd')
@@ -979,6 +1087,12 @@ class MarketIntelligenceService:
                         domain_summary += f"- {d.get('asset', 'Asset')} price: ${price_usd:,.2f} ({change_24h:+.1f}% 24h)\n"
                     else:
                         domain_summary += f"- {d.get('asset', 'Asset')} price: N/A\n"
+                elif item.data_type == "fred_indicator":
+                    d = item.data
+                    domain_summary += (
+                        f"- {d['series']}: {d['latest_value']} (as of {d['as_of']},"
+                        f" change: {d['change_from_prior']}) [FRED]\n"
+                    )
                 else:
                     note = item.data.get('note', '')
                     if note:
