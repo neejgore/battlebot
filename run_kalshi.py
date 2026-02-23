@@ -764,21 +764,25 @@ class KalshiBattleBot:
         without_news['win_rate'] = without_news['wins'] / without_news['trades'] if without_news['trades'] > 0 else 0
         
         # Build summary
-        lines = ["=== NEWS INTELLIGENCE EFFECTIVENESS ==="]
-        
-        if with_news['trades'] > 0:
-            lines.append(f"\nWITH NEWS ({with_news['trades']} trades):")
-            lines.append(f"  Win Rate: {with_news['win_rate']*100:.0f}% ({with_news['wins']}W/{with_news['losses']}L)")
-            lines.append(f"  P&L: ${with_news['pnl']:+.2f}")
-        else:
-            lines.append("\nWITH NEWS: No trades yet")
-        
-        if without_news['trades'] > 0:
-            lines.append(f"\nWITHOUT NEWS ({without_news['trades']} trades):")
-            lines.append(f"  Win Rate: {without_news['win_rate']*100:.0f}% ({without_news['wins']}W/{without_news['losses']}L)")
-            lines.append(f"  P&L: ${without_news['pnl']:+.2f}")
-        else:
-            lines.append("\nWITHOUT NEWS: No trades yet")
+        wn_str = (
+            f"WITH NEWS    ({with_news['trades']:>3} trades): "
+            f"{with_news['win_rate']*100:.0f}% win rate "
+            f"({with_news['wins']}W/{with_news['losses']}L) "
+            f"P&L ${with_news['pnl']:+.2f}"
+        ) if with_news['trades'] > 0 else "WITH NEWS: No trades yet"
+
+        non_str = (
+            f"WITHOUT NEWS ({without_news['trades']:>3} trades): "
+            f"{without_news['win_rate']*100:.0f}% win rate "
+            f"({without_news['wins']}W/{without_news['losses']}L) "
+            f"P&L ${without_news['pnl']:+.2f}"
+        ) if without_news['trades'] > 0 else "WITHOUT NEWS: No trades yet"
+
+        lines = [
+            "=== NEWS INTELLIGENCE EFFECTIVENESS ===",
+            wn_str,
+            non_str,
+        ]
         
         # Conclusion
         if with_news['trades'] >= 3 and without_news['trades'] >= 3:
@@ -1626,13 +1630,17 @@ class KalshiBattleBot:
                     # These consistently produce LOW_CONFIDENCE signals and waste API credits
                     # Filter markets by explicit country/region name — avoids false positives
                     # from generic terms like "house of rep" matching foreign parliaments
-                    no_intel_countries = [
+                    no_intel_patterns = [
+                        # Foreign countries/elections
                         'nepal', 'kenya', 'nigeria', 'pakistan', 'bangladesh',
                         'ethiopia', 'myanmar', 'cambodia', 'laos', 'mozambique',
                         'zimbabwe', 'zambia', 'malawi', 'botswana', 'namibia',
                         'colombian chamber', 'colombia election',
+                        # Foreign central banks — consistently LOW_CONFIDENCE, no news edge
+                        "people's bank of china", 'pboc', 'bank of china cut',
+                        'ecb cut', 'bank of england cut', 'bank of japan cut',
                     ]
-                    if any(p in question_lower for p in no_intel_countries):
+                    if any(p in question_lower for p in no_intel_patterns):
                         continue  # Skip: no reliable news intelligence for this market
 
                     # FILTER 3: Skip markets where probability is extreme (< 10% or > 90%)
