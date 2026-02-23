@@ -1012,12 +1012,12 @@ class KalshiBattleBot:
         print(f"  News Integration: {'ON' if self._use_intelligence else 'OFF'}")
         # Check if Brave is configured
         try:
-            brave_key = self._intelligence._news_service._brave_api_key
+            brave_key = self._intelligence.news_service._brave_api_key
             if brave_key:
-                print(f"  News Source: BRAVE SEARCH API (configured)")
+                print(f"  News Source: Brave Search API + Reddit RSS (configured)")
             else:
-                print(f"  News Source: Google News RSS (fallback)")
-        except:
+                print(f"  News Source: Google News RSS + Reddit RSS (no Brave key)")
+        except Exception:
             print(f"  News Source: Unknown")
         print(f"  Prefer Inefficient Markets: {'ON' if self._prefer_inefficient else 'OFF'}")
         print(f"  Contrarian Timing: {'ON' if self._use_contrarian else 'OFF'}")
@@ -1652,7 +1652,7 @@ class KalshiBattleBot:
                 if loop_counter >= INTEL_LOG_INTERVAL:
                     loop_counter = 0
                     try:
-                        news_stats = self._intelligence._news_service.get_usage_stats()
+                        news_stats = self._intelligence.news_service.get_usage_stats()
                         intel_eff = self._get_intel_effectiveness()
                         print(f"\n[INTEL STATUS] Brave searches: {news_stats.get('brave_searches', 0)}, Cache size: {news_stats.get('cache_size', 0)}")
                         if intel_eff.get('with_news', {}).get('trades', 0) > 0 or intel_eff.get('without_news', {}).get('trades', 0) > 0:
