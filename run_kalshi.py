@@ -3615,7 +3615,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Total vs <span id="depositsLabel">$150</span> deposited</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
                 <div class="card"><div class="card-label">Today</div><div class="card-value" id="todayPnl">—</div><div class="card-sub" id="todayPnlSub">vs start of day</div></div>
                 <div class="card"><div class="card-label">Today's Peak</div><div class="card-value" id="intradayHigh">—</div><div class="card-sub" id="peakGiveback">intraday high watermark</div></div>
-                <div class="card"><div class="card-label">Open positions</div><div class="card-value" id="positionStatus">0</div><div class="card-sub" id="positionStatusSub">ahead / behind</div></div>
+                <div class="card"><div class="card-label">Positions</div><div class="card-value" id="positionStatus">0 winning / 0 losing</div><div class="card-sub" id="positionStatusSub">vs entry price</div></div>
             </div>
             <div class="section-title">TODAY'S ACTIVITY</div>
             <div class="grid">
@@ -3822,8 +3822,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     todaySubEl.textContent = 'vs start of day (set tomorrow)';
                 }
                 
-                document.getElementById('positionStatus').textContent = p.positions.winning + ' / ' + p.positions.losing;
-                document.getElementById('positionStatusSub').textContent = 'positions ahead / behind';
+                document.getElementById('positionStatus').textContent = p.positions.winning + ' winning / ' + p.positions.losing + ' losing';
+                document.getElementById('positionStatusSub').textContent = 'vs entry price';
                 // Keep Settlements tab deposit label in sync
                 const sdl = document.getElementById('settlDepositsLabel');
                 if (sdl) sdl.textContent = '$' + (p.account.total_deposits || 150);
