@@ -39,9 +39,10 @@ class KalshiBattleBot:
         # Config from env - STRICT defaults for profitability
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
-        self.min_edge = max(0.10, float(os.getenv('MIN_EDGE', 0.10)))  # 10% min edge - enforce minimum
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.30))  # 30% confidence - Claude is honest about uncertainty
+        self.min_edge = max(0.12, float(os.getenv('MIN_EDGE', 0.12)))  # 12% min edge - raised from 10% to filter noise
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.50))  # 50% confidence - raised from 30%; only trade when AI is genuinely confident
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 25))  # $25 max - bigger bets on better opportunities
+        self.max_days_to_resolution = float(os.getenv('MAX_DAYS_TO_RESOLUTION', 45))  # Skip markets resolving > 45 days out
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.20))  # 20% Kelly - higher conviction on filtered bets
         self.max_oi_pct = float(os.getenv('MAX_OI_PCT', 0.10))  # Max 10% of open interest
         self.simulate_prices = os.getenv('SIMULATE_PRICES', 'false').lower() == 'true'
@@ -1604,6 +1605,12 @@ class KalshiBattleBot:
                     weather_patterns = ['temperature', '° to ', '°-', 'degrees', 'high of', 'low of']
                     if any(p in question_lower for p in weather_patterns):
                         continue  # Weather ranges are unpredictable coin flips
+
+                    # FILTER 6: Skip markets resolving too far out (high uncertainty, hard to lock gains)
+                    hours_to_res_check = market.get('hours_to_resolution', 0)
+                    max_hours = self.max_days_to_resolution * 24
+                    if hours_to_res_check > max_hours:
+                        continue  # Too far out — too much can change before resolution
                         
                     if len(self._positions) >= self._risk_limits.max_positions:
                         break
@@ -2269,13 +2276,10 @@ class KalshiBattleBot:
                     if position.get('pending_exit'):
                         return  # Silently skip - don't spam logs
                     
-                    # Skip exit for positions > 10 contracts (likely illiquid, wait for settlement)
-                    if contracts > 10:
-                        print(f"[LIVE SELL] Position ({contracts} contracts) too large for liquid exit - waiting for settlement")
-                        return
-                    
-                    # Use limit order at 1¢ for immediate fill
-                    sell_price_cents = 1
+                    # Use a limit sell at current bid minus 2¢ for quick fills without
+                    # giving away value. Floor at 1¢ to always be marketable.
+                    current_side_price = exit_price  # exit_price is the current market price for this side
+                    sell_price_cents = max(1, int(current_side_price * 100) - 2)
                     
                     print(f"[LIVE SELL] Placing limit order: {contracts} {position['side']} @ {sell_price_cents}¢")
                     
@@ -3516,7 +3520,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             </div>
             <div class="section-title">REAL P&L <span style="font-size:10px;opacity:0.6;">(value minus what you deposited)</span></div>
             <div class="grid">
-                <div class="card"><div class="card-label">Total vs $150 deposited</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
+                <div class="card"><div class="card-label">Total vs <span id="depositsLabel">$150</span> deposited</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
                 <div class="card"><div class="card-label">Today</div><div class="card-value" id="todayPnl">—</div><div class="card-sub" id="todayPnlSub">vs start of day</div></div>
                 <div class="card"><div class="card-label">Today's Peak</div><div class="card-value" id="intradayHigh">—</div><div class="card-sub" id="peakGiveback">intraday high watermark</div></div>
                 <div class="card"><div class="card-label">Open positions</div><div class="card-value" id="positionStatus">0</div><div class="card-sub" id="positionStatusSub">ahead / behind</div></div>
@@ -3668,6 +3672,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 // Real P&L: only from account value (negative = red, positive = green)
                 const ret = p.performance.total_return;
                 const returnPctVal = p.performance.return_pct;
+                const depositsLbl = document.getElementById('depositsLabel');
+                if (depositsLbl) depositsLbl.textContent = '$' + (p.account.total_deposits || 150);
                 document.getElementById('totalReturn').textContent = (ret >= 0 ? '+' : '') + '$' + ret.toFixed(2);
                 document.getElementById('totalReturn').className = 'card-value ' + (ret >= 0 ? 'green' : 'red');
                 document.getElementById('returnPct').textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%';
@@ -3733,7 +3739,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 
                 // Portfolio value chart (day-over-day, hourly for today)
                 if (p.history) {
-                    renderHistoryChart(p.history, p.today_hourly || []);
+                    renderHistoryChart(p.history, p.today_hourly || [], p.account.total_deposits || 150);
                 }
                 
                 // Strategy readout (state + signals); don't block main UI if these fail
@@ -3899,14 +3905,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         
         // Portfolio value (Kalshi) day-over-day: line + bar chart, updates hourly
-        function renderHistoryChart(history, todayHourly) {
+        function renderHistoryChart(history, todayHourly, depositsArg) {
             const container = document.getElementById('historyChart');
             if (!history || history.length === 0) {
                 container.innerHTML = '<div style="color:#8b949e;font-size:13px;padding:24px 0;text-align:center;">No history yet — data updates hourly once the bot syncs with Kalshi.</div>';
                 return;
             }
 
-            const DEPOSITS = parseFloat(document.getElementById('totalReturn') ? 150 : 150);
+            const DEPOSITS = parseFloat(depositsArg) || 150;
             const ordered = history.slice().reverse(); // oldest → newest
             const todayStr = new Date().toISOString().slice(0, 10);
 
@@ -4044,8 +4050,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
       <stop offset="0%" stop-color="#f85149" stop-opacity="0.03"/>
       <stop offset="100%" stop-color="#f85149" stop-opacity="0.55"/>
     </linearGradient>
-    <clipPath id="${uid}ca"><rect x="${pad.left}" y="${pad.top}" width="${cW}" height="${Math.max(0,(depY-pad.top).toFixed(2))}"/></clipPath>
-    <clipPath id="${uid}cb"><rect x="${pad.left}" y="${depY.toFixed(2)}" width="${cW}" height="${Math.max(0,(botY-depY).toFixed(2))}"/></clipPath>
+    <clipPath id="${uid}ca"><rect x="${pad.left}" y="${pad.top}" width="${cW}" height="${Math.max(0, depY-pad.top).toFixed(2)}"/></clipPath>
+    <clipPath id="${uid}cb"><rect x="${pad.left}" y="${depY.toFixed(2)}" width="${cW}" height="${Math.max(0, botY-depY).toFixed(2)}"/></clipPath>
     <filter id="${uid}glow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
   </defs>
 
