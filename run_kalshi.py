@@ -1412,19 +1412,26 @@ class KalshiBattleBot:
         def market_score(m):
             ineff = m.get('inefficiency_score', 0) * 0.5
             oi = min(m.get('open_interest', 0) / 1000, 1.0) * 0.3
-            
-            # Category bonus based on historical win rates
             q = m.get('question', '').lower()
+            ticker = m.get('id', '').upper()
+
+            # Category bonus: reward markets where Claude has real signal
+            # Penalize markets where Claude has <30% confidence historically
             category_bonus = 0.0
-            if 'weather' in q or 'rain' in q or 'snow' in q or 'precipitation' in q:
-                category_bonus = 1.0  # Weather: 100% win rate historically
-            elif 'crypto' in q or 'bitcoin' in q or 'ethereum' in q:
-                category_bonus = 0.5  # Crypto markets - mid tier
-            elif 'politics' in q or 'election' in q or 'congress' in q or 'senate' in q:
-                category_bonus = 0.3  # Politics - some edge possible
+            if any(x in q for x in ['doge', 'trump', 'fed ', 'rate cut', 'deportat', 'congress',
+                                      'senate', 'executive order', 'tariff', 'election', 'fomc']):
+                category_bonus = 1.0   # Politics/policy: highest edge opportunity
+            elif any(x in q for x in ['gdp', 'cpi', 'inflation', 'unemployment', 'jobs report']):
+                category_bonus = 0.8   # Economics: good signal from FRED data
+            elif any(x in q for x in ['bitcoin price', 'ethereum price', 'btc price', 'eth price',
+                                       'bitcoin range', 'btc range']) \
+                 or any(x in ticker for x in ['KXBTC', 'KXETH', 'KXBTCD', 'KXETHD']):
+                category_bonus = -1.0  # Intraday crypto price: <30% confidence, always at cluster cap
+            elif any(x in q for x in ['snow', 'temperature', 'high temp', 'high of', 'low of', '°', 'degrees']):
+                category_bonus = -1.0  # Weather: currently losing, overly concentrated
             elif any(sport in q for sport in ['nba', 'nfl', 'mlb', 'nhl', 'ncaa', 'soccer', 'golf', 'tennis']):
-                category_bonus = -0.5  # Sports: historically poor (28% win rate)
-            
+                category_bonus = -2.0  # Sports: blocked anyway, lowest priority
+
             return ineff + oi + (category_bonus * 0.2)
         
         if self._prefer_inefficient:
@@ -1437,9 +1444,9 @@ class KalshiBattleBot:
             short_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
             medium_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         
-        # PRIORITIZE: Ultra-short first, then short, then medium
-        # Increased limits since strict filtering (NO-only, 15-95¢) reduces opportunities
-        selected = ultra_short[:50] + short_term[:30] + medium_term[:20]
+        # PRIORITIZE: Short-term political/policy markets first, then ultra-short, then medium
+        # Ultra-short cap at 10: intraday crypto/weather hog slots with low-signal analysis
+        selected = short_term[:40] + ultra_short[:10] + medium_term[:20]
         
         # Log what we found
         print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
