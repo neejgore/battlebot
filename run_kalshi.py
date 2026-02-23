@@ -5,6 +5,9 @@ Legal for US residents including California.
 Uses same AI strategy as Polymarket version.
 """
 
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning, message='.*utcnow.*')
+
 import asyncio
 import json
 import os
@@ -1618,7 +1621,20 @@ class KalshiBattleBot:
                     ]
                     if any(pattern in ticker_upper for pattern in sports_ticker_patterns):
                         continue  # SKIP sports by ticker pattern
-                    
+
+                    # FILTER: Skip foreign elections with no reliable intelligence
+                    # These consistently produce LOW_CONFIDENCE signals and waste API credits
+                    low_intel_patterns = [
+                        'nepal', 'kenya', 'nigeria', 'pakistan', 'bangladesh',
+                        'ethiopia', 'myanmar', 'cambodia', 'laos', 'mozambique',
+                        'zimbabwe', 'zambia', 'malawi', 'botswana', 'namibia',
+                        'house of representatives', 'house of represen',  # foreign parliament races
+                    ]
+                    # Only apply this filter for non-US markets (US House is fine)
+                    is_us_market = any(x in question_lower for x in ['u.s.', 'us ', 'united states', 'america', 'american', 'senate', 'congress', 'white house', 'president'])
+                    if not is_us_market and any(p in question_lower for p in low_intel_patterns):
+                        continue  # Skip: no reliable news intelligence for this market
+
                     # FILTER 3: Skip markets where probability is extreme (< 10% or > 90%)
                     # These have low expected value and high variance
                     market_price = market.get('price', 0.5)
@@ -2336,9 +2352,14 @@ class KalshiBattleBot:
                         should_exit = True
                         exit_reason_mon = f"NEAR_SETTLEMENT_LOCK_{gain_pct*100:.0f}pct"
                     
-                    # Logging only (no exit) for monitoring
+                    # Logging only (no exit) for monitoring — throttle to once per hour per position
                     elif unrealized_pnl < -0.70 * cost_basis:
-                        print(f"[Position Monitor] {pos_id[:8]} down 70%+ - holding for settlement | {pos.get('question','')[:40]}")
+                        if not hasattr(self, '_monitor_log_times'):
+                            self._monitor_log_times = {}
+                        last_log = self._monitor_log_times.get(pos_id, 0)
+                        if (datetime.utcnow().timestamp() - last_log) > 3600:
+                            print(f"[Position Monitor] {pos_id[:8]} down 70%+ - holding for settlement | {pos.get('question','')[:40]}")
+                            self._monitor_log_times[pos_id] = datetime.utcnow().timestamp()
                     
                     if should_exit:
                         print(f"[Position Monitor] {pos_id[:8]} {exit_reason_mon} | "

@@ -101,20 +101,21 @@ class NewsService:
         
     def _extract_search_terms(self, question: str) -> list[str]:
         """Extract key search terms from a market question."""
-        # Remove common prediction market phrases
+        import re as _re
+        # Remove common prediction market phrases — whole words only to avoid
+        # corrupting real words (e.g. 'in' inside 'congress' → 'co gress')
         cleaned = question.lower()
-        for phrase in ['will', 'be', 'the', 'by', 'on', 'in', 'at', 'to', 'of', 
-                       'yes', 'no', 'this', 'that', 'before', 'after', 'during',
-                       'more than', 'less than', 'over', 'under', 'above', 'below',
-                       'reach', 'exceed', 'fall', 'rise', 'drop', 'increase', 'decrease']:
-            cleaned = cleaned.replace(phrase, ' ')
+        stopwords = [
+            'will', 'be', 'the', 'by', 'on', 'in', 'at', 'to', 'of',
+            'yes', 'no', 'this', 'that', 'before', 'after', 'during',
+            'more than', 'less than', 'over', 'under', 'above', 'below',
+            'reach', 'exceed', 'fall', 'rise', 'drop', 'increase', 'decrease',
+        ]
+        for phrase in sorted(stopwords, key=len, reverse=True):  # longest first
+            cleaned = _re.sub(r'\b' + _re.escape(phrase) + r'\b', ' ', cleaned)
         
-        # Extract key entities (capitalized words, numbers with context)
         words = cleaned.split()
-        
-        # Get the main subject (usually first few significant words)
         significant = [w for w in words if len(w) > 2 and w.isalpha()][:5]
-        
         return significant
     
     def _build_search_query(self, question: str, category: Optional[str] = None) -> str:
