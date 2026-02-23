@@ -39,8 +39,8 @@ class KalshiBattleBot:
         # Config from env - STRICT defaults for profitability
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
-        self.min_edge = max(0.12, float(os.getenv('MIN_EDGE', 0.12)))  # 12% min edge - raised from 10% to filter noise
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.50))  # 50% confidence - raised from 30%; only trade when AI is genuinely confident
+        self.min_edge = max(0.07, float(os.getenv('MIN_EDGE', 0.08)))  # 8% min edge — filters noise without blocking moderate edges
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.40))  # 40% confidence — filters low-quality calls; 50% was too strict, blocked all trades
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 25))  # $25 max - bigger bets on better opportunities
         self.max_days_to_resolution = float(os.getenv('MAX_DAYS_TO_RESOLUTION', 45))  # Skip markets resolving > 45 days out
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.20))  # 20% Kelly - higher conviction on filtered bets
