@@ -1631,7 +1631,13 @@ class KalshiBattleBot:
                         'house of representatives', 'house of represen',  # foreign parliament races
                     ]
                     # Only apply this filter for non-US markets (US House is fine)
-                    is_us_market = any(x in question_lower for x in ['u.s.', 'us ', 'united states', 'america', 'american', 'senate', 'congress', 'white house', 'president'])
+                    # "congress" alone is ambiguous (Nepal Congress party vs US Congress)
+                    # require "u.s. congress" or "u.s. senate" etc. for US detection
+                    is_us_market = any(x in question_lower for x in [
+                        'u.s.', 'us ', 'united states', 'america', 'american',
+                        'u.s. senate', 'u.s. congress', 'white house', 'president trump',
+                        'president biden', 'trump', 'biden', 'harris', 'senate', 'house of rep',
+                    ])
                     if not is_us_market and any(p in question_lower for p in low_intel_patterns):
                         continue  # Skip: no reliable news intelligence for this market
 
@@ -1753,12 +1759,21 @@ class KalshiBattleBot:
         # Deportations / immigration
         if any(x in q for x in ['deport', 'immigration', 'migrant', 'border']):
             return 'deportation'
-        # Trump executive actions (broad) — but NOT "basis points" / economics
-        if any(x in q for x in ['trump', 'executive order', 'tariff', 'maga', 'mar-a-lago']):
-            return 'trump_policy'
-        # State of the Union / congressional events
-        if any(x in q for x in ['state of the union', 'sotu', 'inaugur', 'joint session']):
+        # State of the Union / congressional events — check BEFORE trump_policy so
+        # "Will X attend the State of the Union" doesn't get swallowed by trump_policy
+        if any(x in q for x in ['state of the union', 'sotu', 'inaugur', 'joint session', 'attend the']):
             return 'political_events'
+        # Trump nickname / mention markets (separate cluster from policy actions)
+        if any(x in q for x in ['trump say', 'trump mention', 'trump tweet', 'trump post',
+                                  'trump nickname', 'will trump use', 'trump refer']):
+            return 'trump_speech'
+        # Trump meetings / travel
+        if any(x in q for x in ['trump meet', 'trump trip', 'mar-a-lago', 'trump travel',
+                                  'trump visit', 'days at']):
+            return 'trump_travel'
+        # Trump executive actions (broad)
+        if any(x in q for x in ['trump', 'executive order', 'tariff', 'maga']):
+            return 'trump_policy'
         # Fed / US interest rates
         if any(x in q for x in ['federal reserve', 'fomc', 'rate cut', 'rate hike',
                                   'fed funds', 'basis point']):
