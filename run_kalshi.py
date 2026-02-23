@@ -953,6 +953,9 @@ class KalshiBattleBot:
             'max_position_size': self.max_position_size,
             'kelly_fraction': self.kelly_fraction,
             'max_oi_pct': self.max_oi_pct,
+            'max_days_to_resolution': self.max_days_to_resolution,
+            'max_cluster_positions': int(os.getenv('MAX_CLUSTER_POSITIONS', '3')),
+            'profit_lock_pct': float(os.getenv('PROFIT_LOCK_PCT', '0.50')),
             'kill_switch': self._risk_engine.daily_stats.kill_switch_triggered,
             'daily_drawdown': self._risk_engine.daily_stats.current_drawdown_pct,
             'exposure_ratio': at_risk / self.initial_bankroll,
@@ -3543,6 +3546,17 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Crypto</div><div class="card-value" id="expCrypto">$0.00</div></div>
                 <div class="card"><div class="card-label">Other</div><div class="card-value" id="expOther">$0.00</div></div>
             </div>
+            <div class="section-title">BOT FILTERS ACTIVE <span style="font-size:10px;opacity:0.6;">live values — these gates control every trade decision</span></div>
+            <div id="filtersGrid" class="grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-bottom:16px;">
+                <div class="card"><div class="card-label">Min Edge</div><div class="card-value" id="cfgMinEdge">—</div><div class="card-sub">skip if AI edge below</div></div>
+                <div class="card"><div class="card-label">Min Confidence</div><div class="card-value" id="cfgMinConf">—</div><div class="card-sub">skip if AI unsure</div></div>
+                <div class="card"><div class="card-label">Max Horizon</div><div class="card-value" id="cfgMaxDays">—</div><div class="card-sub">skip far-out markets</div></div>
+                <div class="card"><div class="card-label">Profit-Lock</div><div class="card-value" id="cfgProfitLock">—</div><div class="card-sub">sell on % gain</div></div>
+                <div class="card"><div class="card-label">Cluster Cap</div><div class="card-value" id="cfgCluster">—</div><div class="card-sub">max per theme</div></div>
+                <div class="card"><div class="card-label">Max Bet Size</div><div class="card-value" id="cfgMaxBet">—</div><div class="card-sub">per position</div></div>
+                <div class="card"><div class="card-label">Kelly Fraction</div><div class="card-value" id="cfgKelly">—</div><div class="card-sub">sizing conservatism</div></div>
+                <div class="card"><div class="card-label">Trading</div><div class="card-value" id="cfgTrading">—</div><div class="card-sub" id="cfgTradingSub">kill-switch status</div></div>
+            </div>
             <div class="section-title">PORTFOLIO VALUE (Kalshi) <span style="font-size:10px;opacity:0.6;">day-over-day · hourly for today · <span style="color:#3fb950;">green</span> = above $150 · <span style="color:#f85149;">red</span> = below</span></div>
             <div id="historyChart" style="padding:12px 0 4px 0;min-height:230px;"></div>
             <div class="section-title">Active Positions <span id="positionCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
@@ -3646,6 +3660,31 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             document.getElementById('botStatus').textContent = s.trading_allowed ? 'Active' : 'Paused';
             document.getElementById('botStatus').className = 'card-value ' + (s.trading_allowed ? 'green' : 'red');
             document.getElementById('botRuntime').textContent = s.runtime;
+
+            // BOT FILTERS ACTIVE section — surface all live thresholds
+            const fEdge = document.getElementById('cfgMinEdge');
+            const fConf = document.getElementById('cfgMinConf');
+            const fDays = document.getElementById('cfgMaxDays');
+            const fLock = document.getElementById('cfgProfitLock');
+            const fClus = document.getElementById('cfgCluster');
+            const fBet  = document.getElementById('cfgMaxBet');
+            const fKelly= document.getElementById('cfgKelly');
+            const fTrad = document.getElementById('cfgTrading');
+            const fTradSub = document.getElementById('cfgTradingSub');
+            if (fEdge) fEdge.textContent = (s.min_edge * 100).toFixed(0) + '%';
+            if (fConf) fConf.textContent = (s.min_confidence * 100).toFixed(0) + '%';
+            if (fDays) fDays.textContent = s.max_days_to_resolution != null ? s.max_days_to_resolution + 'd' : '—';
+            if (fLock) fLock.textContent = s.profit_lock_pct != null ? '+' + (s.profit_lock_pct * 100).toFixed(0) + '%' : '—';
+            if (fClus) fClus.textContent = s.max_cluster_positions != null ? s.max_cluster_positions + ' pos' : '—';
+            if (fBet)  fBet.textContent  = s.max_position_size != null ? '$' + s.max_position_size : '—';
+            if (fKelly)fKelly.textContent = s.kelly_fraction != null ? (s.kelly_fraction * 100).toFixed(0) + '%' : '—';
+            if (fTrad) {
+                const ks = s.kill_switch;
+                fTrad.textContent = ks ? 'HALTED' : (s.trading_allowed ? 'ON' : 'PAUSED');
+                fTrad.className = 'card-value ' + (ks ? 'red' : s.trading_allowed ? 'green' : 'yellow');
+            }
+            if (fTradSub) fTradSub.textContent = s.kill_switch ? 'kill-switch triggered' :
+                ('drawdown ' + (s.daily_drawdown != null ? (s.daily_drawdown * 100).toFixed(1) + '%' : '0%'));
         }
         
         // Fetch performance first so dashboard always shows Kalshi numbers; then state + signals for readout
