@@ -73,6 +73,7 @@ class KalshiBattleBot:
         self._last_analysis: dict[str, datetime] = {}
         self._last_analysis_price: dict[str, float] = {}
         self._recently_exited: dict[str, datetime] = {}  # Track exits to prevent re-entry
+        self._recently_exited_reason: dict[str, str] = {}  # Exit reason per market
         self._analysis_cooldown = 1800  # 30 minutes
         self._price_change_threshold = 0.02  # Re-analyze on 2% move
         self._start_time = None
@@ -131,12 +132,10 @@ class KalshiBattleBot:
             self._save_state()
             return
         
-        # TEMPORARY: Clear buggy reconciled trades that had wrong P&L (entry_price=0)
-        # This fixes the kill switch being triggered by false losses
-        # Remove this after Feb 23, 2026
-        clear_buggy = os.getenv('CLEAR_BUGGY_TRADES', 'true').lower() == 'true'
+        # CLEAR_BUGGY_TRADES: opt-in only via env var (no longer the default)
+        clear_buggy = os.getenv('CLEAR_BUGGY_TRADES', 'false').lower() == 'true'
         if clear_buggy:
-            print("[State] Clearing buggy reconciled trades with wrong P&L...")
+            print("[State] Clearing reconciled trades (CLEAR_BUGGY_TRADES=true)...")
             
         try:
             if os.path.exists(self._state_file):
@@ -1655,6 +1654,45 @@ class KalshiBattleBot:
                 print(f"[Trading Error] {e}")
             await asyncio.sleep(30)
     
+    def _get_cluster_key(self, question: str) -> str:
+        """Map a market question to a correlation cluster key.
+        
+        Markets in the same cluster move together (same underlying news driver).
+        We cap how many positions we hold per cluster to avoid over-concentration.
+        """
+        q = question.lower()
+        # DOGE / federal spending cuts
+        if any(x in q for x in ['doge', 'elon', 'federal spending', 'budget cut', 'cut the budget',
+                                  'cut between', 'cut less than', 'cut more than']):
+            return 'doge_spending'
+        # Deportations / immigration
+        if any(x in q for x in ['deport', 'immigration', 'migrant', 'border']):
+            return 'deportation'
+        # Trump executive actions (broad)
+        if any(x in q for x in ['trump', 'executive order', 'tariff']):
+            return 'trump_policy'
+        # Fed / interest rates
+        if any(x in q for x in ['fed', 'interest rate', 'fomc', 'rate cut', 'rate hike']):
+            return 'fed_rates'
+        # Crypto price buckets (BTC/ETH)
+        if any(x in q for x in ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto']):
+            return 'crypto_price'
+        # Weather same city
+        for city in ['new york', 'chicago', 'los angeles', 'houston', 'miami']:
+            if city in q:
+                return f'weather_{city.replace(" ", "_")}'
+        # Sports same league/team
+        if any(x in q for x in ['nba', 'lakers', 'celtics', 'warriors', 'nets']):
+            return 'nba'
+        if any(x in q for x in ['nfl', 'chiefs', 'eagles', 'cowboys', '49ers']):
+            return 'nfl'
+        if any(x in q for x in ['mlb', 'yankees', 'dodgers', 'astros']):
+            return 'mlb'
+        # GDP / economic indicators (same release)
+        if any(x in q for x in ['gdp', 'recession', 'inflation', 'cpi', 'unemployment']):
+            return 'macro_economics'
+        return 'other'
+
     async def _analyze_market(self, market: dict):
         """Analyze market with AI and decide whether to trade.
         
@@ -1886,17 +1924,34 @@ class KalshiBattleBot:
             should_trade = False
             reasons.append('ALREADY_IN_POSITION')
         
-        # Don't re-enter markets we recently exited (prevent chasing losses)
+        # Don't re-enter markets we recently exited
+        # Cooldown varies by exit reason:
+        #  - PROFIT_LOCK exit: 6h cooldown (position won, don't re-buy same thing)
+        #  - Other exits: 2h cooldown (prevent chasing)
         recent_exit = self._recently_exited.get(market_id)
         if recent_exit:
+            exit_reason_stored = self._recently_exited_reason.get(market_id, '')
+            cooldown_hours = 6.0 if 'PROFIT_LOCK' in exit_reason_stored or 'NEAR_SETTLEMENT' in exit_reason_stored else 2.0
             hours_since_exit = (datetime.utcnow() - recent_exit).total_seconds() / 3600
-            if hours_since_exit < 2:  # 2 hour cooldown after exit
+            if hours_since_exit < cooldown_hours:
                 should_trade = False
-                reasons.append(f'RECENTLY_EXITED_{hours_since_exit:.1f}h_AGO')
+                reasons.append(f'RECENTLY_EXITED_{hours_since_exit:.1f}h_AGO_{exit_reason_stored[:20]}')
         
         if len(self._positions) >= self._risk_limits.max_positions:
             should_trade = False
             reasons.append('MAX_POSITIONS')
+        
+        # CORRELATION CLUSTER CAP: Limit exposure to same news theme
+        # Prevents piling into 10 DOGE-cut variants when 2-3 are sufficient.
+        MAX_POSITIONS_PER_CLUSTER = int(os.getenv('MAX_CLUSTER_POSITIONS', '3'))
+        cluster_key = self._get_cluster_key(market.get('question', ''))
+        cluster_count = sum(
+            1 for p in self._positions.values()
+            if self._get_cluster_key(p.get('question', '')) == cluster_key
+        )
+        if cluster_count >= MAX_POSITIONS_PER_CLUSTER:
+            should_trade = False
+            reasons.append(f'CLUSTER_CAP_{cluster_key[:20]}_{cluster_count}')
         
         # Log decision
         decision = 'TRADE' if should_trade else 'NO_TRADE'
@@ -2148,18 +2203,52 @@ class KalshiBattleBot:
                     pos['current_price'] = current_price
                     pos['unrealized_pnl'] = unrealized_pnl
                     
-                    # DISABLED: Stop loss and profit target exits
-                    # Historical data shows:
-                    # - Stop losses cutting winners (32% win rate, still losing money)
-                    # - Profit targets not working (0% win rate)
-                    # Strategy: Let ALL bets settle naturally - don't exit early
-                    # Positions will only exit when market settles (winner pays 100¢)
+                    # EXIT STRATEGY:
+                    # - NO stop losses (they cut winners - historical data confirms)
+                    # - YES selective profit-lock for large gains near resolution
+                    #   Rationale: "was up yesterday, gave it back today" pattern
+                    #   caused by unrealized gains reversing with no lock mechanism.
                     
-                    # Only log extreme movements for monitoring (don't exit)
-                    if unrealized_pnl < -0.70 * (contracts * entry_price):
-                        print(f"[Position Monitor] {pos_id[:8]} down 70%+ - holding for settlement")
-                    elif unrealized_pnl > 0.50 * (contracts * entry_price):
-                        print(f"[Position Monitor] {pos_id[:8]} up 50%+ - holding for settlement")
+                    cost_basis = contracts * entry_price
+                    gain_pct = (unrealized_pnl / cost_basis) if cost_basis > 0 else 0
+                    
+                    # Calculate days to resolution
+                    days_to_res = None
+                    end_date_str = pos.get('end_date')
+                    if end_date_str:
+                        try:
+                            end_dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                            days_to_res = (end_dt - datetime.now(end_dt.tzinfo)).total_seconds() / 86400
+                        except Exception:
+                            pass
+                    
+                    should_exit = False
+                    exit_reason_mon = ""
+                    
+                    # PROFIT-LOCK: Exit when position has gained significantly
+                    # Logic: if we're up 50%+, the market has already priced in our view —
+                    # locking in is better than waiting for a potential reversal.
+                    PROFIT_LOCK_PCT = float(os.getenv('PROFIT_LOCK_PCT', '0.50'))  # 50% gain threshold
+                    
+                    if gain_pct >= PROFIT_LOCK_PCT and cost_basis > 0:
+                        should_exit = True
+                        exit_reason_mon = f"PROFIT_LOCK_{gain_pct*100:.0f}pct"
+                    
+                    # NEAR-SETTLEMENT LOCK: Within 4h of resolution, lock any gain > 25%
+                    # This captures "approaching certainty" price moves before final settlement
+                    elif days_to_res is not None and days_to_res <= 0.17 and gain_pct >= 0.25:
+                        should_exit = True
+                        exit_reason_mon = f"NEAR_SETTLEMENT_LOCK_{gain_pct*100:.0f}pct"
+                    
+                    # Logging only (no exit) for monitoring
+                    elif unrealized_pnl < -0.70 * cost_basis:
+                        print(f"[Position Monitor] {pos_id[:8]} down 70%+ - holding for settlement | {pos.get('question','')[:40]}")
+                    
+                    if should_exit:
+                        print(f"[Position Monitor] {pos_id[:8]} {exit_reason_mon} | "
+                              f"entry={entry_price*100:.0f}¢ cur={current_price*100:.0f}¢ "
+                              f"uPnL=${unrealized_pnl:+.2f} | {pos.get('question','')[:40]}")
+                        await self._exit_position(pos_id, current_price, unrealized_pnl, exit_reason_mon)
                 
             except Exception as e:
                 print(f"[Monitor Error] {e}")
@@ -2217,8 +2306,9 @@ class KalshiBattleBot:
         # For dry run mode, or after sell is confirmed (called from sync loop)
         self._positions.pop(pos_id, None)
         
-        # Track exit to prevent re-entry (chasing losses)
+        # Track exit to prevent re-entry
         self._recently_exited[position['market_id']] = datetime.utcnow()
+        self._recently_exited_reason[position['market_id']] = reason
         
         await self._risk_engine.record_trade_result(pnl)
         
@@ -2319,8 +2409,9 @@ class KalshiBattleBot:
                     # Now actually remove the position and record exit
                     self._positions.pop(pos_id, None)
                     
-                    # Track exit to prevent re-entry (chasing losses)
+                    # Track exit to prevent re-entry
                     self._recently_exited[position['market_id']] = datetime.utcnow()
+                    self._recently_exited_reason[position['market_id']] = reason
                     
                     await self._risk_engine.record_trade_result(pnl)
                     
@@ -2908,6 +2999,12 @@ class KalshiBattleBot:
                     'today_pnl_pct': today_pnl_pct,
                     'start_of_day_value': start_of_day_value,
                     'unrealized_pnl': round(unrealized_pnl, 2),
+                    # Intraday high/low for "was up, gave it back" analysis
+                    'intraday_high': today_snapshot.get('intraday_high'),
+                    'intraday_high_time': today_snapshot.get('intraday_high_time'),
+                    'intraday_low': today_snapshot.get('intraday_low'),
+                    'peak_giveback': round(today_snapshot.get('intraday_high', account_value) - account_value, 2)
+                                     if today_snapshot.get('intraday_high') else None,
                 },
                 # Positions Summary
                 'positions': {
@@ -2966,6 +3063,23 @@ class KalshiBattleBot:
         snapshot['cash'] = round(cash, 2)
         snapshot['positions_value'] = round(positions_value, 2)
         snapshot['timestamp'] = now.isoformat()
+        
+        # Track intraday high watermark — shows "was up X, now at Y" pattern
+        current_high = snapshot.get('intraday_high', val)
+        if val > current_high:
+            snapshot['intraday_high'] = val
+            snapshot['intraday_high_time'] = now.isoformat()
+        else:
+            snapshot['intraday_high'] = current_high
+        
+        # Track intraday low watermark
+        current_low = snapshot.get('intraday_low', val)
+        if val < current_low:
+            snapshot['intraday_low'] = val
+            snapshot['intraday_low_time'] = now.isoformat()
+        else:
+            snapshot['intraday_low'] = current_low
+        
         self._daily_snapshots[today_str] = snapshot
         
         # Hourly series for today (Kalshi portfolio value)
@@ -3005,9 +3119,14 @@ class KalshiBattleBot:
                     'account_value': s.get('account_value'),
                     'cash': s.get('cash'),
                     'positions_value': s.get('positions_value'),
+                    'start_of_day_value': s.get('start_of_day_value'),
+                    'intraday_high': s.get('intraday_high'),
+                    'intraday_low': s.get('intraday_low'),
+                    'intraday_high_time': s.get('intraday_high_time'),
                 })
             else:
-                daily.append({'date': date_str, 'account_value': None, 'cash': None, 'positions_value': None})
+                daily.append({'date': date_str, 'account_value': None, 'cash': None,
+                              'positions_value': None, 'intraday_high': None, 'intraday_low': None})
         
         today_str = today.strftime('%Y-%m-%d')
         today_hourly = []
@@ -3399,6 +3518,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div class="grid">
                 <div class="card"><div class="card-label">Total vs $150 deposited</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
                 <div class="card"><div class="card-label">Today</div><div class="card-value" id="todayPnl">—</div><div class="card-sub" id="todayPnlSub">vs start of day</div></div>
+                <div class="card"><div class="card-label">Today's Peak</div><div class="card-value" id="intradayHigh">—</div><div class="card-sub" id="peakGiveback">intraday high watermark</div></div>
                 <div class="card"><div class="card-label">Open positions</div><div class="card-value" id="positionStatus">0</div><div class="card-sub" id="positionStatusSub">ahead / behind</div></div>
             </div>
             <div class="section-title">TODAY'S ACTIVITY</div>
@@ -3406,6 +3526,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">New Bets</div><div class="card-value" id="todayBets">0</div><div class="card-sub" id="todayDeployed">$0 deployed</div></div>
                 <div class="card"><div class="card-label">Open Positions</div><div class="card-value" id="openPositions">0</div><div class="card-sub" id="positionLimit">of 25 max</div></div>
                 <div class="card"><div class="card-label">Bot Status</div><div class="card-value" id="botStatus">Active</div><div class="card-sub" id="botRuntime">0h 0m</div></div>
+            </div>
+            <div class="section-title">STRATEGY READOUT</div>
+            <div id="strategyReadout" class="card" style="padding:16px;line-height:1.6;font-size:14px;">
+                <p id="readoutMoney">—</p>
+                <p id="readoutToday">—</p>
+                <p id="readoutSignal">—</p>
             </div>
             <div class="section-title">EXPOSURE BY CATEGORY</div>
             <div class="grid" id="exposureGrid">
@@ -3518,11 +3644,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             document.getElementById('botRuntime').textContent = s.runtime;
         }
         
-        // Fetch real performance data from Kalshi API
+        // Fetch performance first so dashboard always shows Kalshi numbers; then state + signals for readout
         async function fetchPerformance() {
             try {
-                const res = await fetch('/api/performance');
-                const p = await res.json();
+                const perfRes = await fetch('/api/performance');
+                const p = await perfRes.json();
                 if (p.error) {
                     console.error('Performance API error:', p.error);
                     return;
@@ -3565,6 +3691,25 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('positionStatus').textContent = p.positions.winning + ' / ' + p.positions.losing;
                 document.getElementById('positionStatusSub').textContent = 'positions ahead / behind';
                 
+                // Intraday high watermark — "was up X, gave back Y today"
+                const highEl = document.getElementById('intradayHigh');
+                const givebackEl = document.getElementById('peakGiveback');
+                if (highEl && p.performance.intraday_high != null) {
+                    const high = p.performance.intraday_high;
+                    const giveback = p.performance.peak_giveback;
+                    const startVal = p.performance.start_of_day_value || high;
+                    const highGain = high - startVal;
+                    highEl.textContent = '$' + high.toFixed(2) + (highGain >= 0 ? ' (+$' + highGain.toFixed(2) + ')' : '');
+                    highEl.className = 'card-value ' + (highGain >= 0 ? 'green' : 'red');
+                    if (givebackEl && giveback != null && giveback > 0.01) {
+                        givebackEl.textContent = '-$' + giveback.toFixed(2) + ' given back from peak';
+                        givebackEl.className = 'card-sub red';
+                    } else if (givebackEl) {
+                        givebackEl.textContent = 'at or near peak';
+                        givebackEl.className = 'card-sub green';
+                    }
+                }
+                
                 // Today's Activity
                 document.getElementById('todayBets').textContent = p.today.new_bets;
                 document.getElementById('todayDeployed').textContent = '$' + (p.today.total_deployed || 0).toFixed(2) + ' deployed';
@@ -3591,8 +3736,44 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     renderHistoryChart(p.history, p.today_hourly || []);
                 }
                 
+                // Strategy readout (state + signals); don't block main UI if these fail
+                try {
+                    const [stateRes, signalsRes] = await Promise.all([fetch('/api/state'), fetch('/api/signals')]);
+                    const state = stateRes.ok ? await stateRes.json() : {};
+                    const sig = signalsRes.ok ? await signalsRes.json() : {};
+                    updateStrategyReadout(p, state, sig);
+                } catch (e) { if (document.getElementById('readoutMoney')) document.getElementById('readoutMoney').textContent = 'Account loaded; readout skipped.'; }
+                
             } catch (e) {
                 console.error('Failed to fetch performance:', e);
+            }
+        }
+        
+        function updateStrategyReadout(p, state, sig) {
+            const moneyEl = document.getElementById('readoutMoney');
+            const todayEl = document.getElementById('readoutToday');
+            const signalEl = document.getElementById('readoutSignal');
+            if (!moneyEl || !todayEl || !signalEl) return;
+            const val = p.account.total_value;
+            const deposits = p.account.total_deposits || 150;
+            const ret = p.performance.total_return;
+            const pct = p.performance.return_pct;
+            const todayPn = p.performance.today_pnl;
+            const todayPct = p.performance.today_pnl_pct;
+            moneyEl.innerHTML = 'Account value is <strong>$' + val.toFixed(2) + '</strong> (deposits $' + deposits + '). Total return ' + (ret >= 0 ? '<span class="green">+' : '<span class="red">') + '$' + ret.toFixed(2) + ' (' + (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%)</span>.';
+            const todayStr = todayPn != null ? 'Today: ' + (todayPn >= 0 ? '<span class="green">+' : '<span class="red">') + '$' + todayPn.toFixed(2) + ' (' + (todayPct >= 0 ? '+' : '') + todayPct.toFixed(1) + '%)</span> vs start of day.' : 'Today: — (set after first snapshot).';
+            todayEl.innerHTML = 'New bets today: <strong>' + (p.today.new_bets || 0) + '</strong>, $' + (p.today.total_deployed || 0).toFixed(2) + ' deployed. Closed today: ' + (state.stats ? (state.stats.today_wins || 0) + ' wins, ' + (state.stats.today_losses || 0) + ' losses (' + (state.stats.today_trades || 0) + ' exits).' : '—') + ' ' + todayStr;
+            if (sig.error || !sig.settled) {
+                signalEl.textContent = 'Signals: ' + (sig.message || sig.error || 'No settled signals yet — need resolved markets to judge AI.');
+            } else {
+                const wr = sig.overall_win_rate || 'N/A';
+                const pnl = sig.overall_pnl || '$0';
+                const bestEdge = (sig.by_edge_threshold && sig.by_edge_threshold.length) ? sig.by_edge_threshold[sig.by_edge_threshold.length - 1] : null;
+                const bestConf = (sig.by_confidence_threshold && sig.by_confidence_threshold.length) ? sig.by_confidence_threshold[sig.by_confidence_threshold.length - 1] : null;
+                let verdict = 'Settled signals: ' + sig.settled + ', win rate ' + wr + ', theoretical P&L ' + pnl + '.';
+                if (bestEdge) verdict += ' Best edge band ' + bestEdge.threshold + '+: ' + bestEdge.win_rate + ' win rate, ' + bestEdge.theoretical_pnl + '.';
+                if (bestConf) verdict += ' Best confidence ' + bestConf.threshold + '+: ' + bestConf.win_rate + ', ' + bestConf.theoretical_pnl + '.';
+                signalEl.innerHTML = verdict;
             }
         }
         
