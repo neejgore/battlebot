@@ -151,10 +151,10 @@ class AISignalGenerator:
     - Graceful degradation on failure
     """
     
-    DEFAULT_MODEL = "claude-haiku-4-20250514"  # Haiku: ~8x cheaper than Sonnet, same quality for probability estimation
+    DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Keep Sonnet — news synthesis quality drives the +17pp edge
     MAX_RETRIES = 1
     TIMEOUT_SECONDS = 30.0
-    MAX_TOKENS = 600  # Reduced from 800 — probability + confidence needs ~200 tokens, 600 is safe headroom
+    MAX_TOKENS = 800
     
     def __init__(
         self,
