@@ -1504,13 +1504,23 @@ class KalshiBattleBot:
                 def market_priority(m):
                     hours = m.get('hours_to_resolution', 9999)
                     news_score = NewsService.score_news_relevance(
-                        m.get('question', ''), 
+                        m.get('question', ''),
                         m.get('category')
                     )
-                    # Weight: time matters most, but boost high-news-value markets
-                    # Lower score = higher priority
+                    q = m.get('question', '').lower()
+                    ticker = m.get('id', '').upper()
+
+                    # Heavily deprioritize intraday crypto price and weather markets:
+                    # Claude has <30% confidence on these, and we're usually at cluster cap.
+                    # Push them to the back of the queue so political/policy markets
+                    # get analyzed first every cycle.
+                    is_crypto_price = any(x in q for x in ['bitcoin price', 'ethereum price', 'btc price', 'eth price', 'bitcoin range', 'btc range']) \
+                        or any(x in ticker for x in ['KXBTC', 'KXETH', 'KXBTCD', 'KXETHD'])
+                    is_weather = any(x in q for x in ['snow', 'temperature', 'high temp', 'high of', 'low of', '°', 'degrees'])
+                    depriority = 10.0 if (is_crypto_price or is_weather) else 0.0
+
                     time_score = min(hours, 168) / 168  # Normalize to 0-1 (cap at 1 week)
-                    return time_score - (news_score * 0.3)  # News relevance reduces score
+                    return depriority + time_score - (news_score * 0.3)
                 
                 markets_by_urgency = sorted(
                     self._monitored.values(),
