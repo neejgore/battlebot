@@ -123,7 +123,13 @@ class NewsService:
         
         # SPORTS-SPECIFIC QUERY BUILDING
         # Detect sports betting markets and build targeted queries
-        is_sports = (
+        # Exclude financial/economics terms that contain sports words ("basis points", "rate spread")
+        is_economics = any(k in question_lower for k in [
+            'basis point', 'interest rate', 'federal reserve', 'central bank', 'pboc',
+            'inflation', 'gdp', 'cpi', 'unemployment', 'rate cut', 'rate hike',
+            'yield', 'treasury', 'bond', 'stock market', 's&p', 'nasdaq',
+        ])
+        is_sports = not is_economics and (
             category and category.lower() == 'sports' or
             any(term in question_lower for term in [
                 'wins', 'points', 'spread', 'total', 'over', 'under',

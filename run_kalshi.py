@@ -1701,19 +1701,34 @@ class KalshiBattleBot:
         # Deportations / immigration
         if any(x in q for x in ['deport', 'immigration', 'migrant', 'border']):
             return 'deportation'
-        # Trump executive actions (broad)
-        if any(x in q for x in ['trump', 'executive order', 'tariff']):
+        # Trump executive actions (broad) — but NOT "basis points" / economics
+        if any(x in q for x in ['trump', 'executive order', 'tariff', 'maga', 'mar-a-lago']):
             return 'trump_policy'
-        # Fed / interest rates
-        if any(x in q for x in ['fed', 'interest rate', 'fomc', 'rate cut', 'rate hike']):
+        # State of the Union / congressional events
+        if any(x in q for x in ['state of the union', 'sotu', 'inaugur', 'joint session']):
+            return 'political_events'
+        # Fed / US interest rates
+        if any(x in q for x in ['federal reserve', 'fomc', 'rate cut', 'rate hike',
+                                  'fed funds', 'basis point']):
             return 'fed_rates'
+        # China / international central banks (separate cluster from US Fed)
+        if any(x in q for x in ["people's bank", "pboc", "china rate", "ecb", "bank of england",
+                                  "bank of japan", "boj"]):
+            return 'intl_central_banks'
         # Crypto price buckets (BTC/ETH)
-        if any(x in q for x in ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto']):
+        if any(x in q for x in ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'solana']):
             return 'crypto_price'
-        # Weather same city
-        for city in ['new york', 'chicago', 'los angeles', 'houston', 'miami']:
+        # GDP / economic indicators (same release)
+        if any(x in q for x in ['gdp', 'recession', 'inflation', 'cpi', 'unemployment',
+                                  'jobs report', 'payroll', 'nonfarm']):
+            return 'macro_economics'
+        # Weather — per city to avoid over-concentration
+        for city in ['new york', 'chicago', 'los angeles', 'houston', 'miami',
+                     'philadelphia', 'boston', 'seattle', 'dallas', 'atlanta']:
             if city in q:
                 return f'weather_{city.replace(" ", "_")}'
+        if any(x in q for x in ['snow', 'temperature', 'high temp', 'precipitation', 'rainfall']):
+            return 'weather_other'
         # Sports same league/team
         if any(x in q for x in ['nba', 'lakers', 'celtics', 'warriors', 'nets']):
             return 'nba'
@@ -1721,9 +1736,10 @@ class KalshiBattleBot:
             return 'nfl'
         if any(x in q for x in ['mlb', 'yankees', 'dodgers', 'astros']):
             return 'mlb'
-        # GDP / economic indicators (same release)
-        if any(x in q for x in ['gdp', 'recession', 'inflation', 'cpi', 'unemployment']):
-            return 'macro_economics'
+        # Middle East / geopolitics
+        if any(x in q for x in ['israel', 'gaza', 'hamas', 'iran', 'ukraine', 'russia',
+                                  'taiwan', 'china war', 'ceasefire']):
+            return 'geopolitics'
         return 'other'
 
     async def _analyze_market(self, market: dict):
