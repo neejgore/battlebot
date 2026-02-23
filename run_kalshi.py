@@ -1254,7 +1254,7 @@ class KalshiBattleBot:
         }
         ultra_short_rejected = {'low_oi': 0, 'wide_spread': 0, 'extreme_price': 0, 'too_close': 0, 'combo': 0, 'no_volume': 0}
         
-        max_days = int(os.getenv('MAX_DAYS_TO_RESOLUTION', '365'))
+        max_days = self.max_days_to_resolution  # shared with trading-loop filter (default 45)
         now = datetime.utcnow()
         
         # Pre-scan to understand what's available
@@ -2497,12 +2497,13 @@ class KalshiBattleBot:
                 
             try:
                 # Fetch market status from Kalshi
-                market = await self._kalshi.get_market(market_id)
-                if not market:
+                raw = await self._kalshi.get_market(market_id)
+                if not raw:
                     continue
-                
+                market = raw.get('market', raw)  # unwrap {'market': {...}} envelope
+
                 status = market.get('status', '')
-                
+
                 if status == 'settled':
                     # Market has settled - record outcome
                     result = market.get('result', '')  # 'yes' or 'no'
@@ -2920,7 +2921,7 @@ class KalshiBattleBot:
                 
                 cost = contracts * entry_price
                 value = contracts * current_price
-                unrealized = value - cost if side == 'yes' else cost - value
+                unrealized = value - cost  # same sign for both YES and NO: higher price = gain
                 
                 total_position_cost += cost
                 total_position_value += value
@@ -3568,7 +3569,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div class="section-title">YOUR ACCOUNT <span style="font-size:10px;opacity:0.6;">(same as Portfolio — from Kalshi)</span></div>
             <div class="grid">
                 <div class="card"><div class="card-label">Account value</div><div class="card-value" id="truthValue">$0.00</div></div>
-                <div class="card"><div class="card-label">Real P&L vs $150</div><div class="card-value" id="truthPnl">$0.00</div><div class="card-sub" id="truthPct">0%</div></div>
+                <div class="card"><div class="card-label">Real P&L vs <span id="settlDepositsLabel">$150</span></div><div class="card-value" id="truthPnl">$0.00</div><div class="card-sub" id="truthPct">0%</div></div>
                 <div class="card"><div class="card-label">Today</div><div class="card-value" id="truthToday">—</div><div class="card-sub">vs start of day</div></div>
             </div>
             <div class="section-title">SETTLED BETS <span style="font-size:10px;opacity:0.6;">(list only — true P&L is above)</span> <span id="settlementCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
@@ -3735,6 +3736,9 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 
                 document.getElementById('positionStatus').textContent = p.positions.winning + ' / ' + p.positions.losing;
                 document.getElementById('positionStatusSub').textContent = 'positions ahead / behind';
+                // Keep Settlements tab deposit label in sync
+                const sdl = document.getElementById('settlDepositsLabel');
+                if (sdl) sdl.textContent = '$' + (p.account.total_deposits || 150);
                 
                 // Intraday high watermark — "was up X, gave back Y today"
                 const highEl = document.getElementById('intradayHigh');
