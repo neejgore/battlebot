@@ -75,8 +75,11 @@ class KalshiBattleBot:
         self._last_analysis_price: dict[str, float] = {}
         self._recently_exited: dict[str, datetime] = {}  # Track exits to prevent re-entry
         self._recently_exited_reason: dict[str, str] = {}  # Exit reason per market
-        self._analysis_cooldown = 1800  # 30 minutes
+        self._analysis_cooldown = 1800  # 30 minutes (overridden per time-horizon in trading loop)
         self._price_change_threshold = 0.02  # Re-analyze on 2% move
+        # Probability cache: {market_id: (timestamp, price_when_cached, ai_prob, confidence)}
+        # Reused when price hasn't moved significantly — avoids redundant Claude calls
+        self._prob_cache: dict[str, tuple[datetime, float, float, float]] = {}
         self._start_time = None
         
         # Price updates counter (no WebSocket for Kalshi, use polling)
@@ -1640,31 +1643,61 @@ class KalshiBattleBot:
                         
                     if len(self._positions) >= self._risk_limits.max_positions:
                         break
-                    
+
+                    # PRE-FILTER: Skip Claude call if we know the market will be rejected anyway.
+                    # These checks mirror _analyze_market but cost nothing vs an API call.
+
+                    # Already holding this market
+                    if market_id in [p.get('market_id') for p in self._positions.values()]:
+                        continue
+
+                    # Recently exited — still in cooldown
+                    recent_exit = self._recently_exited.get(market_id)
+                    if recent_exit:
+                        exit_reason_stored = self._recently_exited_reason.get(market_id, '')
+                        cooldown_hours = 6.0 if 'PROFIT_LOCK' in exit_reason_stored or 'NEAR_SETTLEMENT' in exit_reason_stored else 2.0
+                        if (datetime.utcnow() - recent_exit).total_seconds() / 3600 < cooldown_hours:
+                            continue
+
+                    # Cluster cap reached — no point asking Claude
+                    _pre_cluster_key = self._get_cluster_key(market.get('question', ''))
+                    _pre_cluster_count = sum(
+                        1 for p in self._positions.values()
+                        if self._get_cluster_key(p.get('question', '')) == _pre_cluster_key
+                    )
+                    MAX_POSITIONS_PER_CLUSTER = int(os.getenv('MAX_CLUSTER_POSITIONS', '3'))
+                    if _pre_cluster_count >= MAX_POSITIONS_PER_CLUSTER:
+                        continue
+
                     # Check cooldown and price movement
                     last = self._last_analysis.get(market_id)
                     last_price = self._last_analysis_price.get(market_id, 0)
                     current_price = market.get('price', 0.5)
-                    
+
                     price_moved = abs(current_price - last_price) >= self._price_change_threshold if last_price else False
-                    
-                    # Shorter cooldown for ultra-short markets (analyze more frequently)
+
+                    # Tiered cooldown based on time horizon — medium-term markets need less frequent re-analysis
                     hours_to_res = market.get('hours_to_resolution', 9999)
-                    cooldown = 300 if hours_to_res <= 24 else self._analysis_cooldown  # 5 min for ultra-short
-                    
+                    if hours_to_res <= 24:
+                        cooldown = 300          # 5 min — ultra-short, price moves fast
+                    elif hours_to_res <= 168:
+                        cooldown = 3600         # 60 min — short-term (1-7 days)
+                    else:
+                        cooldown = 7200         # 2 hours — medium-term (7-45 days)
+
                     if last and not price_moved:
                         if (datetime.utcnow() - last).total_seconds() < cooldown:
                             continue
-                    
+
                     # Log time horizon and news relevance for visibility
                     news_relevance = NewsService.score_news_relevance(
                         market.get('question', ''),
                         market.get('category')
                     )
                     time_label = "ULTRA-SHORT" if hours_to_res <= 24 else "SHORT" if hours_to_res <= 168 else "MEDIUM"
-                    if hours_to_res <= 168 or news_relevance > 0.6:  # Log short-term or high news value
+                    if hours_to_res <= 168 or news_relevance > 0.6:
                         print(f"[{time_label}] {hours_to_res:.1f}h | News relevance: {news_relevance:.2f}")
-                    
+
                     await self._analyze_market(market)
                     self._last_analysis[market_id] = datetime.utcnow()
                     self._last_analysis_price[market_id] = current_price
@@ -1789,52 +1822,86 @@ class KalshiBattleBot:
         
         # Step 2: Get historical performance for learning
         historical = self._get_historical_performance()
-        
-        # Step 3: Get AI signal with intelligence data and historical performance
-        try:
-            result = await self._ai_generator.generate_signal(
-                market_question=market.get('question', ''),
-                current_price=current_price,
-                spread=market.get('spread', 0.02),
-                resolution_rules=market.get('rules', '') or market.get('description', ''),
-                volume_24h=market.get('volume_24h', 0),
-                category=market.get('category'),
-                # Intelligence data
-                news_summary=intel.news_summary if intel else None,
-                domain_summary=intel.domain_summary if intel else None,
-                recent_price_change=intel.recent_price_change if intel else 0.0,
-                overreaction_info=overreaction_info,
-                # Historical performance for learning
-                historical_performance=historical.get('summary') if historical.get('total_trades', 0) > 0 else None,
+
+        # Step 3: Get AI signal — use probability cache if price is stable (saves API credits)
+        # Cache is valid for up to 2h if price moved <1.5¢ since last call
+        cached = self._prob_cache.get(market_id)
+        use_cache = False
+        if cached:
+            cache_time, cache_price, cache_prob, cache_conf = cached
+            price_drift = abs(current_price - cache_price)
+            cache_age = (datetime.utcnow() - cache_time).total_seconds()
+            hours_to_res = market.get('hours_to_resolution', 9999)
+            max_cache_age = 300 if hours_to_res <= 24 else 3600  # 5 min for ultra-short, 1 hr otherwise
+            if price_drift < 0.015 and cache_age < max_cache_age:
+                use_cache = True
+
+        if use_cache:
+            # Reconstruct a minimal signal result from cache — no API call needed
+            from logic.ai_signal import TradeSignal
+            cached_signal = TradeSignal(
+                raw_prob=cache_prob,
+                confidence=cache_conf,
+                key_reasons=["(cached — price unchanged)"],
             )
-            
-            # Check if AI call succeeded (result is AISignalResult with success flag)
-            if not result or not result.success or not result.signal:
-                error_msg = result.error if result else "No response"
-                print(f"[AI] FAILED: {error_msg}")
-                # Store failed analysis
-                self._analyses.insert(0, {
-                    'market_id': market_id,
-                    'question': market.get('question', ''),
-                    'market_price': current_price,
-                    'ai_probability': None,
-                    'confidence': None,
-                    'edge': 0,
-                    'side': None,
-                    'decision': 'NO_TRADE',
-                    'reason': f"AI failed: {error_msg}",
-                    'timestamp': datetime.utcnow().isoformat(),
-                })
-                self._analyses = self._analyses[:50]
-                await self._broadcast_update()
-                return
-            
-            # Extract signal data from result
-            signal = result.signal
+            class _CachedResult:
+                success = True
+                error = None
+                latency_ms = 0
+                signal = cached_signal
+            result = _CachedResult()
+            signal = cached_signal
             self._ai_successes += 1
+            print(f"[AI] {question[:45]}... | ♻ CACHED (drift {abs(current_price - cache_price):.3f})")
+        else:
+            try:
+                result = await self._ai_generator.generate_signal(
+                    market_question=market.get('question', ''),
+                    current_price=current_price,
+                    spread=market.get('spread', 0.02),
+                    resolution_rules=market.get('rules', '') or market.get('description', ''),
+                    volume_24h=market.get('volume_24h', 0),
+                    category=market.get('category'),
+                    # Intelligence data
+                    news_summary=intel.news_summary if intel else None,
+                    domain_summary=intel.domain_summary if intel else None,
+                    recent_price_change=intel.recent_price_change if intel else 0.0,
+                    overreaction_info=overreaction_info,
+                    # Historical performance for learning
+                    historical_performance=historical.get('summary') if historical.get('total_trades', 0) > 0 else None,
+                )
             
-        except Exception as e:
-            print(f"[AI] FAILED: {e}")
+                # Check if AI call succeeded
+                if not result or not result.success or not result.signal:
+                    error_msg = result.error if result else "No response"
+                    print(f"[AI] FAILED: {error_msg}")
+                    self._analyses.insert(0, {
+                        'market_id': market_id,
+                        'question': market.get('question', ''),
+                        'market_price': current_price,
+                        'ai_probability': None,
+                        'confidence': None,
+                        'edge': 0,
+                        'side': None,
+                        'decision': 'NO_TRADE',
+                        'reason': f"AI failed: {error_msg}",
+                        'timestamp': datetime.utcnow().isoformat(),
+                    })
+                    self._analyses = self._analyses[:50]
+                    await self._broadcast_update()
+                    return
+
+                # Extract signal data from result
+                signal = result.signal
+                self._ai_successes += 1
+                # Store in probability cache for reuse when price is stable
+                self._prob_cache[market_id] = (datetime.utcnow(), current_price, signal.raw_prob, signal.confidence)
+
+            except Exception as e:
+                print(f"[AI] FAILED: {e}")
+                return
+
+        if not signal:
             return
         
         # Step 3: Calibrate probability (async call)
