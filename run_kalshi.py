@@ -1624,21 +1624,15 @@ class KalshiBattleBot:
 
                     # FILTER: Skip foreign elections with no reliable intelligence
                     # These consistently produce LOW_CONFIDENCE signals and waste API credits
-                    low_intel_patterns = [
+                    # Filter markets by explicit country/region name — avoids false positives
+                    # from generic terms like "house of rep" matching foreign parliaments
+                    no_intel_countries = [
                         'nepal', 'kenya', 'nigeria', 'pakistan', 'bangladesh',
                         'ethiopia', 'myanmar', 'cambodia', 'laos', 'mozambique',
                         'zimbabwe', 'zambia', 'malawi', 'botswana', 'namibia',
-                        'house of representatives', 'house of represen',  # foreign parliament races
+                        'colombian chamber', 'colombia election',
                     ]
-                    # Only apply this filter for non-US markets (US House is fine)
-                    # "congress" alone is ambiguous (Nepal Congress party vs US Congress)
-                    # require "u.s. congress" or "u.s. senate" etc. for US detection
-                    is_us_market = any(x in question_lower for x in [
-                        'u.s.', 'us ', 'united states', 'america', 'american',
-                        'u.s. senate', 'u.s. congress', 'white house', 'president trump',
-                        'president biden', 'trump', 'biden', 'harris', 'senate', 'house of rep',
-                    ])
-                    if not is_us_market and any(p in question_lower for p in low_intel_patterns):
+                    if any(p in question_lower for p in no_intel_countries):
                         continue  # Skip: no reliable news intelligence for this market
 
                     # FILTER 3: Skip markets where probability is extreme (< 10% or > 90%)
