@@ -3684,7 +3684,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="card"><div class="card-label">Kelly Fraction</div><div class="card-value" id="cfgKelly">—</div><div class="card-sub">sizing conservatism</div></div>
                 <div class="card"><div class="card-label">Trading</div><div class="card-value" id="cfgTrading">—</div><div class="card-sub" id="cfgTradingSub">kill-switch status</div></div>
             </div>
-            <div class="section-title">PORTFOLIO VALUE (Kalshi) <span style="font-size:10px;opacity:0.6;">day-over-day · hourly for today · <span style="color:#3fb950;">green</span> = above $150 · <span style="color:#f85149;">red</span> = below</span></div>
+            <div class="section-title" style="display:flex;align-items:center;justify-content:space-between;">
+                <span>PORTFOLIO VALUE (Kalshi) <span style="font-size:10px;opacity:0.6;"><span style="color:#3fb950;">green</span> = above deposits · <span style="color:#f85149;">red</span> = below</span></span>
+                <span id="chartToggle" style="display:flex;gap:4px;">
+                    <button onclick="setChartMode('hourly')" id="btnHourly" style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#8b949e;cursor:pointer;">Hourly</button>
+                    <button onclick="setChartMode('daily')" id="btnDaily" style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid #58a6ff;background:#1f3a5f;color:#58a6ff;cursor:pointer;">Daily</button>
+                    <button onclick="setChartMode('monthly')" id="btnMonthly" style="font-size:11px;padding:3px 10px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#8b949e;cursor:pointer;">Monthly</button>
+                </span>
+            </div>
             <div id="historyChart" style="padding:12px 0 4px 0;min-height:230px;"></div>
             <div class="section-title">Active Positions <span id="positionCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="positions"></div>
@@ -3906,9 +3913,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 if (tpc) { tpc.textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%'; tpc.className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red'); }
                 if (tt) { tt.textContent = (todayPn != null ? (todayPn >= 0 ? '+' : '') + '$' + todayPn.toFixed(2) : '—'); tt.className = 'card-value' + (todayPn != null ? ' ' + (todayPn >= 0 ? 'green' : 'red') : ''); }
                 
-                // Portfolio value chart (day-over-day, hourly for today)
+                // Portfolio value chart — store data globally so toggle buttons can re-render
                 if (p.history) {
-                    renderHistoryChart(p.history, p.today_hourly || [], p.account.total_deposits || 150);
+                    window._chartHistory   = p.history;
+                    window._chartHourly    = p.today_hourly || [];
+                    window._chartDeposits  = p.account.total_deposits || 150;
+                    renderHistoryChart(window._chartHistory, window._chartHourly, window._chartDeposits, window._chartMode || 'daily');
                 }
                 
                 // Strategy readout (state + signals); don't block main UI if these fail
@@ -4103,8 +4113,27 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             }
         }
         
+        // Chart mode toggle
+        window._chartMode = 'daily';
+        function setChartMode(mode) {
+            window._chartMode = mode;
+            ['hourly','daily','monthly'].forEach(m => {
+                const btn = document.getElementById('btn' + m.charAt(0).toUpperCase() + m.slice(1));
+                if (!btn) return;
+                if (m === mode) {
+                    btn.style.borderColor = '#58a6ff'; btn.style.background = '#1f3a5f'; btn.style.color = '#58a6ff';
+                } else {
+                    btn.style.borderColor = '#30363d'; btn.style.background = '#21262d'; btn.style.color = '#8b949e';
+                }
+            });
+            if (window._chartHistory) {
+                renderHistoryChart(window._chartHistory, window._chartHourly || [], window._chartDeposits || 150, mode);
+            }
+        }
+
         // Portfolio value (Kalshi) day-over-day: line + bar chart, updates hourly
-        function renderHistoryChart(history, todayHourly, depositsArg) {
+        function renderHistoryChart(history, todayHourly, depositsArg, mode) {
+            mode = mode || 'daily';
             const container = document.getElementById('historyChart');
             if (!history || history.length === 0) {
                 container.innerHTML = '<div style="color:#8b949e;font-size:13px;padding:24px 0;text-align:center;">No history yet — data updates hourly once the bot syncs with Kalshi.</div>';
@@ -4114,44 +4143,50 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             const DEPOSITS = parseFloat(depositsArg) || 150;
             const ordered = history.slice().reverse(); // oldest → newest
             const todayStr = new Date().toISOString().slice(0, 10);
-
-            // Build unified series: past days (daily) + today (hourly if available)
-            const pastDays = ordered.filter(h => h.date < todayStr && h.account_value != null);
             const todayDay  = ordered.find(h => h.date === todayStr);
 
             let points = [];
-            pastDays.forEach(h => {
-                const d = new Date(h.date + 'T12:00:00');
-                points.push({
-                    label:     d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-                    dayLabel:  d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
-                    value:     h.account_value,
-                    isToday:   false, isHourly: false,
-                    high:      h.intraday_high, low: h.intraday_low,
-                });
-            });
+            let todaySepIdx = 0;
 
-            const todaySepIdx = points.length; // index where today starts
-
-            if (todayHourly && todayHourly.length > 0) {
+            if (mode === 'hourly') {
+                // Hourly mode: show only today's hourly data
+                if (!todayHourly || todayHourly.length === 0) {
+                    container.innerHTML = '<div style="color:#8b949e;font-size:13px;padding:24px 0;text-align:center;">No hourly data yet for today.</div>';
+                    return;
+                }
                 todayHourly.forEach((pt, i) => {
                     const hh = String(pt.hour).padStart(2,'0');
+                    points.push({ label: hh+':00', dayLabel: 'Today '+hh+':00', value: pt.value,
+                                  isToday: true, isHourly: true, isLatest: i === todayHourly.length - 1 });
+                });
+                todaySepIdx = 0;
+            } else {
+                // Daily / Monthly: show past days + today
+                const daysBack = mode === 'monthly' ? 30 : 14;
+                const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - daysBack);
+                const cutoffStr = cutoff.toISOString().slice(0, 10);
+                const pastDays = ordered.filter(h => h.date < todayStr && h.date >= cutoffStr && h.account_value != null);
+                pastDays.forEach(h => {
+                    const d = new Date(h.date + 'T12:00:00');
                     points.push({
-                        label:    hh + ':00',
-                        dayLabel: 'Today ' + hh + ':00',
-                        value:    pt.value,
-                        isToday:  true, isHourly: true,
-                        isLatest: i === todayHourly.length - 1,
+                        label:    d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+                        dayLabel: d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+                        value: h.account_value, isToday: false, isHourly: false,
+                        high: h.intraday_high, low: h.intraday_low,
                     });
                 });
-            } else if (todayDay && todayDay.account_value != null) {
-                points.push({
-                    label: 'Today', dayLabel: 'Today',
-                    value: todayDay.account_value,
-                    isToday: true, isHourly: false,
-                    high: todayDay.intraday_high, low: todayDay.intraday_low,
-                    isLatest: true,
-                });
+                todaySepIdx = points.length;
+                if (todayHourly && todayHourly.length > 0) {
+                    todayHourly.forEach((pt, i) => {
+                        const hh = String(pt.hour).padStart(2,'0');
+                        points.push({ label: hh+':00', dayLabel: 'Today '+hh+':00', value: pt.value,
+                                      isToday: true, isHourly: true, isLatest: i === todayHourly.length - 1 });
+                    });
+                } else if (todayDay && todayDay.account_value != null) {
+                    points.push({ label: 'Today', dayLabel: 'Today', value: todayDay.account_value,
+                                  isToday: true, isHourly: false,
+                                  high: todayDay.intraday_high, low: todayDay.intraday_low, isLatest: true });
+                }
             }
 
             if (points.length === 0) {
