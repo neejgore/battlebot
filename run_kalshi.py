@@ -4206,10 +4206,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
             const allVals = points.map(p => p.value).filter(v => v != null);
             const highVals = points.filter(p => p.high).map(p => p.high);
-            const spread = Math.max(...[...allVals, ...highVals, DEPOSITS]) - Math.min(...allVals, DEPOSITS);
+            // Include today's intraday high so the watermark line never clips above the chart
+            const todayHighVal = (todayDay && todayDay.intraday_high) ? todayDay.intraday_high : 0;
+            const spread = Math.max(...[...allVals, ...highVals, DEPOSITS, todayHighVal]) - Math.min(...allVals, DEPOSITS);
             const vPad = Math.max(spread * 0.18, 3);
             const minY = Math.max(0, Math.min(...allVals, DEPOSITS) - vPad);
-            const maxY = Math.max(...allVals, ...highVals, DEPOSITS) + vPad;
+            const maxY = Math.max(...allVals, ...highVals, DEPOSITS, todayHighVal) + vPad;
             const yRange = maxY - minY || 1;
 
             const xS = i  => pad.left + (i / Math.max(points.length - 1, 1)) * cW;
