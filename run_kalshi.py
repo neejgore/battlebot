@@ -46,7 +46,7 @@ class KalshiBattleBot:
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.55))  # 55% confidence — raised from 40%; data showed conf<0.55 loses money
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 25))  # $25 max - bigger bets on better opportunities
         self.max_days_to_resolution = float(os.getenv('MAX_DAYS_TO_RESOLUTION', 30))  # 30 days max — tighter than 45
-        self.min_days_to_resolution = float(os.getenv('MIN_DAYS_TO_RESOLUTION', 2))  # 2 day floor — no same/next-day gambling
+        self.min_days_to_resolution = float(os.getenv('MIN_DAYS_TO_RESOLUTION', 0))  # No minimum — sports/weather filters handle bad short-horizon bets; BTC range needs access
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.10))  # 10% Kelly — conservative sizing
         self.max_oi_pct = float(os.getenv('MAX_OI_PCT', 0.10))  # Max 10% of open interest
         self.simulate_prices = os.getenv('SIMULATE_PRICES', 'false').lower() == 'true'
@@ -1034,7 +1034,7 @@ class KalshiBattleBot:
         print(f"Bankroll: ${self.initial_bankroll:,.2f}")
         print(f"Min Edge: {self.min_edge*100:.1f}%  |  Min Confidence: {self.min_confidence*100:.0f}%")
         print(f"Max Position: ${self.max_position_size:,.2f}  |  Kelly: {self.kelly_fraction*100:.0f}%")
-        print(f"Horizon: {self.min_days_to_resolution:.0f}d min — {self.max_days_to_resolution:.0f}d max")
+        print(f"Horizon: 12h min (hard floor) — {self.max_days_to_resolution:.0f}d max  [BTC range bets: allowed]")
         print(f"Daily Loss Limit: 10%  |  Cluster Cap: {os.getenv('MAX_CLUSTER_POSITIONS','3')} (trump_speech=1)")
         print(f"\n[Intelligence Features]")
         print(f"  News Integration: {'ON' if self._use_intelligence else 'OFF'}")
@@ -1691,10 +1691,12 @@ class KalshiBattleBot:
                     if hours_to_res_check > max_hours:
                         continue  # Too far out — too much can change before resolution
 
-                    # FILTER 6b: Skip markets resolving too soon — no time to be right, pure gambling
-                    min_hours = self.min_days_to_resolution * 24
+                    # FILTER 6b: Skip markets resolving in under 12h — truly last-minute, price locked in
+                    # NOTE: BTC range bets resolve in 1-2 days and are our best-performing category.
+                    # Keep this floor at 12h only to block bets placed in the final hours before resolution.
+                    min_hours = max(self.min_days_to_resolution * 24, 12) if self.min_days_to_resolution > 0 else 12
                     if hours_to_res_check > 0 and hours_to_res_check < min_hours:
-                        continue  # Resolves in under 2 days — too close, price already locked in
+                        continue  # Resolves in under 12h — too close to resolution, skip
                         
                     if len(self._positions) >= self._risk_limits.max_positions:
                         break
