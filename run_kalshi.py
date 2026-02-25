@@ -1032,8 +1032,10 @@ class KalshiBattleBot:
         print(f"{'='*60}")
         print(f"Platform: Kalshi (CFTC-regulated, US legal)")
         print(f"Bankroll: ${self.initial_bankroll:,.2f}")
-        print(f"Min Edge: {self.min_edge*100:.1f}%")
-        print(f"Max Position: ${self.max_position_size:,.2f}")
+        print(f"Min Edge: {self.min_edge*100:.1f}%  |  Min Confidence: {self.min_confidence*100:.0f}%")
+        print(f"Max Position: ${self.max_position_size:,.2f}  |  Kelly: {self.kelly_fraction*100:.0f}%")
+        print(f"Horizon: {self.min_days_to_resolution:.0f}d min — {self.max_days_to_resolution:.0f}d max")
+        print(f"Daily Loss Limit: 10%  |  Cluster Cap: {os.getenv('MAX_CLUSTER_POSITIONS','3')} (trump_speech=1)")
         print(f"\n[Intelligence Features]")
         print(f"  News Integration: {'ON' if self._use_intelligence else 'OFF'}")
         # Check if Brave is configured
@@ -2158,7 +2160,8 @@ class KalshiBattleBot:
 
             # News-backed bets: win rate is higher (+17pp) but larger sizes amplify losses.
             # Cap news-backed sizing at 60% of Kelly output to prevent overconcentration.
-            has_intel = self._analyses[0].get('has_intel', False) if self._analyses else False
+            # Use local `intel` variable (not self._analyses[0]) to avoid race with concurrent analysis.
+            has_intel = intel is not None
             if has_intel and signal.confidence < 0.80:
                 pre_cap = position_size
                 position_size = position_size * 0.6
