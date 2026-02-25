@@ -42,11 +42,12 @@ class KalshiBattleBot:
         # Config from env - STRICT defaults for profitability
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
-        self.min_edge = max(0.07, float(os.getenv('MIN_EDGE', 0.08)))  # 8% min edge — filters noise without blocking moderate edges
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.40))  # 40% confidence — filters low-quality calls; 50% was too strict, blocked all trades
+        self.min_edge = max(0.12, float(os.getenv('MIN_EDGE', 0.12)))  # 12% min edge — raised from 8% to cut low-quality bets
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.55))  # 55% confidence — raised from 40%; data showed conf<0.55 loses money
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 25))  # $25 max - bigger bets on better opportunities
-        self.max_days_to_resolution = float(os.getenv('MAX_DAYS_TO_RESOLUTION', 45))  # Skip markets resolving > 45 days out
-        self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.20))  # 20% Kelly - higher conviction on filtered bets
+        self.max_days_to_resolution = float(os.getenv('MAX_DAYS_TO_RESOLUTION', 30))  # 30 days max — tighter than 45
+        self.min_days_to_resolution = float(os.getenv('MIN_DAYS_TO_RESOLUTION', 2))  # 2 day floor — no same/next-day gambling
+        self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.10))  # 10% Kelly — conservative sizing
         self.max_oi_pct = float(os.getenv('MAX_OI_PCT', 0.10))  # Max 10% of open interest
         self.simulate_prices = os.getenv('SIMULATE_PRICES', 'false').lower() == 'true'
         
@@ -102,7 +103,7 @@ class KalshiBattleBot:
         
         # Risk Engine - selective but confident
         self._risk_limits = RiskLimits(
-            max_daily_drawdown=0.15,
+            max_daily_drawdown=0.10,  # 10% daily loss circuit breaker (was 15%)
             max_position_size=self.max_position_size,  # $30 max
             max_percent_bankroll_per_market=0.25,  # 25% per market - fewer bets = bigger size
             max_total_open_risk=0.90,  # 90% max exposure - 10% reserve
@@ -490,7 +491,18 @@ class KalshiBattleBot:
             print(f"[Reconcile] Error during reconciliation: {e}")
             import traceback
             traceback.print_exc()
-    
+
+    async def _settlement_reconcile_loop(self):
+        """Run settlement reconciliation every 6 hours to capture settled markets."""
+        await asyncio.sleep(3600)  # First run 1 hour after startup (startup already ran it)
+        while True:
+            try:
+                if not self.dry_run:
+                    await self._reconcile_settlements_from_fills()
+            except Exception as e:
+                print(f"[SettleLoop] Error: {e}")
+            await asyncio.sleep(6 * 3600)  # Every 6 hours
+
     async def _sync_positions_with_kalshi(self):
         """Sync internal positions with Kalshi's actual positions and balance.
         
@@ -967,6 +979,7 @@ class KalshiBattleBot:
             'kelly_fraction': self.kelly_fraction,
             'max_oi_pct': self.max_oi_pct,
             'max_days_to_resolution': self.max_days_to_resolution,
+            'min_days_to_resolution': self.min_days_to_resolution,
             'max_cluster_positions': int(os.getenv('MAX_CLUSTER_POSITIONS', '3')),
             'profit_lock_pct': float(os.getenv('PROFIT_LOCK_PCT', '0.50')),
             'kill_switch': self._risk_engine.daily_stats.kill_switch_triggered,
@@ -1053,16 +1066,16 @@ class KalshiBattleBot:
         if not self.dry_run:
             await self._sync_positions_with_kalshi()
         
-        # DISABLED: Reconciliation was creating buggy P&L data that corrupted dashboard
-        # The bot will track trades going forward; historical trades are in Kalshi account
-        # if not self.dry_run:
-        #     await self._reconcile_settlements_from_fills()
-        
+        # Run once on startup to backfill any settlements that happened during downtime
+        if not self.dry_run:
+            await self._reconcile_settlements_from_fills()
+
         # Start background tasks
         asyncio.create_task(self._market_loop())
         asyncio.create_task(self._trading_loop())
         asyncio.create_task(self._position_monitor_loop())
         asyncio.create_task(self._price_refresh_loop())
+        asyncio.create_task(self._settlement_reconcile_loop())  # Periodic settlement P&L backfill
         if not self.dry_run:
             asyncio.create_task(self._position_sync_loop())
         
@@ -1639,6 +1652,10 @@ class KalshiBattleBot:
                         # Foreign central banks — consistently LOW_CONFIDENCE, no news edge
                         "people's bank of china", 'pboc', 'bank of china cut',
                         'ecb cut', 'bank of england cut', 'bank of japan cut',
+                        # Weather — bot has zero meteorological data; all snow/rain bets have lost money
+                        'snow', 'rainfall', 'precipitation', 'blizzard', 'snowfall',
+                        'rain in ', 'will it rain', 'inches of rain', 'inches of snow',
+                        'storm in ', 'hurricane', 'tornado',
                     ]
                     if any(p in question_lower for p in no_intel_patterns):
                         continue  # Skip: no reliable news intelligence for this market
@@ -1657,8 +1674,12 @@ class KalshiBattleBot:
                     if volume < 500:
                         continue  # Skip illiquid markets - need 500+ for reliable exits
                     
-                    # FILTER 5: Skip narrow-range weather/temperature markets (coin flips)
-                    weather_patterns = ['temperature', '° to ', '°-', 'degrees', 'high of', 'low of']
+                    # FILTER 5: Skip all temperature/weather range markets (coin flips, no edge)
+                    weather_patterns = [
+                        'temperature', '° to ', '°-', 'degrees', 'high of', 'low of',
+                        'high temp', 'low temp', 'max temp', 'min temp',
+                        'weather in', 'climate', 'sunny', 'cloudy', 'foggy',
+                    ]
                     if any(p in question_lower for p in weather_patterns):
                         continue  # Weather ranges are unpredictable coin flips
 
@@ -1667,6 +1688,11 @@ class KalshiBattleBot:
                     max_hours = self.max_days_to_resolution * 24
                     if hours_to_res_check > max_hours:
                         continue  # Too far out — too much can change before resolution
+
+                    # FILTER 6b: Skip markets resolving too soon — no time to be right, pure gambling
+                    min_hours = self.min_days_to_resolution * 24
+                    if hours_to_res_check > 0 and hours_to_res_check < min_hours:
+                        continue  # Resolves in under 2 days — too close, price already locked in
                         
                     if len(self._positions) >= self._risk_limits.max_positions:
                         break
@@ -1693,7 +1719,16 @@ class KalshiBattleBot:
                         if self._get_cluster_key(p.get('question', '')) == _pre_cluster_key
                     )
                     MAX_POSITIONS_PER_CLUSTER = int(os.getenv('MAX_CLUSTER_POSITIONS', '3'))
-                    if _pre_cluster_count >= MAX_POSITIONS_PER_CLUSTER:
+                    # Per-cluster overrides: tighter caps on low-edge speculative categories
+                    _CLUSTER_CAPS = {
+                        'trump_speech':        1,  # "Will Trump say X" — generic AI reasoning, bad P&L
+                        'weather_new_york':    1,  # Residual; new weather bets already blocked upstream
+                        'weather_philadelphia': 1,
+                        'weather_generic':     1,
+                        'intl_central_banks':  1,  # No news edge on foreign CB markets
+                    }
+                    _cluster_cap = _CLUSTER_CAPS.get(_pre_cluster_key, MAX_POSITIONS_PER_CLUSTER)
+                    if _pre_cluster_count >= _cluster_cap:
                         continue
 
                     # Check cooldown and price movement
@@ -2040,15 +2075,29 @@ class KalshiBattleBot:
         # Check if we should trade
         should_trade = True
         reasons = []
-        
+
+        # DAILY LOSS CIRCUIT BREAKER: Stop opening new positions if down >10% today
+        # Uses Kalshi's authoritative total value vs start-of-day snapshot
+        if hasattr(self, '_daily_snapshots'):
+            today_str = datetime.utcnow().strftime('%Y-%m-%d')
+            today_snap = self._daily_snapshots.get(today_str, {})
+            start_val = today_snap.get('start_of_day_value')
+            current_val = self._kalshi_total
+            if start_val and current_val and start_val > 0:
+                daily_loss_pct = (current_val - start_val) / start_val
+                if daily_loss_pct < -0.10:
+                    should_trade = False
+                    reasons.append(f'DAILY_LOSS_LIMIT_{daily_loss_pct*100:.1f}pct')
+                    print(f"[Risk] Daily loss circuit breaker: {daily_loss_pct*100:.1f}% today — pausing new bets")
+
         if edge < self.min_edge:
             should_trade = False
             reasons.append('LOW_EDGE')
-        
+
         if signal.confidence < self.min_confidence:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
-        
+
         if market_id in [p.get('market_id') for p in self._positions.values()]:
             should_trade = False
             reasons.append('ALREADY_IN_POSITION')
@@ -2078,7 +2127,16 @@ class KalshiBattleBot:
             1 for p in self._positions.values()
             if self._get_cluster_key(p.get('question', '')) == cluster_key
         )
-        if cluster_count >= MAX_POSITIONS_PER_CLUSTER:
+        # Per-cluster overrides: tighter caps on speculative/low-edge categories
+        _EXEC_CLUSTER_CAPS = {
+            'trump_speech':        1,
+            'weather_new_york':    1,
+            'weather_philadelphia': 1,
+            'weather_generic':     1,
+            'intl_central_banks':  1,
+        }
+        _exec_cluster_cap = _EXEC_CLUSTER_CAPS.get(cluster_key, MAX_POSITIONS_PER_CLUSTER)
+        if cluster_count >= _exec_cluster_cap:
             should_trade = False
             reasons.append(f'CLUSTER_CAP_{cluster_key[:20]}_{cluster_count}')
         
@@ -2097,7 +2155,15 @@ class KalshiBattleBot:
                 confidence=signal.confidence,
                 market_id=market_id,
             )
-            
+
+            # News-backed bets: win rate is higher (+17pp) but larger sizes amplify losses.
+            # Cap news-backed sizing at 60% of Kelly output to prevent overconcentration.
+            has_intel = self._analyses[0].get('has_intel', False) if self._analyses else False
+            if has_intel and signal.confidence < 0.80:
+                pre_cap = position_size
+                position_size = position_size * 0.6
+                print(f"[Intel Size Cap] ${pre_cap:.2f} → ${position_size:.2f} (news bet, conf<0.80)")
+
             # Liquidity cap: don't exceed X% of open interest
             open_interest = market.get('open_interest', 0) or 0
             if open_interest > 0 and self.max_oi_pct > 0:
@@ -2107,9 +2173,9 @@ class KalshiBattleBot:
                 if position_size > max_size_by_liquidity:
                     print(f"[Liquidity Cap] ${position_size:.2f} → ${max_size_by_liquidity:.2f} (OI={open_interest}, max {self.max_oi_pct*100:.0f}%)")
                     position_size = max_size_by_liquidity
-            
+
             print(f"[Debug] Position size: ${position_size:.2f}")
-            
+
             if position_size > 0:
                 await self._enter_position(market, side, position_size, adjusted_prob, edge, signal.confidence)
                 print(f"[AI] {question}... | ✓ TRADE | Edge: +{edge*100:.1f}% | Conf: {signal.confidence*100:.0f}%")
@@ -3677,7 +3743,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div id="filtersGrid" class="grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-bottom:16px;">
                 <div class="card"><div class="card-label">Min Edge</div><div class="card-value" id="cfgMinEdge">—</div><div class="card-sub">AI edge must exceed</div></div>
                 <div class="card"><div class="card-label">Min Confidence</div><div class="card-value" id="cfgMinConf">—</div><div class="card-sub">AI certainty must exceed</div></div>
-                <div class="card"><div class="card-label">Max Horizon</div><div class="card-value" id="cfgMaxDays">—</div><div class="card-sub">market must resolve within</div></div>
+                <div class="card"><div class="card-label">Horizon Window</div><div class="card-value" id="cfgMaxDays">—</div><div class="card-sub" id="cfgDaysSub">must resolve within X days</div></div>
                 <div class="card"><div class="card-label">Profit-Lock Exit</div><div class="card-value" id="cfgProfitLock">—</div><div class="card-sub">auto-sell at this gain</div></div>
                 <div class="card"><div class="card-label">Cluster Cap</div><div class="card-value" id="cfgCluster">—</div><div class="card-sub">max bets per news theme</div></div>
                 <div class="card"><div class="card-label">Max Bet Size</div><div class="card-value" id="cfgMaxBet">—</div><div class="card-sub">per position ceiling</div></div>
@@ -3808,6 +3874,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             if (fEdge) fEdge.textContent = (s.min_edge * 100).toFixed(0) + '%';
             if (fConf) fConf.textContent = (s.min_confidence * 100).toFixed(0) + '%';
             if (fDays) fDays.textContent = s.max_days_to_resolution != null ? s.max_days_to_resolution + 'd' : '—';
+            const fDaysSub = document.getElementById('cfgDaysSub');
+            if (fDaysSub && s.min_days_to_resolution != null) fDaysSub.textContent = s.min_days_to_resolution + 'd min · ' + s.max_days_to_resolution + 'd max';
             if (fLock) fLock.textContent = s.profit_lock_pct != null ? '+' + (s.profit_lock_pct * 100).toFixed(0) + '%' : '—';
             if (fClus) fClus.textContent = s.max_cluster_positions != null ? s.max_cluster_positions + ' pos' : '—';
             if (fBet)  fBet.textContent  = s.max_position_size != null ? '$' + s.max_position_size : '—';
