@@ -6,6 +6,7 @@ CFTC-regulated, legal for US residents including California.
 
 import os
 import time
+import asyncio
 import base64
 import hashlib
 from datetime import datetime
@@ -30,6 +31,11 @@ class KalshiClient:
     PROD_URL = "https://api.elections.kalshi.com/trade-api/v2"
     DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
     
+    # Kalshi rate limit: ~10 req/s across all endpoints.
+    # We stay well under with a 0.2s minimum gap between calls (5 req/s max).
+    _MIN_CALL_INTERVAL = 0.2  # seconds between API calls
+    _last_call_time: float = 0.0
+
     def __init__(self, 
                  api_key_id: Optional[str] = None,
                  private_key_path: Optional[str] = None,
@@ -111,6 +117,44 @@ class KalshiClient:
         )
         return base64.b64encode(signature).decode()
     
+    async def _rate_limit(self):
+        """Enforce minimum gap between Kalshi API calls to avoid 429s."""
+        now = time.monotonic()
+        gap = now - KalshiClient._last_call_time
+        if gap < self._MIN_CALL_INTERVAL:
+            await asyncio.sleep(self._MIN_CALL_INTERVAL - gap)
+        KalshiClient._last_call_time = time.monotonic()
+
+    async def _get_with_retry(self, client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+        """GET with automatic retry on 429 (exponential backoff, max 3 attempts)."""
+        for attempt in range(3):
+            await self._rate_limit()
+            response = await client.get(url, **kwargs)
+            if response.status_code == 429:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                logger.warning(f"Kalshi 429 rate limit on {url} — retrying in {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response
+        response.raise_for_status()  # raise on final attempt
+        return response
+
+    async def _post_with_retry(self, client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
+        """POST with automatic retry on 429."""
+        for attempt in range(3):
+            await self._rate_limit()
+            response = await client.post(url, **kwargs)
+            if response.status_code == 429:
+                wait = 2 ** attempt
+                logger.warning(f"Kalshi 429 on POST {url} — retrying in {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response
+        response.raise_for_status()
+        return response
+
     def _get_auth_headers(self, method: str, path: str) -> dict:
         """Generate authentication headers for request."""
         if not self.api_key_id or not self._private_key:
@@ -164,12 +208,10 @@ class KalshiClient:
             params['mve_filter'] = 'exclude'
             
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
-                params=params,
-                headers={'Accept': 'application/json'}
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
+                params=params, headers={'Accept': 'application/json'}
             )
-            response.raise_for_status()
             return response.json()
     
     async def get_market(self, ticker: str) -> dict:
@@ -177,27 +219,21 @@ class KalshiClient:
         path = f"/markets/{ticker}"
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
                 headers={'Accept': 'application/json'}
             )
-            response.raise_for_status()
             return response.json()
     
     async def get_series_list(self) -> dict:
-        """Fetch all available series (categories of markets).
-        
-        Returns:
-            Dict with 'series' list containing all series tickers and metadata
-        """
+        """Fetch all available series (categories of markets)."""
         path = "/series"
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
                 headers={'Accept': 'application/json'}
             )
-            response.raise_for_status()
             return response.json()
     
     async def get_events(self, 
@@ -205,14 +241,7 @@ class KalshiClient:
                         limit: int = 100,
                         series_ticker: Optional[str] = None,
                         cursor: Optional[str] = None) -> dict:
-        """Fetch events (series of related markets).
-        
-        Args:
-            status: Event status (open, closed, settled)
-            limit: Max results per page
-            series_ticker: Filter by series ticker (e.g., 'PRES' for politics)
-            cursor: Pagination cursor
-        """
+        """Fetch events (series of related markets)."""
         path = "/events"
         params = {'status': status, 'limit': limit}
         if series_ticker:
@@ -221,12 +250,10 @@ class KalshiClient:
             params['cursor'] = cursor
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
-                params=params,
-                headers={'Accept': 'application/json'}
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
+                params=params, headers={'Accept': 'application/json'}
             )
-            response.raise_for_status()
             return response.json()
     
     async def get_orderbook(self, ticker: str) -> dict:
@@ -234,11 +261,10 @@ class KalshiClient:
         path = f"/markets/{ticker}/orderbook"
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
                 headers={'Accept': 'application/json'}
             )
-            response.raise_for_status()
             return response.json()
     
     async def get_balance(self) -> dict:
@@ -248,11 +274,10 @@ class KalshiClient:
         headers['Accept'] = 'application/json'
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
                 headers=headers
             )
-            response.raise_for_status()
             return response.json()
     
     async def place_order(self,
@@ -295,12 +320,10 @@ class KalshiClient:
         logger.debug(f"Placing order: {body}")
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                f"{self.base_url}{path}",
-                headers=headers,
-                json=body
+            response = await self._post_with_retry(
+                client, f"{self.base_url}{path}",
+                headers=headers, json=body
             )
-            response.raise_for_status()
             return response.json()
     
     async def sell_position(self,
@@ -343,12 +366,10 @@ class KalshiClient:
         logger.debug(f"Selling position: {body}")
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                f"{self.base_url}{path}",
-                headers=headers,
-                json=body
+            response = await self._post_with_retry(
+                client, f"{self.base_url}{path}",
+                headers=headers, json=body
             )
-            response.raise_for_status()
             return response.json()
     
     async def get_positions(self) -> dict:
@@ -358,11 +379,10 @@ class KalshiClient:
         headers['Accept'] = 'application/json'
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
                 headers=headers
             )
-            response.raise_for_status()
             return response.json()
     
     async def cancel_order(self, order_id: str) -> dict:
@@ -372,10 +392,8 @@ class KalshiClient:
         headers['Accept'] = 'application/json'
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.delete(
-                f"{self.base_url}{path}",
-                headers=headers
-            )
+            await self._rate_limit()
+            response = await client.delete(f"{self.base_url}{path}", headers=headers)
             response.raise_for_status()
             return response.json()
     
@@ -386,11 +404,10 @@ class KalshiClient:
         headers['Accept'] = 'application/json'
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
                 headers=headers
             )
-            response.raise_for_status()
             return response.json()
     
     async def get_fills(self, ticker: Optional[str] = None, limit: int = 100) -> dict:
@@ -404,31 +421,23 @@ class KalshiClient:
             params['ticker'] = ticker
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
-                headers=headers,
-                params=params
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
+                headers=headers, params=params
             )
-            response.raise_for_status()
             return response.json()
     
     async def get_orders(self, status: str = "resting") -> dict:
-        """Get orders by status (requires auth).
-        
-        Args:
-            status: 'resting' (open), 'canceled', or 'executed'
-        """
+        """Get orders by status (requires auth)."""
         path = "/portfolio/orders"
         headers = self._get_auth_headers('GET', path)
         headers['Accept'] = 'application/json'
         
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{self.base_url}{path}",
-                headers=headers,
-                params={'status': status}
+            response = await self._get_with_retry(
+                client, f"{self.base_url}{path}",
+                headers=headers, params={'status': status}
             )
-            response.raise_for_status()
             return response.json()
 
 

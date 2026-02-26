@@ -3104,19 +3104,22 @@ class KalshiBattleBot:
                 side = 'yes' if contracts > 0 else 'no'
                 contracts = abs(contracts)
                 
-                # Get current market price
-                market_result = await self._kalshi.get_market(ticker)
-                market = market_result.get('market', {}) if market_result else {}
-                
-                yes_price = market.get('yes_bid', 50) / 100.0
-                no_price = market.get('no_bid', 50) / 100.0
+                # Use in-memory price cache (updated every 30s by _price_refresh_loop).
+                # Avoids firing 1 API call per position on every dashboard load, which
+                # trips Kalshi's 429 rate limit when combined with the refresh loop.
+                # Cache is at most ~60s stale — acceptable for display purposes.
+                cached_market = self._markets.get(ticker, {})
+                yes_price = cached_market.get('yes_price', 0.50)
+                no_price = cached_market.get('no_price', 1 - yes_price)
                 current_price = yes_price if side == 'yes' else no_price
+                question = cached_market.get('question', ticker)[:50]
                 
-                # Get entry price from our fills
+                # Get entry price from our internal position records
                 entry_price = 0.50  # default
                 for p in self._positions.values():
                     if p.get('market_id') == ticker:
                         entry_price = p.get('entry_price', 0.50)
+                        question = p.get('question', question)[:50]
                         break
                 
                 cost = contracts * entry_price
@@ -3128,7 +3131,7 @@ class KalshiBattleBot:
                 
                 positions_detail.append({
                     'ticker': ticker,
-                    'question': market.get('title', ticker)[:50],
+                    'question': question,
                     'side': side.upper(),
                     'contracts': contracts,
                     'entry_price': entry_price,
