@@ -1656,6 +1656,8 @@ class KalshiBattleBot:
                         'chinese gdp', 'china gdp', 'eurozone gdp', 'uk gdp',
                         'german gdp', 'japan gdp', 'india gdp',
                         'gdp (yoy)', 'gdp growth', 'gdp reading',
+                        # Dogecoin range — AI consistently low confidence (25-30%), no edge vs BTC
+                        'dogecoin price range', 'doge price range',
                         # Foreign central banks — consistently LOW_CONFIDENCE, no news edge
                         "people's bank of china", 'pboc', 'bank of china cut',
                         'ecb cut', 'bank of england cut', 'bank of japan cut',
