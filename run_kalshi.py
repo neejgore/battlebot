@@ -1651,6 +1651,11 @@ class KalshiBattleBot:
                         'ethiopia', 'myanmar', 'cambodia', 'laos', 'mozambique',
                         'zimbabwe', 'zambia', 'malawi', 'botswana', 'namibia',
                         'colombian chamber', 'colombia election',
+                        # Foreign macro/GDP — no edge, repeatedly rejected by AI (wastes API credits)
+                        'brazilian gdp', 'brazil gdp', 'brazil q4', 'brazil q3',
+                        'chinese gdp', 'china gdp', 'eurozone gdp', 'uk gdp',
+                        'german gdp', 'japan gdp', 'india gdp',
+                        'gdp (yoy)', 'gdp growth', 'gdp reading',
                         # Foreign central banks — consistently LOW_CONFIDENCE, no news edge
                         "people's bank of china", 'pboc', 'bank of china cut',
                         'ecb cut', 'bank of england cut', 'bank of japan cut',
