@@ -3293,8 +3293,18 @@ class KalshiBattleBot:
         # reflect a real tradeable high (bid/ask midpoints shift immediately on connect).
         bot_uptime_secs = (now - self._start_time).total_seconds() if self._start_time else 999
         if bot_uptime_secs >= 300:  # Only track high after 5 min of operation
-            current_high = snapshot.get('intraday_high', val)
-            if val > current_high:
+            current_high = snapshot.get('intraday_high')
+            # Floor: peak can never be lower than start_of_day_value.
+            # If the account dropped during the 5-min guard window, the first
+            # recorded peak is floored at the day's starting value so the dashboard
+            # never shows a peak below where the day began.
+            start_val = snapshot.get('start_of_day_value', val)
+            if current_high is None:
+                # First peak of the day — floor at start_of_day so peak >= start
+                current_high = max(val, start_val)
+                snapshot['intraday_high'] = current_high
+                snapshot['intraday_high_time'] = now.isoformat()
+            elif val > current_high:
                 snapshot['intraday_high'] = val
                 snapshot['intraday_high_time'] = now.isoformat()
             else:
