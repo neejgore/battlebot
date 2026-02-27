@@ -1017,13 +1017,6 @@ class KalshiBattleBot:
         self._running = True
         self._start_time = datetime.utcnow()
         
-        # Clear any intraday_high that was set by a previous cold-start sync
-        # (first-call peaks are unreliable; the 5-min guard in _save_daily_snapshot
-        # now prevents this going forward, but we need to wipe the stale value too)
-        today_str = datetime.utcnow().strftime('%Y-%m-%d')
-        if hasattr(self, '_daily_snapshots') and today_str in self._daily_snapshots:
-            self._daily_snapshots[today_str].pop('intraday_high', None)
-            self._daily_snapshots[today_str].pop('intraday_high_time', None)
         
         # Connect database
         await self._db.connect()
@@ -3277,6 +3270,13 @@ class KalshiBattleBot:
                         self._portfolio_hourly = state.get('portfolio_hourly', {})
             except Exception:
                 pass
+            # Wipe any intraday_high recorded during a previous cold-start sync.
+            # The high is unreliable within the first 5 minutes of operation; clear
+            # it here so the stale value from the state file doesn't persist.
+            _load_today = datetime.utcnow().strftime('%Y-%m-%d')
+            if _load_today in self._daily_snapshots:
+                self._daily_snapshots[_load_today].pop('intraday_high', None)
+                self._daily_snapshots[_load_today].pop('intraday_high_time', None)
         
         # Start-of-day value (first we see today)
         snapshot = self._daily_snapshots.get(today_str, {})
