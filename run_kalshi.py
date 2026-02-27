@@ -1017,6 +1017,14 @@ class KalshiBattleBot:
         self._running = True
         self._start_time = datetime.utcnow()
         
+        # Clear any intraday_high that was set by a previous cold-start sync
+        # (first-call peaks are unreliable; the 5-min guard in _save_daily_snapshot
+        # now prevents this going forward, but we need to wipe the stale value too)
+        today_str = datetime.utcnow().strftime('%Y-%m-%d')
+        if hasattr(self, '_daily_snapshots') and today_str in self._daily_snapshots:
+            self._daily_snapshots[today_str].pop('intraday_high', None)
+            self._daily_snapshots[today_str].pop('intraday_high_time', None)
+        
         # Connect database
         await self._db.connect()
         self._db_connected = True
@@ -3280,12 +3288,17 @@ class KalshiBattleBot:
         snapshot['timestamp'] = now.isoformat()
         
         # Track intraday high watermark — shows "was up X, now at Y" pattern
-        current_high = snapshot.get('intraday_high', val)
-        if val > current_high:
-            snapshot['intraday_high'] = val
-            snapshot['intraday_high_time'] = now.isoformat()
-        else:
-            snapshot['intraday_high'] = current_high
+        # Guard: don't update the high within the first 5 minutes of startup.
+        # The cold-start sync captures an instantaneous Kalshi price that may not
+        # reflect a real tradeable high (bid/ask midpoints shift immediately on connect).
+        bot_uptime_secs = (now - self._start_time).total_seconds() if self._start_time else 999
+        if bot_uptime_secs >= 300:  # Only track high after 5 min of operation
+            current_high = snapshot.get('intraday_high', val)
+            if val > current_high:
+                snapshot['intraday_high'] = val
+                snapshot['intraday_high_time'] = now.isoformat()
+            else:
+                snapshot['intraday_high'] = current_high
         
         # Track intraday low watermark
         current_low = snapshot.get('intraday_low', val)
