@@ -1676,6 +1676,15 @@ class KalshiBattleBot:
                     if any(p in question_lower for p in no_intel_patterns):
                         continue  # Skip: no reliable news intelligence for this market
 
+                    # FILTER: Crypto markets — only allow RANGE bets, block exact price bets.
+                    # Data: range=82% WR +$64.82 | exact price=29% WR -$67.27 (opposite edge).
+                    # Works regardless of spacing ("price  on" vs "price on").
+                    _is_crypto = any(x in question_lower for x in
+                                     ['bitcoin', 'btc ', 'ethereum', ' eth ', 'solana', 'sol price',
+                                      'xrp', 'ripple', 'crypto'])
+                    if _is_crypto and 'range' not in question_lower:
+                        continue  # Crypto exact price bet — 29% WR, no edge
+
                     # FILTER 3: Skip markets where probability is extreme (< 10% or > 90%)
                     # These have low expected value and high variance
                     market_price = market.get('price', 0.5)
