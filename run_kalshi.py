@@ -1659,6 +1659,12 @@ class KalshiBattleBot:
                         'gdp (yoy)', 'gdp growth', 'gdp reading',
                         # Dogecoin range — AI consistently low confidence (25-30%), no edge vs BTC
                         'dogecoin price range', 'doge price range',
+                        # Press secretary speech markets — priced efficiently, AI has no edge (<8%)
+                        'will the white house press secretary say',
+                        'will the press secretary say',
+                        # Unemployment rate — analyzed 8x today at 25-30% confidence every time
+                        # AI cannot predict monthly BLS data releases with any reliability
+                        'unemployment rate in ',
                         # Foreign central banks — consistently LOW_CONFIDENCE, no news edge
                         "people's bank of china", 'pboc', 'bank of china cut',
                         'ecb cut', 'bank of england cut', 'bank of japan cut',
