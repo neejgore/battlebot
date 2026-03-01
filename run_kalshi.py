@@ -1662,6 +1662,8 @@ class KalshiBattleBot:
                         # Press secretary speech markets — priced efficiently, AI has no edge (<8%)
                         'will the white house press secretary say',
                         'will the press secretary say',
+                        # Fed/Powell speech prediction markets — 2% edge every time, no predictive value
+                        'will powell say', 'powell say trump', 'powell say "',
                         # Unemployment rate — analyzed 8x today at 25-30% confidence every time
                         # AI cannot predict monthly BLS data releases with any reliability
                         'unemployment rate in ',
