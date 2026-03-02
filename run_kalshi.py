@@ -2407,6 +2407,49 @@ class KalshiBattleBot:
         self._save_state()
         await self._broadcast_update()
     
+    async def _check_position_news(self, pos_id: str, pos: dict) -> None:
+        """Fetch and cache recent news for an open position (at most once per 2 hours).
+
+        Stores up to 3 headlines in pos['latest_news'] so they appear in the dashboard.
+        Logs a brief summary to Railway logs.
+        BTC range positions are skipped — the live price monitor already covers them.
+        """
+        question = pos.get('question', '')
+        if not question:
+            return
+
+        # BTC range already tracked by _fetch_btc_price / BTC Monitor log
+        q_lower = question.lower()
+        if 'bitcoin' in q_lower and 'range' in q_lower:
+            return
+
+        if not hasattr(self, '_news_check_times'):
+            self._news_check_times: dict = {}
+        if time.time() - self._news_check_times.get(pos_id, 0) < 7200:
+            return  # checked within the last 2 hours
+
+        try:
+            news_items = await self._intelligence.news_service.fetch_news(question, max_results=3)
+            self._news_check_times[pos_id] = time.time()
+
+            if not news_items:
+                return
+
+            # Persist headlines into position dict → flows through to dashboard via _handle_state
+            pos['latest_news'] = [
+                {'title': item.title[:100], 'source': item.source, 'snippet': item.snippet[:200]}
+                for item in news_items[:3]
+            ]
+
+            side = pos.get('side', 'YES')
+            upnl = pos.get('unrealized_pnl', 0) or 0
+            print(f"[Position News] {pos_id[:8]} {side} uPnL=${upnl:+.2f} | {question[:50]}")
+            for item in news_items[:3]:
+                print(f"  • [{item.source}] {item.title[:90]}")
+
+        except Exception:
+            pass  # news failure must never disrupt the position monitor
+
     async def _fetch_btc_price(self) -> float | None:
         """Fetch live BTC/USD price from CoinGecko (free, no API key)."""
         try:
@@ -2493,6 +2536,9 @@ class KalshiBattleBot:
                             print(f"[BTC Monitor] {pos_id[:8]} | BTC=${_btc_now:,.0f} | "
                                   f"market={current_price*100:.0f}¢ | uPnL=${unrealized_pnl:+.2f} | "
                                   f"{_status} | {pos.get('question','')[:45]}")
+
+                    # NEWS CHECK: Scan headlines for each non-BTC-range position every 2h
+                    await self._check_position_news(pos_id, pos)
 
                     # PROFIT-LOCK: Exit when position has gained significantly
                     # Logic: if we're up 50%+, the market has already priced in our view —
@@ -4143,6 +4189,15 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                         <div><div class="position-detail-label">SIZE</div><div class="position-detail-value">$${p.size.toFixed(2)}</div></div>
                         <div><div class="position-detail-label">P&L</div><div class="position-detail-value ${p.unrealized_pnl >= 0 ? 'green' : 'red'}">${p.unrealized_pnl >= 0 ? '+' : ''}$${p.unrealized_pnl.toFixed(2)}</div></div>
                     </div>
+                    ${p.latest_news && p.latest_news.length ? `
+                    <div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,0.03);border-radius:6px;border-left:2px solid #30363d;">
+                        <div style="font-size:9px;letter-spacing:1px;color:#8b949e;margin-bottom:5px;">LATEST NEWS</div>
+                        ${p.latest_news.map(n => `
+                            <div style="font-size:11px;color:#c9d1d9;margin-bottom:4px;line-height:1.4;">
+                                <span style="color:#6e7681;font-size:10px;">[${n.source}]</span> ${n.title}
+                            </div>
+                        `).join('')}
+                    </div>` : ''}
                 </div>
             `).join('');
             document.getElementById('positions').innerHTML = html || '<div style="color:#8b949e;font-size:13px;padding:12px;">No open positions</div>';
