@@ -4192,11 +4192,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     ${p.latest_news && p.latest_news.length ? `
                     <div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,0.03);border-radius:6px;border-left:2px solid #30363d;">
                         <div style="font-size:9px;letter-spacing:1px;color:#8b949e;margin-bottom:5px;">LATEST NEWS</div>
-                        ${p.latest_news.map(n => `
-                            <div style="font-size:11px;color:#c9d1d9;margin-bottom:4px;line-height:1.4;">
-                                <span style="color:#6e7681;font-size:10px;">[${n.source}]</span> ${n.title}
-                            </div>
-                        `).join('')}
+                        ${p.latest_news.map(n => {
+                            const src = (n.source||'').replace(/[`<>]/g,"'");
+                            const ttl = (n.title||'').replace(/[`<>]/g,"'");
+                            return `<div style="font-size:11px;color:#c9d1d9;margin-bottom:4px;line-height:1.4;"><span style="color:#6e7681;font-size:10px;">[${src}]</span> ${ttl}</div>`;
+                        }).join('')}
                     </div>` : ''}
                 </div>
             `).join('');
