@@ -9,10 +9,11 @@ import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning, message='.*utcnow.*')
 
 import asyncio
+import collections
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiohttp import web
 import httpx
 from dotenv import load_dotenv
@@ -69,6 +70,10 @@ class KalshiBattleBot:
         self._analyses: list[dict] = []
         # Signal log for backtesting - tracks ALL AI signals and their outcomes
         self._signal_log: list[dict] = []  # Persisted, checked for outcomes
+        # Filter diagnostic log — records every market skipped before Claude, with reason
+        self._filter_log: collections.deque = collections.deque(maxlen=500)
+        # Nightly strategy report — populated by _nightly_strategy_loop at midnight UTC
+        self._last_nightly_report: dict = {}
         # Actual Kalshi values from API (synced every 5 min)
         self._kalshi_cash = None       # Available cash
         self._kalshi_portfolio = None  # Current positions value
@@ -504,6 +509,83 @@ class KalshiBattleBot:
                 print(f"[SettleLoop] Error: {e}")
             await asyncio.sleep(6 * 3600)  # Every 6 hours
 
+    async def _run_nightly_report(self) -> None:
+        """Calculate and log the nightly strategy performance report."""
+        now = datetime.now(timezone.utc)
+        cutoff_30d = (now - timedelta(days=30)).isoformat()
+        cutoff_7d  = (now - timedelta(days=7)).isoformat()
+        cutoff_24h = (now - timedelta(hours=24)).isoformat()
+
+        exits = [t for t in self._trades if t.get('action') == 'EXIT' and t.get('pnl') is not None]
+        recent = [t for t in exits if t.get('timestamp', '') >= cutoff_30d]
+        week   = [t for t in exits if t.get('timestamp', '') >= cutoff_7d]
+
+        # P&L by cluster/category
+        cat: dict = collections.defaultdict(lambda: {'wins': 0, 'losses': 0, 'pnl': 0.0})
+        for t in recent:
+            pnl = t.get('pnl', 0) or 0
+            key = self._get_cluster_key(t.get('question', ''))
+            cat[key]['pnl'] += pnl
+            if pnl > 0: cat[key]['wins'] += 1
+            else:       cat[key]['losses'] += 1
+
+        # Filter activity last 24h
+        filter_counts: dict = collections.defaultdict(int)
+        for entry in self._filter_log:
+            if entry['ts'] >= cutoff_24h:
+                # Group LOW_VOLUME_NNN under LOW_VOLUME
+                reason = entry['reason'] if not entry['reason'].startswith('LOW_VOLUME_') else 'LOW_VOLUME'
+                filter_counts[reason] += 1
+
+        week_pnl   = sum(t.get('pnl', 0) or 0 for t in week)
+        new_today  = sum(1 for t in self._trades
+                         if t.get('action') in ('ENTRY', 'ORDER_PLACED')
+                         and t.get('timestamp', '')[:10] == now.strftime('%Y-%m-%d'))
+
+        self._last_nightly_report = {
+            'generated_at': now.isoformat(),
+            'period_days': 30,
+            'total_settled_30d': len(recent),
+            'settled_7d': len(week),
+            'pnl_7d': round(week_pnl, 2),
+            'new_bets_today': new_today,
+            'open_positions': len(self._positions),
+            'category_stats': {
+                k: {'wins': v['wins'], 'losses': v['losses'],
+                    'win_rate': round(v['wins'] / (v['wins'] + v['losses']), 3) if (v['wins'] + v['losses']) > 0 else 0,
+                    'pnl': round(v['pnl'], 2)}
+                for k, v in cat.items()
+            },
+            'filter_counts_24h': dict(sorted(filter_counts.items(), key=lambda x: -x[1])),
+        }
+
+        # Log to Railway
+        print(f"\n{'='*58}")
+        print(f"[NIGHTLY REPORT]  {now.strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"{'='*58}")
+        print(f"  7-day P&L: ${week_pnl:+.2f}  |  30d settled: {len(recent)}  |  Open: {len(self._positions)}")
+        print(f"  New bets today: {new_today}")
+        print(f"  Category breakdown (30d):")
+        for k, v in sorted(self._last_nightly_report['category_stats'].items(), key=lambda x: -x[1]['pnl']):
+            tot = v['wins'] + v['losses']
+            print(f"    {k:<22} {v['wins']}W/{v['losses']}L  WR={v['win_rate']:.0%}  P&L=${v['pnl']:+.2f}")
+        print(f"  Filter activity (24h): {self._last_nightly_report['filter_counts_24h']}")
+        print(f"{'='*58}\n")
+
+    async def _nightly_strategy_loop(self) -> None:
+        """Fire _run_nightly_report every day at midnight UTC."""
+        while self._running:
+            try:
+                now = datetime.now(timezone.utc)
+                next_midnight = (now + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                await asyncio.sleep((next_midnight - now).total_seconds())
+                await self._run_nightly_report()
+            except Exception as e:
+                print(f"[NightlyLoop Error] {e}")
+                await asyncio.sleep(3600)  # retry in 1h on error
+
     async def _sync_positions_with_kalshi(self):
         """Sync internal positions with Kalshi's actual positions and balance.
         
@@ -815,6 +897,16 @@ class KalshiBattleBot:
             'without_news': without_news,
         }
     
+    def _log_filter(self, market_id: str, question: str, reason: str, price: float = 0.0) -> None:
+        """Record a market that was filtered before reaching Claude analysis."""
+        self._filter_log.append({
+            'ts': datetime.utcnow().isoformat()[:19],
+            'market_id': market_id,
+            'question': question[:80],
+            'reason': reason,
+            'price': round(price, 3),
+        })
+
     def _get_stats(self) -> dict:
         """Calculate all stats from current state."""
         # Pending/resting orders (always from internal state)
@@ -1008,6 +1100,8 @@ class KalshiBattleBot:
         self._app.router.add_get('/api/performance', self._handle_performance)
         self._app.router.add_get('/api/settlements', self._handle_settlements)
         self._app.router.add_get('/api/debug-reconcile', self._handle_debug_reconcile)
+        self._app.router.add_get('/api/filters', self._handle_filters)
+        self._app.router.add_get('/api/nightly', self._handle_nightly)
         
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -1080,6 +1174,7 @@ class KalshiBattleBot:
         asyncio.create_task(self._position_monitor_loop())
         asyncio.create_task(self._price_refresh_loop())
         asyncio.create_task(self._settlement_reconcile_loop())  # Periodic settlement P&L backfill
+        asyncio.create_task(self._nightly_strategy_loop())     # Nightly performance report at midnight UTC
         if not self.dry_run:
             asyncio.create_task(self._position_sync_loop())
         
@@ -1587,6 +1682,7 @@ class KalshiBattleBot:
                         'points or more', 'rebounds or more', 'assists or more',
                     ]
                     if any(pattern in question_lower or pattern in question_raw for pattern in player_prop_patterns):
+                        self._log_filter(market_id, question_raw, 'PLAYER_PROP', market.get('price', 0))
                         continue
                     
                     # FILTER 2b: Skip point spreads and totals - too volatile, no edge
@@ -1597,6 +1693,7 @@ class KalshiBattleBot:
                         '.5 points', 'points scored',
                     ]
                     if any(pattern in question_lower for pattern in point_spread_patterns):
+                        self._log_filter(market_id, question_raw, 'POINT_SPREAD', market.get('price', 0))
                         continue
                     
                     # FILTER 2c: HARD BLOCK ALL SPORTS - historically poor (28% win rate, -$32 losses)
@@ -1630,6 +1727,7 @@ class KalshiBattleBot:
                         'pitcher', 'batter', 'innings', 'overtime', 'penalty kick',
                     ]
                     if any(pattern in question_lower for pattern in sports_patterns):
+                        self._log_filter(market_id, question_raw, 'SPORTS_QUESTION', market.get('price', 0))
                         continue  # SKIP ALL SPORTS - no edge, high losses
                     
                     # Also check ticker patterns for sports
@@ -1649,6 +1747,7 @@ class KalshiBattleBot:
                         'KXLIGAMXGAME', 'KXBUNDESGAME', 'KXLIGUE1GAME',
                     ]
                     if any(pattern in ticker_upper for pattern in sports_ticker_patterns):
+                        self._log_filter(market_id, question_raw, 'SPORTS_TICKER', market.get('price', 0))
                         continue  # SKIP sports by ticker pattern
 
                     # FILTER: Skip foreign elections with no reliable intelligence
@@ -1685,6 +1784,7 @@ class KalshiBattleBot:
                         'storm in ', 'hurricane', 'tornado',
                     ]
                     if any(p in question_lower for p in no_intel_patterns):
+                        self._log_filter(market_id, question_raw, 'NO_INTEL_PATTERN', market.get('price', 0))
                         continue  # Skip: no reliable news intelligence for this market
 
                     # FILTER: Crypto markets — only allow RANGE bets, block exact price bets.
@@ -1694,6 +1794,7 @@ class KalshiBattleBot:
                                      ['bitcoin', 'btc ', 'ethereum', ' eth ', 'solana', 'sol price',
                                       'xrp', 'ripple', 'crypto'])
                     if _is_crypto and 'range' not in question_lower:
+                        self._log_filter(market_id, question_raw, 'CRYPTO_EXACT_PRICE', market.get('price', 0))
                         continue  # Crypto exact price bet — 29% WR, no edge
 
                     # FILTER 3: Skip markets where probability is extreme (< 10% or > 90%)
@@ -1703,6 +1804,7 @@ class KalshiBattleBot:
                     no_price = market.get('no_price', 1 - market_price)
                     
                     if yes_price < 0.10 or yes_price > 0.90:
+                        self._log_filter(market_id, question_raw, 'EXTREME_PRICE', yes_price)
                         continue  # Skip extreme probability markets
                     
                     # FILTER 4: Skip markets with low volume (need real liquidity)
@@ -1712,6 +1814,7 @@ class KalshiBattleBot:
                     _is_btc_range_market = 'bitcoin' in question_lower and 'range' in question_lower
                     _min_vol = 200 if _is_btc_range_market else 500
                     if volume < _min_vol:
+                        self._log_filter(market_id, question_raw, f'LOW_VOLUME_{int(volume)}', market.get('price', 0))
                         continue  # Skip illiquid markets
                     
                     # FILTER 5: Skip all temperature/weather range markets (coin flips, no edge)
@@ -1721,12 +1824,14 @@ class KalshiBattleBot:
                         'weather in', 'climate', 'sunny', 'cloudy', 'foggy',
                     ]
                     if any(p in question_lower for p in weather_patterns):
+                        self._log_filter(market_id, question_raw, 'WEATHER_RANGE', market.get('price', 0))
                         continue  # Weather ranges are unpredictable coin flips
 
                     # FILTER 6: Skip markets resolving too far out (high uncertainty, hard to lock gains)
                     hours_to_res_check = market.get('hours_to_resolution', 0)
                     max_hours = self.max_days_to_resolution * 24
                     if hours_to_res_check > max_hours:
+                        self._log_filter(market_id, question_raw, 'TOO_FAR_OUT', market.get('price', 0))
                         continue  # Too far out — too much can change before resolution
 
                     # FILTER 6b: Skip markets resolving in under 12h — truly last-minute, price locked in
@@ -1734,6 +1839,7 @@ class KalshiBattleBot:
                     # Keep this floor at 12h only to block bets placed in the final hours before resolution.
                     min_hours = max(self.min_days_to_resolution * 24, 12) if self.min_days_to_resolution > 0 else 12
                     if hours_to_res_check > 0 and hours_to_res_check < min_hours:
+                        self._log_filter(market_id, question_raw, 'TOO_CLOSE_TO_RESOLUTION', market.get('price', 0))
                         continue  # Resolves in under 12h — too close to resolution, skip
                         
                     if len(self._positions) >= self._risk_limits.max_positions:
@@ -3153,6 +3259,38 @@ class KalshiBattleBot:
     async def _handle_signals(self, request):
         """API endpoint for signal backtesting analysis."""
         return web.json_response(self._get_signal_performance())
+
+    async def _handle_filters(self, request):
+        """API endpoint: shows what markets are being filtered and why."""
+        cutoff_24h = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        cutoff_1h  = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        log = list(self._filter_log)  # snapshot of deque
+
+        counts_24h: dict = collections.defaultdict(int)
+        counts_1h:  dict = collections.defaultdict(int)
+        for entry in log:
+            reason = entry['reason'] if not entry['reason'].startswith('LOW_VOLUME_') else 'LOW_VOLUME'
+            if entry['ts'] >= cutoff_24h:
+                counts_24h[reason] += 1
+            if entry['ts'] >= cutoff_1h:
+                counts_1h[reason] += 1
+
+        return web.json_response({
+            'summary': {
+                'total_logged': len(log),
+                'last_24h': dict(sorted(counts_24h.items(), key=lambda x: -x[1])),
+                'last_1h':  dict(sorted(counts_1h.items(),  key=lambda x: -x[1])),
+            },
+            'recent_50': list(reversed(log))[:50],
+            'nightly_report': self._last_nightly_report,
+        })
+
+    async def _handle_nightly(self, request):
+        """API endpoint: returns latest nightly strategy report (or triggers one now)."""
+        force = request.rel_url.query.get('force', '').lower() == 'true'
+        if force:
+            await self._run_nightly_report()
+        return web.json_response(self._last_nightly_report or {'message': 'No report yet — runs at midnight UTC or call with ?force=true'})
     
     async def _handle_fills(self, request):
         """Debug endpoint to see Kalshi fills."""
@@ -3908,6 +4046,16 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             <div id="positions"></div>
             <div class="section-title" style="margin-top:20px">Recent Trades <span id="tradeCount" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">0</span></div>
             <div id="trades"></div>
+
+            <div class="section-title" style="margin-top:20px">Filter Activity
+                <span id="filterBadge" style="float:right;background:#30363d;padding:2px 8px;border-radius:10px;font-size:11px;">loading…</span>
+            </div>
+            <div id="filterActivity" style="font-size:12px;color:#8b949e;padding:8px 0;">Loading filter data…</div>
+
+            <div class="section-title" style="margin-top:20px">Nightly Strategy Report
+                <span style="float:right;font-size:10px;color:#6e7681;" id="nightlyTs"></span>
+            </div>
+            <div id="nightlyReport" style="font-size:12px;color:#8b949e;padding:8px 0;">Runs at midnight UTC · <a href="/api/nightly?force=true" target="_blank" style="color:#58a6ff;">run now ↗</a></div>
         </div>
         <div id="txlog" class="tab-content hidden">
             <div class="section-title">YOUR ACCOUNT <span style="font-size:10px;opacity:0.6;">(same as Portfolio — from Kalshi)</span></div>
@@ -4615,8 +4763,62 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         // Initial performance fetch and regular updates
         fetchPerformance();
         fetchSettlements();
+        fetchFilters();
         setInterval(fetchPerformance, 15000); // Update every 15 seconds
         setInterval(fetchSettlements, 30000); // Update settlements every 30 seconds
+        setInterval(fetchFilters, 60000);     // Update filter/nightly data every 60 seconds
+
+        async function fetchFilters() {
+            try {
+                const res = await fetch('/api/filters');
+                if (!res.ok) return;
+                const d = await res.json();
+
+                // Filter Activity badge + breakdown
+                const s24 = d.summary && d.summary.last_24h ? d.summary.last_24h : {};
+                const total24 = Object.values(s24).reduce((a,b)=>a+b,0);
+                const badge = document.getElementById('filterBadge');
+                if (badge) badge.textContent = total24 + ' filtered (24h)';
+
+                const fa = document.getElementById('filterActivity');
+                if (fa) {
+                    if (total24 === 0) {
+                        fa.innerHTML = '<span style="color:#6e7681;">No markets filtered yet — bot may still be starting up.</span>';
+                    } else {
+                        const rows = Object.entries(s24)
+                            .sort((a,b)=>b[1]-a[1])
+                            .map(([k,v]) => `<span style="display:inline-block;margin:3px 6px 3px 0;padding:2px 8px;background:#161b22;border:1px solid #30363d;border-radius:10px;color:#c9d1d9;">${k} <b style="color:#58a6ff;">${v}</b></span>`)
+                            .join('');
+                        fa.innerHTML = rows;
+                    }
+                }
+
+                // Nightly Report
+                const nr = d.nightly_report;
+                const nrEl = document.getElementById('nightlyReport');
+                const nrTs = document.getElementById('nightlyTs');
+                if (nrEl && nr && nr.generated_at) {
+                    if (nrTs) nrTs.textContent = new Date(nr.generated_at).toLocaleString();
+                    const cats = nr.category_stats || {};
+                    const catRows = Object.entries(cats)
+                        .sort((a,b) => b[1].pnl - a[1].pnl)
+                        .map(([k,v]) => {
+                            const tot = v.wins + v.losses;
+                            const wr = tot > 0 ? Math.round(v.win_rate*100) : 0;
+                            const col = v.pnl >= 0 ? '#3fb950' : '#f85149';
+                            return `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #21262d;">
+                                <span style="color:#c9d1d9;">${k}</span>
+                                <span>${v.wins}W/${v.losses}L &nbsp; ${wr}% WR &nbsp; <b style="color:${col};">${v.pnl >= 0 ? '+' : ''}$${v.pnl.toFixed(2)}</b></span>
+                            </div>`;
+                        }).join('');
+                    const pnl7 = nr.pnl_7d || 0;
+                    const pnlCol = pnl7 >= 0 ? '#3fb950' : '#f85149';
+                    nrEl.innerHTML = `<div style="margin-bottom:8px;color:#c9d1d9;">7-day P&L: <b style="color:${pnlCol};">${pnl7 >= 0 ? '+' : ''}$${pnl7.toFixed(2)}</b> &nbsp;|&nbsp; 30d settled: ${nr.total_settled_30d || 0} &nbsp;|&nbsp; <a href="/api/nightly?force=true" target="_blank" style="color:#58a6ff;font-size:11px;">run now ↗</a></div>${catRows || '<span style="color:#6e7681;">No settled trades in 30 days yet.</span>'}`;
+                } else if (nrEl) {
+                    nrEl.innerHTML = 'Runs at midnight UTC &nbsp;·&nbsp; <a href="/api/nightly?force=true" target="_blank" style="color:#58a6ff;">run now ↗</a>';
+                }
+            } catch(e) { console.warn('fetchFilters error', e); }
+        }
     </script>
 </body>
 </html>
