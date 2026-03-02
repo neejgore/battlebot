@@ -11,6 +11,7 @@ warnings.filterwarnings('ignore', category=DeprecationWarning, message='.*utcnow
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from aiohttp import web
 import httpx
@@ -1638,6 +1639,14 @@ class KalshiBattleBot:
                         'KXUFC', 'KXBOX', 'KXTEN', 'KXSOC', 'KXWNH', 'KXWOH',
                         'KXDPWORLD', 'KXNBL', 'KXBRASIL', 'KXWCC', 'KXFIGHT',
                         'KXMATCH', 'KXBOUT', 'KXCHAMP',
+                        # European/international soccer leagues (caught by question " vs " but add tickers too)
+                        'KXLALIGA', 'KXSERIEA', 'KXBUNDES', 'KXLIGUE1', 'KXPREMIER',
+                        'KXLIGAMX', 'KXCOPPA', 'KXFACUP', 'KXEUROPA', 'KXCHAMPIONSLEAGUE',
+                        # Race sports
+                        'KXNASCARRACE', 'KXF1RACE',
+                        # Generic game/match tickers not caught above
+                        'KXNBLGAME', 'KXWOMHOCKEY', 'KXLALIGA2GAME', 'KXSERIEAGAME',
+                        'KXLIGAMXGAME', 'KXBUNDESGAME', 'KXLIGUE1GAME',
                     ]
                     if any(pattern in ticker_upper for pattern in sports_ticker_patterns):
                         continue  # SKIP sports by ticker pattern
@@ -1697,9 +1706,13 @@ class KalshiBattleBot:
                         continue  # Skip extreme probability markets
                     
                     # FILTER 4: Skip markets with low volume (need real liquidity)
+                    # BTC range bets (our best strategy) can qualify at lower volume since
+                    # new daily contracts open with less liquidity initially.
                     volume = market.get('volume', 0) or market.get('open_interest', 0) or 0
-                    if volume < 500:
-                        continue  # Skip illiquid markets - need 500+ for reliable exits
+                    _is_btc_range_market = 'bitcoin' in question_lower and 'range' in question_lower
+                    _min_vol = 200 if _is_btc_range_market else 500
+                    if volume < _min_vol:
+                        continue  # Skip illiquid markets
                     
                     # FILTER 5: Skip all temperature/weather range markets (coin flips, no edge)
                     weather_patterns = [
@@ -2394,6 +2407,20 @@ class KalshiBattleBot:
         self._save_state()
         await self._broadcast_update()
     
+    async def _fetch_btc_price(self) -> float | None:
+        """Fetch live BTC/USD price from CoinGecko (free, no API key)."""
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={"ids": "bitcoin", "vs_currencies": "usd"},
+                )
+                if r.status_code == 200:
+                    return float(r.json()["bitcoin"]["usd"])
+        except Exception:
+            pass
+        return None
+
     async def _position_monitor_loop(self):
         """Monitor positions for exit conditions."""
         import random
@@ -2449,7 +2476,24 @@ class KalshiBattleBot:
                     
                     should_exit = False
                     exit_reason_mon = ""
-                    
+
+                    # BTC RANGE MONITORING: For open BTC range bets, log live BTC price
+                    # to show whether the range is at risk. Refreshes every 15 minutes.
+                    _q_lower = pos.get('question', '').lower()
+                    if 'bitcoin' in _q_lower and 'range' in _q_lower:
+                        if not hasattr(self, '_btc_price_cache'):
+                            self._btc_price_cache: dict = {'price': None, 'fetched_at': 0}
+                        if time.time() - self._btc_price_cache['fetched_at'] > 900:
+                            _btc_live = await self._fetch_btc_price()
+                            if _btc_live:
+                                self._btc_price_cache = {'price': _btc_live, 'fetched_at': time.time()}
+                        _btc_now = self._btc_price_cache.get('price')
+                        if _btc_now:
+                            _status = "IN RANGE" if current_price > 0.35 else "AT RISK"
+                            print(f"[BTC Monitor] {pos_id[:8]} | BTC=${_btc_now:,.0f} | "
+                                  f"market={current_price*100:.0f}¢ | uPnL=${unrealized_pnl:+.2f} | "
+                                  f"{_status} | {pos.get('question','')[:45]}")
+
                     # PROFIT-LOCK: Exit when position has gained significantly
                     # Logic: if we're up 50%+, the market has already priced in our view —
                     # locking in is better than waiting for a potential reversal.
