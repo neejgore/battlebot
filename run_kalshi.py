@@ -542,6 +542,9 @@ class KalshiBattleBot:
                          if t.get('action') in ('ENTRY', 'ORDER_PLACED')
                          and t.get('timestamp', '')[:10] == now.strftime('%Y-%m-%d'))
 
+        # Run market gap discovery — find liquid series we haven't analysed today
+        market_gaps = await self._discover_market_gaps()
+
         self._last_nightly_report = {
             'generated_at': now.isoformat(),
             'period_days': 30,
@@ -557,6 +560,7 @@ class KalshiBattleBot:
                 for k, v in cat.items()
             },
             'filter_counts_24h': dict(sorted(filter_counts.items(), key=lambda x: -x[1])),
+            'market_gaps': market_gaps,   # series with liquid markets not analysed today
         }
 
         # Log to Railway
@@ -567,10 +571,79 @@ class KalshiBattleBot:
         print(f"  New bets today: {new_today}")
         print(f"  Category breakdown (30d):")
         for k, v in sorted(self._last_nightly_report['category_stats'].items(), key=lambda x: -x[1]['pnl']):
-            tot = v['wins'] + v['losses']
             print(f"    {k:<22} {v['wins']}W/{v['losses']}L  WR={v['win_rate']:.0%}  P&L=${v['pnl']:+.2f}")
         print(f"  Filter activity (24h): {self._last_nightly_report['filter_counts_24h']}")
+        if market_gaps:
+            print(f"  ⚠️  MARKET GAPS — liquid series NOT analysed today ({len(market_gaps)}):")
+            for g in market_gaps[:10]:
+                print(f"    [{g['series']}] bid={g['yes_bid']:.0%} oi={g['open_interest']:,} — {g['example_question'][:55]}")
+        else:
+            print(f"  ✅  No market gaps — all liquid series covered.")
         print(f"{'='*58}\n")
+
+    async def _discover_market_gaps(self) -> list[dict]:
+        """Scan ALL Kalshi series for liquid markets (10-90c YES, OI ≥ 200) that the bot
+        has NOT analyzed in the last 24 hours.  Returns a list of gap records so the
+        nightly report can flag them and operators can decide whether to act.
+
+        This prevents the KXETH / KXBTCR→KXBTC class of blind spots:
+        even if a new series appears with a different naming convention, this job
+        will surface it automatically at midnight.
+        """
+        gaps: list[dict] = []
+        try:
+            # Markets analysed in the last 24 hours — series we already cover
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            covered_series: set[str] = set()
+            for a in self._analyses:
+                ts = a.get('timestamp', '')
+                if ts >= cutoff:
+                    mid = a.get('market_id', '')
+                    # Series prefix = everything before the first date segment (26MAR…)
+                    import re as _re2
+                    m = _re2.match(r'^([A-Z0-9]+)-\d{2}[A-Z]{3}', mid.upper())
+                    if m:
+                        covered_series.add(m.group(1))
+
+            # Also include series we know about from the filter log (even if filtered out)
+            for entry in self._filter_log:
+                if entry.get('ts', '') >= cutoff:
+                    mid = entry.get('market_id', '')
+                    m = _re2.match(r'^([A-Z0-9]+)-\d{2}[A-Z]{3}', mid.upper())
+                    if m:
+                        covered_series.add(m.group(1))
+
+            # Walk through all currently-fetched markets and find liquid ones
+            # whose series we haven't touched
+            seen_gap_series: set[str] = set()
+            for mkt in self._markets:
+                mid = mkt.get('ticker', mkt.get('id', ''))
+                m = _re2.match(r'^([A-Z0-9]+)-\d{2}[A-Z]{3}', mid.upper())
+                if not m:
+                    continue
+                series = m.group(1)
+                if series in covered_series or series in seen_gap_series:
+                    continue
+
+                yes_bid = mkt.get('yes_bid', 0) or 0
+                oi      = mkt.get('open_interest', 0) or 0
+                vol     = mkt.get('volume', 0) or oi
+
+                # Liquid + eligible price range
+                if 0.10 <= yes_bid <= 0.90 and vol >= 200:
+                    seen_gap_series.add(series)
+                    gaps.append({
+                        'series': series,
+                        'example_ticker': mid,
+                        'example_question': mkt.get('title', mkt.get('question', ''))[:80],
+                        'yes_bid': round(yes_bid, 2),
+                        'open_interest': oi,
+                    })
+
+        except Exception as e:
+            print(f"[Market Gap Discovery] Error: {e}")
+
+        return sorted(gaps, key=lambda x: -x['open_interest'])
 
     async def _nightly_strategy_loop(self) -> None:
         """Fire _run_nightly_report every day at midnight UTC."""
@@ -1794,22 +1867,33 @@ class KalshiBattleBot:
                         self._log_filter(market_id, question_raw, 'NO_INTEL_PATTERN', market.get('price', 0))
                         continue  # Skip: no reliable news intelligence for this market
 
-                    # FILTER: Crypto markets — only allow RANGE bets, block exact price bets.
-                    # Data: range=82% WR +$64.82 | exact price=29% WR -$67.27 (opposite edge).
-                    # Known range series by ticker prefix (title may not say "range"):
-                    #   KXBTC-, KXETH-, KXBCH-, KXDOGE-, KXSOL-, KXXRP-, KXNASDAQ100-
-                    _RANGE_SERIES_PREFIXES = (
-                        'KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-',
-                    )
+                    # FILTER: Block crypto EXACT-PRICE series — these have no edge (29% WR, -$67).
+                    # Strategy: INVERTED BLOCKLIST — only block tickers we know are exact-price ladders.
+                    # This means any NEW range/bucket series Kalshi adds is automatically eligible
+                    # (it passes EXTREME_PRICE + VOLUME gates below, then Claude decides).
+                    # Known exact-price series suffixes: D=daily above/below, 15M=15-min up/down.
                     _ticker_upper = market_id.upper()
-                    _is_known_range_series = any(_ticker_upper.startswith(p) for p in _RANGE_SERIES_PREFIXES)
+                    _EXACT_PRICE_SUFFIXES = ('KXBTCD', 'KXETHD', 'KXDOGED', 'KXXRPD', 'KXBCHD',
+                                             'KXBTC15M', 'KXETH15M', 'KXSOL15M', 'KXDOGE15M',
+                                             'KXXRP15M', 'KXBCH15M')
+                    _is_exact_price_series = any(_ticker_upper.startswith(p) for p in _EXACT_PRICE_SUFFIXES)
+                    if _is_exact_price_series:
+                        self._log_filter(market_id, question_raw, 'CRYPTO_EXACT_PRICE', market.get('price', 0))
+                        continue  # Known exact-price ladder — no edge
+                    # Also block one-off "will X hit $Y" phrasing that is NOT a bucket series
+                    import re as _re
+                    _is_known_range_series = any(_ticker_upper.startswith(p) for p in (
+                        'KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-',
+                    ))
                     _is_crypto = any(x in question_lower for x in
                                      ['bitcoin', 'btc ', 'ethereum', ' eth ', 'solana', 'sol price',
                                       'xrp', 'ripple', 'crypto'])
-                    _is_crypto_range = 'range' in question_lower or _is_known_range_series
-                    if _is_crypto and not _is_crypto_range:
+                    _has_exact_price_phrasing = bool(_re.search(
+                        r'(above|below|hit|reach|exceed|surpass|touch)\s+\$[\d,]+', question_lower
+                    ))
+                    if _is_crypto and _has_exact_price_phrasing and not _is_known_range_series:
                         self._log_filter(market_id, question_raw, 'CRYPTO_EXACT_PRICE', market.get('price', 0))
-                        continue  # Crypto exact price bet — 29% WR, no edge
+                        continue  # Crypto one-off threshold bet — no edge
 
                     # FILTER 3: Skip markets where probability is extreme (< 10% or > 90%)
                     # These have low expected value and high variance
@@ -4840,7 +4924,28 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                         }).join('');
                     const pnl7 = nr.pnl_7d || 0;
                     const pnlCol = pnl7 >= 0 ? '#3fb950' : '#f85149';
-                    nrEl.innerHTML = `<div style="margin-bottom:8px;color:#c9d1d9;">7-day P&L: <b style="color:${pnlCol};">${pnl7 >= 0 ? '+' : ''}$${pnl7.toFixed(2)}</b> &nbsp;|&nbsp; 30d settled: ${nr.total_settled_30d || 0} &nbsp;|&nbsp; <a href="/api/nightly?force=true" target="_blank" style="color:#58a6ff;font-size:11px;">run now ↗</a></div>${catRows || '<span style="color:#6e7681;">No settled trades in 30 days yet.</span>'}`;
+                    // Market gaps section
+                    const gaps = nr.market_gaps || [];
+                    let gapsHtml = '';
+                    if (gaps.length > 0) {
+                        const gapRows = gaps.slice(0,8).map(g => {
+                            const bid = Math.round((g.yes_bid||0)*100);
+                            const oi = (g.open_interest||0).toLocaleString();
+                            const q = (g.example_question||'').replace(/[<>&]/g,'');
+                            return `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #21262d;">
+                                <span style="color:#e3b341;font-weight:600;">${g.series}</span>
+                                <span style="color:#8b949e;font-size:11px;flex:1;margin:0 8px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;">${q}</span>
+                                <span style="color:#c9d1d9;white-space:nowrap;">bid=${bid}¢ oi=${oi}</span>
+                            </div>`;
+                        }).join('');
+                        gapsHtml = `<div style="margin-top:12px;padding:8px 10px;background:rgba(227,179,65,0.07);border:1px solid rgba(227,179,65,0.3);border-radius:6px;">
+                            <div style="font-size:10px;letter-spacing:1px;color:#e3b341;margin-bottom:6px;">⚠ MARKET GAPS — LIQUID SERIES NOT YET ANALYSED (${gaps.length})</div>
+                            ${gapRows}
+                        </div>`;
+                    } else if (gaps !== undefined) {
+                        gapsHtml = `<div style="margin-top:8px;font-size:11px;color:#3fb950;">✓ All liquid series covered — no gaps detected.</div>`;
+                    }
+                    nrEl.innerHTML = `<div style="margin-bottom:8px;color:#c9d1d9;">7-day P&L: <b style="color:${pnlCol};">${pnl7 >= 0 ? '+' : ''}$${pnl7.toFixed(2)}</b> &nbsp;|&nbsp; 30d settled: ${nr.total_settled_30d || 0} &nbsp;|&nbsp; <a href="/api/nightly?force=true" target="_blank" style="color:#58a6ff;font-size:11px;">run now ↗</a></div>${catRows || '<span style="color:#6e7681;">No settled trades in 30 days yet.</span>'}${gapsHtml}`;
                 } else if (nrEl) {
                     nrEl.innerHTML = 'Runs at midnight UTC &nbsp;·&nbsp; <a href="/api/nightly?force=true" target="_blank" style="color:#58a6ff;">run now ↗</a>';
                 }
