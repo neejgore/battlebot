@@ -79,7 +79,23 @@ class KalshiBattleBot:
         self._kalshi_cash = None       # Available cash
         self._kalshi_portfolio = None  # Current positions value
         self._kalshi_total = None      # Total portfolio value
+        
+        # All attributes that _load_state() will populate must be initialised BEFORE
+        # _load_state() is called so that _save_state() never writes {} for them.
+        self._daily_snapshots: dict = {}
+        self._portfolio_hourly: dict = {}
+        # Stats debug counter — initialised here to avoid hasattr in _get_stats hot path
+        self._stats_debug_counter: int = 0
+        # Snapshot file-save throttle — initialised here to avoid hasattr in _save_daily_snapshot
+        self._last_snapshot_file_save: datetime | None = None
+        
         self._load_state()
+        # After loading, wipe today's stale intraday_high from the previous session so the
+        # dashboard never shows a leftover peak from a prior run as today's high.
+        _today_str = datetime.utcnow().strftime('%Y-%m-%d')
+        if _today_str in self._daily_snapshots:
+            self._daily_snapshots[_today_str].pop('intraday_high', None)
+            self._daily_snapshots[_today_str].pop('intraday_high_time', None)
         
         self._running = False
         self._last_analysis: dict[str, datetime] = {}
@@ -166,6 +182,8 @@ class KalshiBattleBot:
                     self._pending_orders = state.get('pending_orders', {})
                     self._trades = state.get('trades', [])
                     self._signal_log = state.get('signal_log', [])
+                    self._daily_snapshots = state.get('daily_snapshots', {})
+                    self._portfolio_hourly = state.get('portfolio_hourly', {})
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals")
                     
                     # Clear ALL reconciled trades - they have corrupted P&L data
@@ -185,6 +203,8 @@ class KalshiBattleBot:
                     self._positions = state.get('positions', {})
                     self._pending_orders = state.get('pending_orders', {})
                     self._trades = state.get('trades', [])
+                    self._daily_snapshots = state.get('daily_snapshots', {})
+                    self._portfolio_hourly = state.get('portfolio_hourly', {})
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades from backup")
         except json.JSONDecodeError as e:
             print(f"[State] WARNING: Corrupted state file, starting fresh: {e}")
@@ -208,7 +228,7 @@ class KalshiBattleBot:
             state_data = {
                 'positions': self._positions,
                 'pending_orders': self._pending_orders,
-                'trades': self._trades[-100:],
+                'trades': self._trades[:100],   # insert(0,...) means newest is at front
                 'signal_log': self._signal_log[-500:],
                 'daily_snapshots': daily_snapshots,
                 'portfolio_hourly': portfolio_hourly,
@@ -1015,8 +1035,6 @@ class KalshiBattleBot:
             using_kalshi = False
         
         # Debug: Log which values are being used (every 10th call to avoid spam)
-        if not hasattr(self, '_stats_debug_counter'):
-            self._stats_debug_counter = 0
         self._stats_debug_counter += 1
         if self._stats_debug_counter % 10 == 1:
             print(f"[Stats] Source: {'KALSHI API' if using_kalshi else 'INTERNAL'}")
@@ -2334,17 +2352,16 @@ class KalshiBattleBot:
 
         # DAILY LOSS CIRCUIT BREAKER: Stop opening new positions if down >10% today
         # Uses Kalshi's authoritative total value vs start-of-day snapshot
-        if hasattr(self, '_daily_snapshots'):
-            today_str = datetime.utcnow().strftime('%Y-%m-%d')
-            today_snap = self._daily_snapshots.get(today_str, {})
-            start_val = today_snap.get('start_of_day_value')
-            current_val = self._kalshi_total
-            if start_val and current_val and start_val > 0:
-                daily_loss_pct = (current_val - start_val) / start_val
-                if daily_loss_pct < -0.10:
-                    should_trade = False
-                    reasons.append(f'DAILY_LOSS_LIMIT_{daily_loss_pct*100:.1f}pct')
-                    print(f"[Risk] Daily loss circuit breaker: {daily_loss_pct*100:.1f}% today — pausing new bets")
+        today_str = datetime.utcnow().strftime('%Y-%m-%d')
+        today_snap = self._daily_snapshots.get(today_str, {})
+        start_val = today_snap.get('start_of_day_value')
+        current_val = self._kalshi_total
+        if start_val and current_val and start_val > 0:
+            daily_loss_pct = (current_val - start_val) / start_val
+            if daily_loss_pct < -0.10:
+                should_trade = False
+                reasons.append(f'DAILY_LOSS_LIMIT_{daily_loss_pct*100:.1f}pct')
+                print(f"[Risk] Daily loss circuit breaker: {daily_loss_pct*100:.1f}% today — pausing new bets")
 
         if edge < self.min_edge:
             should_trade = False
@@ -2502,6 +2519,9 @@ class KalshiBattleBot:
                     order_type='limit',
                 )
                 order_id = result.get('order', {}).get('order_id')
+                if not order_id:
+                    print(f"[Order Error] Kalshi returned no order_id — aborting")
+                    return  # Can't track an order with no ID
                 print(f"[LIVE ORDER] Placed: {contracts} {side} @ {order_price_cents}¢ | Order ID: {order_id}")
             except Exception as e:
                 print(f"[Order Error] Failed to place order on Kalshi: {e}")
@@ -3513,10 +3533,10 @@ class KalshiBattleBot:
             winning_positions = len([p for p in positions_detail if p['unrealized_pnl'] > 0])
             losing_positions = len([p for p in positions_detail if p['unrealized_pnl'] < 0])
             
-            # 6. Get today's activity
+            # 6. Get today's activity — include both filled (ENTRY) and pending (ORDER_PLACED)
             today_str = datetime.utcnow().strftime('%Y-%m-%d')
             today_entries = [t for t in self._trades 
-                           if t.get('action') == 'ENTRY' and 
+                           if t.get('action') in ('ENTRY', 'ORDER_PLACED') and 
                            t.get('timestamp', '').startswith(today_str)]
             
             # 7. Calculate exposure breakdown
@@ -3614,24 +3634,8 @@ class KalshiBattleBot:
         hour_str = now.strftime('%H')
         val = round(account_value, 2)
         
-        if not hasattr(self, '_daily_snapshots'):
-            self._daily_snapshots = {}
-            self._portfolio_hourly = {}
-            try:
-                if os.path.exists(self._state_file):
-                    with open(self._state_file, 'r') as f:
-                        state = json.load(f)
-                        self._daily_snapshots = state.get('daily_snapshots', {})
-                        self._portfolio_hourly = state.get('portfolio_hourly', {})
-            except Exception:
-                pass
-            # Wipe any intraday_high recorded during a previous cold-start sync.
-            # The high is unreliable within the first 5 minutes of operation; clear
-            # it here so the stale value from the state file doesn't persist.
-            _load_today = datetime.utcnow().strftime('%Y-%m-%d')
-            if _load_today in self._daily_snapshots:
-                self._daily_snapshots[_load_today].pop('intraday_high', None)
-                self._daily_snapshots[_load_today].pop('intraday_high_time', None)
+        # _daily_snapshots and _portfolio_hourly are always initialised in __init__ and
+        # loaded from the state file by _load_state(), so no hasattr guard needed here.
         
         # Start-of-day value (first we see today)
         snapshot = self._daily_snapshots.get(today_str, {})
@@ -3689,16 +3693,12 @@ class KalshiBattleBot:
         for old in sorted_dates[30:]:
             del self._daily_snapshots[old]
         
-        if not hasattr(self, '_last_snapshot_file_save') or (now - self._last_snapshot_file_save).total_seconds() > 300:
+        if self._last_snapshot_file_save is None or (now - self._last_snapshot_file_save).total_seconds() > 300:
             self._save_state()
             self._last_snapshot_file_save = now
     
     def _get_performance_history(self) -> tuple:
         """Return (daily history for last 14 days, today's hourly points for chart)."""
-        if not hasattr(self, '_daily_snapshots'):
-            self._daily_snapshots = {}
-        if not hasattr(self, '_portfolio_hourly'):
-            self._portfolio_hourly = {}
         
         daily = []
         today = datetime.utcnow().date()
