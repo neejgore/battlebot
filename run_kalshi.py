@@ -1548,10 +1548,10 @@ class KalshiBattleBot:
                 category_bonus = 1.0   # Politics/policy: highest edge opportunity
             elif any(x in q for x in ['gdp', 'cpi', 'inflation', 'unemployment', 'jobs report']):
                 category_bonus = 0.8   # Economics: good signal from FRED data
-            elif any(x in q for x in ['bitcoin price', 'ethereum price', 'btc price', 'eth price',
-                                       'bitcoin range', 'btc range']) \
-                 or any(x in ticker for x in ['KXBTC', 'KXETH', 'KXBTCD', 'KXETHD']):
-                category_bonus = -1.0  # Intraday crypto price: <30% confidence, always at cluster cap
+            elif any(x in ticker for x in ['KXBTCD', 'KXETHD']):
+                category_bonus = -1.0  # Exact crypto above/below price: blocked by CRYPTO_EXACT_PRICE filter
+            elif any(ticker.startswith(p) for p in ['KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-', 'KXSOL-']):
+                category_bonus = 0.5   # Range bucket markets: our profitable strategy, prioritize
             elif any(x in q for x in ['snow', 'temperature', 'high temp', 'high of', 'low of', '°', 'degrees']):
                 category_bonus = -1.0  # Weather: currently losing, overly concentrated
             elif any(sport in q for sport in ['nba', 'nfl', 'mlb', 'nhl', 'ncaa', 'soccer', 'golf', 'tennis']):
@@ -1571,7 +1571,14 @@ class KalshiBattleBot:
         
         # PRIORITIZE: Short-term political/policy markets first, then ultra-short, then medium
         # Ultra-short cap at 10: intraday crypto/weather hog slots with low-signal analysis
-        selected = short_term[:40] + ultra_short[:10] + medium_term[:20]
+        # Force-include top range series markets so they never get crowded out by high-OI macro markets.
+        _RANGE_PREFIXES = ('KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-', 'KXSOL-', 'KXXRP-')
+        _range_markets = [m for m in short_term + ultra_short
+                          if any(m.get('id','').upper().startswith(p) for p in _RANGE_PREFIXES)]
+        _range_markets = sorted(_range_markets, key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:10]
+        _range_ids = {m['id'] for m in _range_markets}
+        _short_non_range = [m for m in short_term if m['id'] not in _range_ids]
+        selected = _range_markets + _short_non_range[:50] + ultra_short[:10] + medium_term[:20]
         
         # Log what we found
         print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
@@ -1789,11 +1796,18 @@ class KalshiBattleBot:
 
                     # FILTER: Crypto markets — only allow RANGE bets, block exact price bets.
                     # Data: range=82% WR +$64.82 | exact price=29% WR -$67.27 (opposite edge).
-                    # Works regardless of spacing ("price  on" vs "price on").
+                    # Known range series by ticker prefix (title may not say "range"):
+                    #   KXBTC-, KXETH-, KXBCH-, KXDOGE-, KXSOL-, KXXRP-, KXNASDAQ100-
+                    _RANGE_SERIES_PREFIXES = (
+                        'KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-',
+                    )
+                    _ticker_upper = market_id.upper()
+                    _is_known_range_series = any(_ticker_upper.startswith(p) for p in _RANGE_SERIES_PREFIXES)
                     _is_crypto = any(x in question_lower for x in
                                      ['bitcoin', 'btc ', 'ethereum', ' eth ', 'solana', 'sol price',
                                       'xrp', 'ripple', 'crypto'])
-                    if _is_crypto and 'range' not in question_lower:
+                    _is_crypto_range = 'range' in question_lower or _is_known_range_series
+                    if _is_crypto and not _is_crypto_range:
                         self._log_filter(market_id, question_raw, 'CRYPTO_EXACT_PRICE', market.get('price', 0))
                         continue  # Crypto exact price bet — 29% WR, no edge
 
@@ -1808,11 +1822,12 @@ class KalshiBattleBot:
                         continue  # Skip extreme probability markets
                     
                     # FILTER 4: Skip markets with low volume (need real liquidity)
-                    # BTC range bets (our best strategy) can qualify at lower volume since
-                    # new daily contracts open with less liquidity initially.
+                    # Range series (BTC, ETH, NASDAQ etc) get a lower 200-volume floor since
+                    # new daily/weekly contracts open with less liquidity initially.
                     volume = market.get('volume', 0) or market.get('open_interest', 0) or 0
-                    _is_btc_range_market = 'bitcoin' in question_lower and 'range' in question_lower
-                    _min_vol = 200 if _is_btc_range_market else 500
+                    _is_btc_range_market = ('bitcoin' in question_lower and 'range' in question_lower) or _ticker_upper.startswith('KXBTC-')
+                    _is_range_market = _is_known_range_series or _is_btc_range_market
+                    _min_vol = 200 if _is_range_market else 500
                     if volume < _min_vol:
                         self._log_filter(market_id, question_raw, f'LOW_VOLUME_{int(volume)}', market.get('price', 0))
                         continue  # Skip illiquid markets
@@ -2524,9 +2539,15 @@ class KalshiBattleBot:
         if not question:
             return
 
-        # BTC range already tracked by _fetch_btc_price / BTC Monitor log
+        # BTC/ETH range already tracked by price monitor — skip news for these
         q_lower = question.lower()
-        if 'bitcoin' in q_lower and 'range' in q_lower:
+        _pos_ticker = pos.get('market_id', '').upper()
+        _is_price_range = (
+            ('bitcoin' in q_lower and 'range' in q_lower)
+            or _pos_ticker.startswith('KXBTC-')
+            or _pos_ticker.startswith('KXETH-')
+        )
+        if _is_price_range:
             return
 
         if not hasattr(self, '_news_check_times'):
@@ -2626,10 +2647,16 @@ class KalshiBattleBot:
                     should_exit = False
                     exit_reason_mon = ""
 
-                    # BTC RANGE MONITORING: For open BTC range bets, log live BTC price
+                    # CRYPTO RANGE MONITORING: For open BTC/ETH range bets, log live price
                     # to show whether the range is at risk. Refreshes every 15 minutes.
                     _q_lower = pos.get('question', '').lower()
-                    if 'bitcoin' in _q_lower and 'range' in _q_lower:
+                    _pos_ticker_mon = pos.get('market_id', '').upper()
+                    _is_crypto_range_pos = (
+                        ('bitcoin' in _q_lower and 'range' in _q_lower)
+                        or _pos_ticker_mon.startswith('KXBTC-')
+                        or _pos_ticker_mon.startswith('KXETH-')
+                    )
+                    if _is_crypto_range_pos:
                         if not hasattr(self, '_btc_price_cache'):
                             self._btc_price_cache: dict = {'price': None, 'fetched_at': 0}
                         if time.time() - self._btc_price_cache['fetched_at'] > 900:
