@@ -152,11 +152,13 @@ class RiskEngine:
         self._synced_exposure: float = 0.0  # Real exposure synced from bot's open positions
         self._lock = asyncio.Lock()
         
-        # Initialize daily stats
+        # Initialize daily stats — pass the configured drawdown limit so the
+        # kill-switch threshold matches what the operator set in RiskLimits.
         self.daily_stats = DailyStats(
             starting_bankroll=initial_bankroll,
             current_bankroll=initial_bankroll,
         )
+        self.daily_stats.MAX_DAILY_DRAWDOWN = self.limits.max_daily_drawdown
         
         logger.info(
             f"RiskEngine V2.1 initialized | Bankroll: ${initial_bankroll:.2f} | "
@@ -557,6 +559,7 @@ class RiskEngine:
                 starting_bankroll=self.bankroll,
                 current_bankroll=self.bankroll,
             )
+            self.daily_stats.MAX_DAILY_DRAWDOWN = self.limits.max_daily_drawdown
             logger.info(f"Daily stats reset | Starting bankroll: ${self.bankroll:.2f}")
     
     async def get_positions_to_check(self) -> list[PositionWithExitRules]:

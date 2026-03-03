@@ -3837,8 +3837,14 @@ class KalshiBattleBot:
                     if status not in ('settled', 'finalized') or not result:
                         continue
                     
-                    # Contracts that settled = what we bought (sells may be settlement payout)
-                    contracts_settled = total_bought
+                    # Contracts that settled = net position (buys minus pre-settlement manual sells).
+                    # Kalshi settlement payouts also appear as 'sell' fills, but those happen
+                    # AFTER settlement and should not reduce the contract count here.
+                    # We approximate: if total_sold >= total_bought it means all were settled/sold,
+                    # otherwise the difference is a pre-settlement manual sell.
+                    # Use total_bought as denominator (correct cost basis), net for quantity.
+                    net_contracts = max(total_bought - total_sold, 0)
+                    contracts_settled = net_contracts if net_contracts > 0 else total_bought
                     market_result_lower = result.lower()
                     
                     if our_side == market_result_lower:
