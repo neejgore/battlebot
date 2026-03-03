@@ -4330,6 +4330,9 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('totalReturn').className = 'card-value ' + (ret >= 0 ? 'green' : 'red');
                 document.getElementById('returnPctSub').textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%';
                 document.getElementById('returnPctSub').className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red');
+                // Also update the Account section "Return" card (same value, different element)
+                document.getElementById('returnPct').textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%';
+                document.getElementById('returnPct').className = 'card-value ' + (returnPctVal >= 0 ? 'green' : 'red');
                 
                 // Today's change = account value now - start of day (from Kalshi)
                 const todayPn = p.performance.today_pnl;
@@ -4474,14 +4477,18 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             const html = trades.slice(0, 10).map(t => {
                 const isExit = t.action === 'EXIT';
                 const isLoss = isExit && t.pnl < 0;
+                // Normalize action class: ORDER_PLACED should use 'entry' styling
+                const actionClass = t.action === 'ORDER_PLACED' ? 'entry' : t.action.toLowerCase();
+                // EXIT trades store entry_price/exit_price, not price; use exit_price for display
+                const displayPrice = (t.exit_price != null ? t.exit_price : (t.price != null ? t.price : (t.entry_price || 0)));
                 return `
-                    <div class="trade ${t.action.toLowerCase()} ${isLoss ? 'loss' : ''}">
+                    <div class="trade ${actionClass} ${isLoss ? 'loss' : ''}">
                         <div class="trade-info">
                             <div>${t.question}</div>
-                            <div style="color:#8b949e;font-size:11px;">${t.side} @ ${(t.price*100).toFixed(0)}¢ · $${t.size.toFixed(2)} · ${new Date(t.timestamp).toLocaleTimeString()}${t.reason ? ' · ' + t.reason : ''}</div>
+                            <div style="color:#8b949e;font-size:11px;">${t.side} @ ${(displayPrice*100).toFixed(0)}¢ · $${t.size.toFixed(2)} · ${new Date(t.timestamp).toLocaleTimeString()}${t.reason ? ' · ' + t.reason : ''}</div>
                         </div>
                         ${isExit ? `<div class="${t.pnl >= 0 ? 'green' : 'red'}">${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}</div>` : ''}
-                        <span class="trade-action ${t.action.toLowerCase()}">${t.action}</span>
+                        <span class="trade-action ${actionClass}">${t.action}</span>
                     </div>
                 `;
             }).join('');
