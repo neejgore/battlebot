@@ -478,8 +478,9 @@ class KalshiBattleBot:
                         continue
                     
                     # Market settled! Calculate P&L
+                    # Lowercase both sides — Kalshi may return 'Yes', 'YES', or 'yes'
                     our_side = (side or '').lower()
-                    if our_side == result:
+                    if our_side == (result or '').lower():
                         exit_price = 1.0
                         pnl = (exit_price - avg_price) * net_contracts
                         outcome = 'WIN'
