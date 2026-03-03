@@ -1420,7 +1420,7 @@ class KalshiBattleBot:
             for m in all_markets:
                 try:
                     market = parse_kalshi_market(m)
-                    if market['id'] and market['id'] not in self._markets:
+                    if market['id']:
                         self._markets[market['id']] = market
                         category = m.get('category', 'unknown')
                         category_counts[category] = category_counts.get(category, 0) + 1
@@ -2184,11 +2184,17 @@ class KalshiBattleBot:
 
         if use_cache:
             # Reconstruct a minimal signal result from cache — no API call needed
-            from logic.ai_signal import TradeSignal
-            cached_signal = TradeSignal(
+            from logic.ai_signal import AISignalOutput
+            cached_signal = AISignalOutput(
                 raw_prob=cache_prob,
                 confidence=cache_conf,
                 key_reasons=["(cached — price unchanged)"],
+                disconfirming_evidence=["(cached)"],
+                what_would_change_mind=["(cached)"],
+                timeline_sensitivity="no: cached signal",
+                failure_modes=["(cached)"],
+                base_rate_considered=True,
+                information_quality="medium",
             )
             class _CachedResult:
                 success = True

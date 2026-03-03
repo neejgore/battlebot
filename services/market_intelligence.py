@@ -440,8 +440,8 @@ class NewsService:
                     matches = re.findall(item_pattern, rss_text, re.DOTALL)
                     
                     for title, link, source in matches[:max_results]:
-                        title = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\\1', title).strip()
-                        source = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\\1', source).strip()
+                        title = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\1', title).strip()
+                        source = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\1', source).strip()
                         
                         if title:
                             news_items.append(NewsItem(
@@ -456,7 +456,7 @@ class NewsService:
                         simple_pattern = r'<item>.*?<title>(.*?)</title>.*?<link>(.*?)</link>.*?</item>'
                         matches = re.findall(simple_pattern, rss_text, re.DOTALL)
                         for title, link in matches[:max_results]:
-                            title = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\\1', title).strip()
+                            title = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\1', title).strip()
                             if title:
                                 news_items.append(NewsItem(
                                     title=title[:200],
