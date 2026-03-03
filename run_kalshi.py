@@ -434,6 +434,7 @@ class KalshiBattleBot:
                 
                 # Calculate net position from fills
                 net_contracts = 0
+                total_buy_contracts = 0  # Track buys separately for avg_price
                 avg_price = 0.0
                 total_cost = 0.0
                 side = None
@@ -447,6 +448,7 @@ class KalshiBattleBot:
                     
                     if action == 'buy':
                         net_contracts += count
+                        total_buy_contracts += count
                         total_cost += price * count
                         side = fill_side
                     elif action == 'sell':
@@ -456,7 +458,8 @@ class KalshiBattleBot:
                 if net_contracts <= 0:
                     continue
                 
-                avg_price = total_cost / net_contracts if net_contracts > 0 else 0.5
+                # avg_price is per-contract cost (use total buys, not net, to get true cost basis)
+                avg_price = total_cost / total_buy_contracts if total_buy_contracts > 0 else 0.5
                 
                 # Check if this market has settled
                 checked += 1
@@ -4305,7 +4308,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 fTrad.className = 'card-value ' + (ks ? 'red' : s.trading_allowed ? 'green' : 'yellow');
             }
             if (fTradSub) fTradSub.textContent = s.kill_switch ? 'kill-switch triggered' :
-                ('drawdown ' + (s.daily_drawdown != null ? (s.daily_drawdown * 100).toFixed(1) + '%' : '0%'));
+                ('drawdown ' + (s.daily_drawdown != null ? s.daily_drawdown.toFixed(1) + '%' : '0%'));
         }
         
         // Fetch performance first so dashboard always shows Kalshi numbers; then state + signals for readout
