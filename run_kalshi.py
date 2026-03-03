@@ -2437,6 +2437,11 @@ class KalshiBattleBot:
         self._analyses[0]['reason'] = ', '.join(reasons) if reasons else 'CRITERIA_MET'
         
         if should_trade:
+            # Sync real open-position exposure into the risk engine so Kelly sizing
+            # correctly accounts for already-deployed capital.
+            real_exposure = sum(p.get('size', 0) for p in self._positions.values())
+            self._risk_engine.sync_open_exposure(real_exposure)
+
             # Calculate position size (async with proper params)
             print(f"[Debug] Calculating size: prob={trade_prob:.2f}, price={trade_price:.2f}, edge={edge:.2f}, conf={signal.confidence:.2f}")
             position_size = await self._risk_engine.calculate_position_size(
@@ -3194,8 +3199,11 @@ class KalshiBattleBot:
                 if sync_counter >= FULL_SYNC_INTERVAL:
                     sync_counter = 0
                     await self._sync_positions_with_kalshi()
-                    # Also cancel any stale resting orders that accumulated
-                    await self._cancel_all_resting_orders()
+                    # NOTE: Do NOT call _cancel_all_resting_orders() here.
+                    # That function is startup-only cleanup. Calling it periodically
+                    # cancels live exit sell orders before they fill, preventing
+                    # profit-locks from ever completing. Stale BUY orders are handled
+                    # by the 10-minute timeout below.
                     # Check signal outcomes for backtesting
                     await self._check_signal_outcomes()
                 

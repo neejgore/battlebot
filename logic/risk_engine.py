@@ -149,6 +149,7 @@ class RiskEngine:
         self._positions: dict[str, PositionWithExitRules] = {}
         self._market_exposure: dict[str, float] = {}  # market_id -> exposure
         self._exit_cooldowns: dict[str, datetime] = {}  # token_id -> cooldown expiry
+        self._synced_exposure: float = 0.0  # Real exposure synced from bot's open positions
         self._lock = asyncio.Lock()
         
         # Initialize daily stats
@@ -182,9 +183,23 @@ class RiskEngine:
     
     @property
     def total_exposure(self) -> float:
-        """Get total open position exposure."""
-        return sum(pos.position.cost_basis for pos in self._positions.values())
+        """Get total open position exposure (internal tracking + override)."""
+        internal = sum(pos.position.cost_basis for pos in self._positions.values())
+        # If the bot has synced real exposure, use the larger of the two to be conservative
+        return max(internal, self._synced_exposure)
     
+    def sync_open_exposure(self, total_open_cost: float) -> None:
+        """Sync the actual exposure from the bot's real open positions.
+
+        Called by the bot before each position-size calculation so that the
+        Kelly formula uses the true remaining capital rather than the full
+        bankroll (which it would see when _positions is empty).
+
+        Args:
+            total_open_cost: Sum of cost_basis for all currently open positions.
+        """
+        self._synced_exposure = max(0.0, total_open_cost)
+
     @property
     def exposure_ratio(self) -> float:
         """Get exposure as fraction of bankroll."""
