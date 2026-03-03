@@ -92,6 +92,12 @@ class KalshiBattleBot:
         # Reused when price hasn't moved significantly — avoids redundant Claude calls
         self._prob_cache: dict[str, tuple[datetime, float, float, float]] = {}
         self._start_time = None
+        # Position monitor helpers — initialised here to avoid hasattr checks in hot loops
+        self._news_check_times: dict[str, float] = {}   # pos_id -> last news fetch epoch
+        self._btc_price_cache: dict = {'price': None, 'fetched_at': 0}
+        self._monitor_log_times: dict[str, float] = {}  # pos_id -> last 70%-down log epoch
+        # Profit-lock threshold — read once from env, not per-position per-cycle
+        self._profit_lock_pct: float = float(os.getenv('PROFIT_LOCK_PCT', '0.50'))
         
         # Price updates counter (no WebSocket for Kalshi, use polling)
         self._price_update_count = 0
@@ -2626,19 +2632,16 @@ class KalshiBattleBot:
         if not question:
             return
 
-        # BTC/ETH range already tracked by price monitor — skip news for these
+        # BTC range already tracked by the live BTC price monitor — skip news for those only
         q_lower = question.lower()
         _pos_ticker = pos.get('market_id', '').upper()
-        _is_price_range = (
+        _is_btc_range = (
             ('bitcoin' in q_lower and 'range' in q_lower)
             or _pos_ticker.startswith('KXBTC-')
-            or _pos_ticker.startswith('KXETH-')
         )
-        if _is_price_range:
+        if _is_btc_range:
             return
 
-        if not hasattr(self, '_news_check_times'):
-            self._news_check_times: dict = {}
         if time.time() - self._news_check_times.get(pos_id, 0) < 7200:
             return  # checked within the last 2 hours
 
@@ -2734,18 +2737,15 @@ class KalshiBattleBot:
                     should_exit = False
                     exit_reason_mon = ""
 
-                    # CRYPTO RANGE MONITORING: For open BTC/ETH range bets, log live price
-                    # to show whether the range is at risk. Refreshes every 15 minutes.
+                    # BTC RANGE MONITORING: For open BTC range bets, log live BTC price.
+                    # ETH range bets are covered by _check_position_news instead.
                     _q_lower = pos.get('question', '').lower()
                     _pos_ticker_mon = pos.get('market_id', '').upper()
-                    _is_crypto_range_pos = (
+                    _is_btc_range_pos = (
                         ('bitcoin' in _q_lower and 'range' in _q_lower)
                         or _pos_ticker_mon.startswith('KXBTC-')
-                        or _pos_ticker_mon.startswith('KXETH-')
                     )
-                    if _is_crypto_range_pos:
-                        if not hasattr(self, '_btc_price_cache'):
-                            self._btc_price_cache: dict = {'price': None, 'fetched_at': 0}
+                    if _is_btc_range_pos:
                         if time.time() - self._btc_price_cache['fetched_at'] > 900:
                             _btc_live = await self._fetch_btc_price()
                             if _btc_live:
@@ -2763,9 +2763,7 @@ class KalshiBattleBot:
                     # PROFIT-LOCK: Exit when position has gained significantly
                     # Logic: if we're up 50%+, the market has already priced in our view —
                     # locking in is better than waiting for a potential reversal.
-                    PROFIT_LOCK_PCT = float(os.getenv('PROFIT_LOCK_PCT', '0.50'))  # 50% gain threshold
-                    
-                    if gain_pct >= PROFIT_LOCK_PCT and cost_basis > 0:
+                    if gain_pct >= self._profit_lock_pct and cost_basis > 0:
                         should_exit = True
                         exit_reason_mon = f"PROFIT_LOCK_{gain_pct*100:.0f}pct"
                     
@@ -2777,8 +2775,6 @@ class KalshiBattleBot:
                     
                     # Logging only (no exit) for monitoring — throttle to once per hour per position
                     elif unrealized_pnl < -0.70 * cost_basis:
-                        if not hasattr(self, '_monitor_log_times'):
-                            self._monitor_log_times = {}
                         last_log = self._monitor_log_times.get(pos_id, 0)
                         if (datetime.utcnow().timestamp() - last_log) > 3600:
                             print(f"[Position Monitor] {pos_id[:8]} down 70%+ - holding for settlement | {pos.get('question','')[:40]}")
@@ -4928,10 +4924,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     const pnl7 = nr.pnl_7d || 0;
                     const pnlCol = pnl7 >= 0 ? '#3fb950' : '#f85149';
                     // Market gaps section
-                    const gaps = nr.market_gaps || [];
+                    const gapsRaw = nr.market_gaps;  // undefined = report not yet run; [] = no gaps found
                     let gapsHtml = '';
-                    if (gaps.length > 0) {
-                        const gapRows = gaps.slice(0,8).map(g => {
+                    if (gapsRaw && gapsRaw.length > 0) {
+                        const gapRows = gapsRaw.slice(0,8).map(g => {
                             const bid = Math.round((g.yes_bid||0)*100);
                             const oi = (g.open_interest||0).toLocaleString();
                             const q = (g.example_question||'').replace(/[<>&]/g,'');
@@ -4942,11 +4938,15 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                             </div>`;
                         }).join('');
                         gapsHtml = `<div style="margin-top:12px;padding:8px 10px;background:rgba(227,179,65,0.07);border:1px solid rgba(227,179,65,0.3);border-radius:6px;">
-                            <div style="font-size:10px;letter-spacing:1px;color:#e3b341;margin-bottom:6px;">⚠ MARKET GAPS — LIQUID SERIES NOT YET ANALYSED (${gaps.length})</div>
+                            <div style="font-size:10px;letter-spacing:1px;color:#e3b341;margin-bottom:6px;">⚠ MARKET GAPS — LIQUID SERIES NOT YET ANALYSED (${gapsRaw.length})</div>
                             ${gapRows}
                         </div>`;
-                    } else if (gaps !== undefined) {
+                    } else if (Array.isArray(gapsRaw)) {
+                        // market_gaps field exists but is empty array → report ran, no gaps
                         gapsHtml = `<div style="margin-top:8px;font-size:11px;color:#3fb950;">✓ All liquid series covered — no gaps detected.</div>`;
+                    } else {
+                        // market_gaps field absent → nightly report hasn't run yet today
+                        gapsHtml = `<div style="margin-top:8px;font-size:11px;color:#6e7681;">Gap check runs at midnight UTC — <a href="/api/nightly?force=true" target="_blank" style="color:#58a6ff;">run now ↗</a></div>`;
                     }
                     nrEl.innerHTML = `<div style="margin-bottom:8px;color:#c9d1d9;">7-day P&L: <b style="color:${pnlCol};">${pnl7 >= 0 ? '+' : ''}$${pnl7.toFixed(2)}</b> &nbsp;|&nbsp; 30d settled: ${nr.total_settled_30d || 0} &nbsp;|&nbsp; <a href="/api/nightly?force=true" target="_blank" style="color:#58a6ff;font-size:11px;">run now ↗</a></div>${catRows || '<span style="color:#6e7681;">No settled trades in 30 days yet.</span>'}${gapsHtml}`;
                 } else if (nrEl) {
