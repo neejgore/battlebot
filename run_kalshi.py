@@ -203,6 +203,7 @@ class KalshiBattleBot:
                     self._positions = state.get('positions', {})
                     self._pending_orders = state.get('pending_orders', {})
                     self._trades = state.get('trades', [])
+                    self._signal_log = state.get('signal_log', [])
                     self._daily_snapshots = state.get('daily_snapshots', {})
                     self._portfolio_hourly = state.get('portfolio_hourly', {})
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades from backup")
@@ -528,7 +529,7 @@ class KalshiBattleBot:
     async def _settlement_reconcile_loop(self):
         """Run settlement reconciliation every 6 hours to capture settled markets."""
         await asyncio.sleep(3600)  # First run 1 hour after startup (startup already ran it)
-        while True:
+        while self._running:
             try:
                 if not self.dry_run:
                     await self._reconcile_settlements_from_fills()
@@ -649,18 +650,18 @@ class KalshiBattleBot:
                 if series in covered_series or series in seen_gap_series:
                     continue
 
-                yes_bid = mkt.get('yes_bid', 0) or 0
-                oi      = mkt.get('open_interest', 0) or 0
-                vol     = mkt.get('volume', 0) or oi
+                yes_price = mkt.get('yes_price', 0) or 0
+                oi        = mkt.get('open_interest', 0) or 0
+                vol       = mkt.get('volume', 0) or oi
 
-                # Liquid + eligible price range
-                if 0.10 <= yes_bid <= 0.90 and vol >= 200:
+                # Liquid + eligible price range (yes_price is the midpoint from parse_kalshi_market)
+                if 0.10 <= yes_price <= 0.90 and vol >= 200:
                     seen_gap_series.add(series)
                     gaps.append({
                         'series': series,
                         'example_ticker': mid,
                         'example_question': mkt.get('question', '')[:80],
-                        'yes_bid': round(yes_bid, 2),
+                        'yes_bid': round(yes_price, 2),
                         'open_interest': oi,
                     })
 
@@ -3256,7 +3257,8 @@ class KalshiBattleBot:
                                             'order_id': order_id,
                                             'order': order,
                                             'fill_count': fill.get('count', order['contracts']),
-                                            'fill_price': fill.get('price', order['entry_price'] * 100) / 100,
+                                            # fills API returns price in DOLLARS (0.0–1.0) — do NOT divide by 100
+                                            'fill_price': fill.get('price', order['entry_price']),
                                         })
                                         print(f"[FILL FOUND] {order_id} from fills API")
                                         break
@@ -4109,7 +4111,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             </div>
             <div class="section-title">REAL P&L <span style="font-size:10px;opacity:0.6;">(value minus what you deposited)</span></div>
             <div class="grid">
-                <div class="card"><div class="card-label">Total vs <span id="depositsLabel">$150</span> deposited</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPct">0%</div></div>
+                <div class="card"><div class="card-label">Total vs <span id="depositsLabel">$150</span> deposited</div><div class="card-value" id="totalReturn">$0.00</div><div class="card-sub" id="returnPctSub">0%</div></div>
                 <div class="card"><div class="card-label">Today</div><div class="card-value" id="todayPnl">—</div><div class="card-sub" id="todayPnlSub">vs start of day</div></div>
                 <div class="card"><div class="card-label">Today's Peak</div><div class="card-value" id="intradayHigh">—</div><div class="card-sub" id="peakGiveback">intraday high watermark</div></div>
                 <div class="card"><div class="card-label">Positions</div><div class="card-value" id="positionStatus">0 winning / 0 losing</div><div class="card-sub" id="positionStatusSub">vs entry price</div></div>
@@ -4320,8 +4322,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 if (depositsLbl) depositsLbl.textContent = '$' + (p.account.total_deposits || 150);
                 document.getElementById('totalReturn').textContent = (ret >= 0 ? '+' : '') + '$' + ret.toFixed(2);
                 document.getElementById('totalReturn').className = 'card-value ' + (ret >= 0 ? 'green' : 'red');
-                document.getElementById('returnPct').textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%';
-                document.getElementById('returnPct').className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red');
+                document.getElementById('returnPctSub').textContent = (returnPctVal >= 0 ? '+' : '') + returnPctVal.toFixed(1) + '%';
+                document.getElementById('returnPctSub').className = 'card-sub ' + (returnPctVal >= 0 ? 'green' : 'red');
                 
                 // Today's change = account value now - start of day (from Kalshi)
                 const todayPn = p.performance.today_pnl;
