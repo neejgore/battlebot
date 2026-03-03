@@ -12,6 +12,7 @@ import asyncio
 import collections
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from aiohttp import web
@@ -591,37 +592,34 @@ class KalshiBattleBot:
         will surface it automatically at midnight.
         """
         gaps: list[dict] = []
+        # Regex for Kalshi ticker format: PREFIX-YYMONDD... e.g. KXBTC-26MAR06...
+        _series_re = re.compile(r'^([A-Z0-9]+)-\d{2}[A-Z]{3}')
         try:
             # Markets analysed in the last 24 hours — series we already cover
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
             covered_series: set[str] = set()
             for a in self._analyses:
-                ts = a.get('timestamp', '')
-                if ts >= cutoff:
-                    mid = a.get('market_id', '')
-                    # Series prefix = everything before the first date segment (26MAR…)
-                    import re as _re2
-                    m = _re2.match(r'^([A-Z0-9]+)-\d{2}[A-Z]{3}', mid.upper())
-                    if m:
-                        covered_series.add(m.group(1))
+                if a.get('timestamp', '') >= cutoff:
+                    mm = _series_re.match(a.get('market_id', '').upper())
+                    if mm:
+                        covered_series.add(mm.group(1))
 
             # Also include series we know about from the filter log (even if filtered out)
             for entry in self._filter_log:
                 if entry.get('ts', '') >= cutoff:
-                    mid = entry.get('market_id', '')
-                    m = _re2.match(r'^([A-Z0-9]+)-\d{2}[A-Z]{3}', mid.upper())
-                    if m:
-                        covered_series.add(m.group(1))
+                    mm = _series_re.match(entry.get('market_id', '').upper())
+                    if mm:
+                        covered_series.add(mm.group(1))
 
-            # Walk through all currently-fetched markets and find liquid ones
-            # whose series we haven't touched
+            # Walk through all currently-fetched PARSED markets and find liquid ones
+            # whose series we haven't touched.  self._markets is a dict[id -> market_dict].
             seen_gap_series: set[str] = set()
-            for mkt in self._markets:
-                mid = mkt.get('ticker', mkt.get('id', ''))
-                m = _re2.match(r'^([A-Z0-9]+)-\d{2}[A-Z]{3}', mid.upper())
-                if not m:
+            for mkt in self._markets.values():
+                mid = mkt.get('id', '')
+                mm = _series_re.match(mid.upper())
+                if not mm:
                     continue
-                series = m.group(1)
+                series = mm.group(1)
                 if series in covered_series or series in seen_gap_series:
                     continue
 
@@ -635,7 +633,7 @@ class KalshiBattleBot:
                     gaps.append({
                         'series': series,
                         'example_ticker': mid,
-                        'example_question': mkt.get('title', mkt.get('question', ''))[:80],
+                        'example_question': mkt.get('question', '')[:80],
                         'yes_bid': round(yes_bid, 2),
                         'open_interest': oi,
                     })
@@ -1642,16 +1640,18 @@ class KalshiBattleBot:
             short_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
             medium_term.sort(key=lambda x: x.get('open_interest', 0) or 0, reverse=True)
         
-        # PRIORITIZE: Short-term political/policy markets first, then ultra-short, then medium
-        # Ultra-short cap at 10: intraday crypto/weather hog slots with low-signal analysis
-        # Force-include top range series markets so they never get crowded out by high-OI macro markets.
+        # PRIORITIZE: Force-include top range series markets first (KXBTC-, KXETH-, KXNASDAQ100-
+        # etc.) so they are never crowded out by high-OI macro markets.  Then fill remaining
+        # slots with the best non-range short-term and ultra-short markets.
         _RANGE_PREFIXES = ('KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-', 'KXSOL-', 'KXXRP-')
         _range_markets = [m for m in short_term + ultra_short
                           if any(m.get('id','').upper().startswith(p) for p in _RANGE_PREFIXES)]
         _range_markets = sorted(_range_markets, key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:10]
         _range_ids = {m['id'] for m in _range_markets}
+        # Exclude range markets from the other buckets to avoid analysing the same market twice
         _short_non_range = [m for m in short_term if m['id'] not in _range_ids]
-        selected = _range_markets + _short_non_range[:50] + ultra_short[:10] + medium_term[:20]
+        _ultra_non_range  = [m for m in ultra_short  if m['id'] not in _range_ids]
+        selected = _range_markets + _short_non_range[:50] + _ultra_non_range[:10] + medium_term[:20]
         
         # Log what we found
         print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
@@ -1738,7 +1738,19 @@ class KalshiBattleBot:
                     self._monitored.values(),
                     key=market_priority
                 )
-                
+
+                # Constants for the crypto filter — defined once per scan cycle, not per market
+                _CRYPTO_EXACT_SUFFIXES = (
+                    'KXBTCD', 'KXETHD', 'KXDOGED', 'KXXRPD', 'KXBCHD',
+                    'KXBTC15M', 'KXETH15M', 'KXSOL15M', 'KXDOGE15M', 'KXXRP15M', 'KXBCH15M',
+                )
+                _CRYPTO_RANGE_PREFIXES = (
+                    'KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-',
+                )
+                _EXACT_PRICE_RE = re.compile(
+                    r'(above|below|hit|reach|exceed|surpass|touch)\s+\$[\d,]+'
+                )
+
                 for market in markets_by_urgency:
                     market_id = market.get('id')
                     if not market_id:
@@ -1871,26 +1883,17 @@ class KalshiBattleBot:
                     # Strategy: INVERTED BLOCKLIST — only block tickers we know are exact-price ladders.
                     # This means any NEW range/bucket series Kalshi adds is automatically eligible
                     # (it passes EXTREME_PRICE + VOLUME gates below, then Claude decides).
-                    # Known exact-price series suffixes: D=daily above/below, 15M=15-min up/down.
                     _ticker_upper = market_id.upper()
-                    _EXACT_PRICE_SUFFIXES = ('KXBTCD', 'KXETHD', 'KXDOGED', 'KXXRPD', 'KXBCHD',
-                                             'KXBTC15M', 'KXETH15M', 'KXSOL15M', 'KXDOGE15M',
-                                             'KXXRP15M', 'KXBCH15M')
-                    _is_exact_price_series = any(_ticker_upper.startswith(p) for p in _EXACT_PRICE_SUFFIXES)
+                    _is_exact_price_series = any(_ticker_upper.startswith(p) for p in _CRYPTO_EXACT_SUFFIXES)
                     if _is_exact_price_series:
                         self._log_filter(market_id, question_raw, 'CRYPTO_EXACT_PRICE', market.get('price', 0))
                         continue  # Known exact-price ladder — no edge
-                    # Also block one-off "will X hit $Y" phrasing that is NOT a bucket series
-                    import re as _re
-                    _is_known_range_series = any(_ticker_upper.startswith(p) for p in (
-                        'KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-',
-                    ))
+                    # Also block one-off "will X hit $Y" phrasing that is NOT a known range series
+                    _is_known_range_series = any(_ticker_upper.startswith(p) for p in _CRYPTO_RANGE_PREFIXES)
                     _is_crypto = any(x in question_lower for x in
                                      ['bitcoin', 'btc ', 'ethereum', ' eth ', 'solana', 'sol price',
                                       'xrp', 'ripple', 'crypto'])
-                    _has_exact_price_phrasing = bool(_re.search(
-                        r'(above|below|hit|reach|exceed|surpass|touch)\s+\$[\d,]+', question_lower
-                    ))
+                    _has_exact_price_phrasing = bool(_EXACT_PRICE_RE.search(question_lower))
                     if _is_crypto and _has_exact_price_phrasing and not _is_known_range_series:
                         self._log_filter(market_id, question_raw, 'CRYPTO_EXACT_PRICE', market.get('price', 0))
                         continue  # Crypto one-off threshold bet — no edge
