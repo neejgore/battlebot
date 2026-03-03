@@ -177,11 +177,14 @@ class RiskEngine:
     
     @property
     def available_capital(self) -> float:
-        """Get available capital for new positions."""
-        total_exposure = sum(
-            pos.position.cost_basis for pos in self._positions.values()
-        )
-        return max(0.0, self.bankroll - total_exposure)
+        """Get available capital for new positions.
+
+        Uses _synced_exposure (set by sync_open_exposure() before each size
+        calculation) because the internal _positions dict is never populated
+        via add_position() — all position tracking goes through the main bot's
+        self._positions dict instead.
+        """
+        return max(0.0, self.bankroll - self._synced_exposure)
     
     @property
     def total_exposure(self) -> float:
@@ -201,6 +204,23 @@ class RiskEngine:
             total_open_cost: Sum of cost_basis for all currently open positions.
         """
         self._synced_exposure = max(0.0, total_open_cost)
+
+    def sync_bankroll(self, actual_total: float) -> None:
+        """Sync the risk-engine bankroll from the real Kalshi account value.
+
+        Called every ~5 minutes by _sync_positions_with_kalshi so that the
+        Kelly sizing and exposure limits stay grounded in the actual portfolio
+        value rather than the stale initial bankroll.
+
+        Does NOT update DailyStats.starting_bankroll — that is intentionally
+        fixed at the start of each day so intraday drawdown is measured correctly.
+
+        Args:
+            actual_total: Current Kalshi total (cash + positions mark-to-market).
+        """
+        if actual_total > 0:
+            self.bankroll = actual_total
+            logger.debug(f"Bankroll synced from Kalshi: ${actual_total:.2f}")
 
     @property
     def exposure_ratio(self) -> float:

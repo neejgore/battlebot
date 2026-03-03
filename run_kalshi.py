@@ -685,6 +685,11 @@ class KalshiBattleBot:
                     hour=0, minute=0, second=0, microsecond=0
                 )
                 await asyncio.sleep((next_midnight - now).total_seconds())
+                # Reset daily risk stats so the kill-switch and drawdown counter
+                # start fresh each day.  Must happen BEFORE the nightly report so
+                # the report sees a clean slate for the new day.
+                await self._risk_engine.reset_daily_stats()
+                print("[Nightly] Daily risk stats reset for new day")
                 await self._run_nightly_report()
             except Exception as e:
                 print(f"[NightlyLoop Error] {e}")
@@ -719,6 +724,11 @@ class KalshiBattleBot:
                 self._kalshi_total = self._kalshi_cash + self._kalshi_portfolio
                 
                 print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, Positions=${self._kalshi_portfolio:.2f}, Total=${self._kalshi_total:.2f}")
+                
+                # Keep risk-engine bankroll in sync with actual Kalshi portfolio value.
+                # Without this, Kelly sizing and exposure limits use the stale initial
+                # bankroll — understating available capital after wins, overstating after losses.
+                self._risk_engine.sync_bankroll(self._kalshi_total)
                 
                 # Keep intraday peak in sync with the same number the user sees on the dashboard
                 await self._save_daily_snapshot(self._kalshi_total, self._kalshi_cash, self._kalshi_portfolio)
