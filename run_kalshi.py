@@ -286,7 +286,10 @@ class KalshiBattleBot:
                         'confidence': order.get('confidence', 0),
                         'entry_time': order.get('placed_time', datetime.utcnow().isoformat()),
                         'unrealized_pnl': 0.0,
-                        'end_date': order.get('end_date'),  # Preserve for time horizon
+                        'end_date': order.get('end_date'),
+                        'has_intel': order.get('has_intel', False),
+                        'news_count': order.get('news_count', 0),
+                        'category': order.get('category', 'unknown'),
                     }
                     self._positions[pos_id] = pos
                     self._pending_orders.pop(order_id)
@@ -805,7 +808,8 @@ class KalshiBattleBot:
                 if ticker not in existing_tickers:
                     # Add missing position
                     pos_id = f"pos_kalshi_{ticker[:20]}_{int(datetime.utcnow().timestamp())}"
-                    question = kp.get('title', kp.get('market_title', ticker))
+                    cached_market = self._markets.get(ticker, {})
+                    question = kp.get('title', kp.get('market_title', cached_market.get('question', ticker)))
                     
                     self._positions[pos_id] = {
                         'id': pos_id,
@@ -821,6 +825,10 @@ class KalshiBattleBot:
                         'confidence': 0.5,
                         'entry_time': datetime.utcnow().isoformat(),
                         'unrealized_pnl': 0.0,
+                        'end_date': cached_market.get('end_date'),
+                        'has_intel': False,
+                        'news_count': 0,
+                        'category': cached_market.get('category', 'unknown'),
                         'synced_from_kalshi': True,
                     }
                     print(f"[Sync] Added position from Kalshi: {side} {contracts} @ {entry_price*100:.0f}¢ (${actual_size:.2f}) | {question[:40]}...")
