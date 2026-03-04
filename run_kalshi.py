@@ -184,7 +184,14 @@ class KalshiBattleBot:
                     self._signal_log = state.get('signal_log', [])
                     self._daily_snapshots = state.get('daily_snapshots', {})
                     self._portfolio_hourly = state.get('portfolio_hourly', {})
-                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals")
+                    # Restore exit cooldowns (ISO strings → datetime)
+                    for k, v in state.get('recently_exited', {}).items():
+                        try:
+                            self._recently_exited[k] = datetime.fromisoformat(v)
+                        except Exception:
+                            pass
+                    self._recently_exited_reason = state.get('recently_exited_reason', {})
+                    print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals, {len(self._recently_exited)} exit cooldowns")
                     
                     # Clear ALL reconciled trades - they have corrupted P&L data
                     if clear_buggy:
@@ -206,6 +213,12 @@ class KalshiBattleBot:
                     self._signal_log = state.get('signal_log', [])
                     self._daily_snapshots = state.get('daily_snapshots', {})
                     self._portfolio_hourly = state.get('portfolio_hourly', {})
+                    for k, v in state.get('recently_exited', {}).items():
+                        try:
+                            self._recently_exited[k] = datetime.fromisoformat(v)
+                        except Exception:
+                            pass
+                    self._recently_exited_reason = state.get('recently_exited_reason', {})
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades from backup")
         except json.JSONDecodeError as e:
             print(f"[State] WARNING: Corrupted state file, starting fresh: {e}")
@@ -226,6 +239,10 @@ class KalshiBattleBot:
             daily_snapshots = getattr(self, '_daily_snapshots', {})
             portfolio_hourly = getattr(self, '_portfolio_hourly', {})
             
+            # Serialize recently_exited (datetime values → ISO strings)
+            recently_exited_serial = {
+                k: v.isoformat() for k, v in self._recently_exited.items()
+            }
             state_data = {
                 'positions': self._positions,
                 'pending_orders': self._pending_orders,
@@ -233,6 +250,8 @@ class KalshiBattleBot:
                 'signal_log': self._signal_log[-500:],
                 'daily_snapshots': daily_snapshots,
                 'portfolio_hourly': portfolio_hourly,
+                'recently_exited': recently_exited_serial,
+                'recently_exited_reason': self._recently_exited_reason,
                 'saved_at': datetime.utcnow().isoformat(),
             }
             
@@ -1855,8 +1874,9 @@ class KalshiBattleBot:
                         # Fighting
                         'ufc', 'boxing', 'mma', 'fight', 'bout', 'knockout', 'k.o.',
                         'heavyweight', 'lightweight', 'middleweight', 'welterweight',
-                        # Generic vs. matchup (two fighters/teams)
-                        ' vs ', ' vs. ',
+                        # Generic vs. matchup — only if it looks like team/player names
+                        # (avoid false positives like "dollar vs euro" or "Fed vs inflation")
+                        # These are covered by sport-specific patterns above
                         # Other sports
                         'f1', 'nascar', 'olympics', 'world cup', 'world series',
                         'super bowl', 'championship', 'tournament', 'playoffs',
@@ -1991,7 +2011,7 @@ class KalshiBattleBot:
                         self._log_filter(market_id, question_raw, 'TOO_CLOSE_TO_RESOLUTION', market.get('price', 0))
                         continue  # Resolves in under 12h — too close to resolution, skip
                         
-                    if len(self._positions) >= self._risk_limits.max_positions:
+                    if len(self._positions) + len(self._pending_orders) >= self._risk_limits.max_positions:
                         break
 
                     # PRE-FILTER: Skip Claude call if we know the market will be rejected anyway.
@@ -2229,11 +2249,21 @@ class KalshiBattleBot:
             print(f"[AI] {question[:45]}... | ♻ CACHED (drift {abs(current_price - cache_price):.3f})")
         else:
             try:
+                # Build resolution_date from market end_date
+                _res_date = None
+                _end_date_str = market.get('end_date')
+                if _end_date_str:
+                    try:
+                        _res_date = datetime.fromisoformat(_end_date_str.replace('Z', '+00:00'))
+                    except Exception:
+                        pass
+
                 result = await self._ai_generator.generate_signal(
                     market_question=market.get('question', ''),
                     current_price=current_price,
                     spread=market.get('spread', 0.02),
                     resolution_rules=market.get('rules', '') or market.get('description', ''),
+                    resolution_date=_res_date,
                     volume_24h=market.get('volume_24h', 0),
                     category=market.get('category'),
                     # Intelligence data
@@ -2270,6 +2300,18 @@ class KalshiBattleBot:
                 self._ai_successes += 1
                 # Store in probability cache for reuse when price is stable
                 self._prob_cache[market_id] = (datetime.utcnow(), current_price, signal.raw_prob, signal.confidence)
+                # Record prediction for future calibration learning
+                if self._calibration and self._db_connected:
+                    try:
+                        await self._calibration.record_prediction(
+                            market_id=market_id,
+                            raw_prob=signal.raw_prob,
+                            market_price=current_price,
+                            category=market.get('category'),
+                            calibrated_prob=None,  # filled in after calibration below
+                        )
+                    except Exception:
+                        pass
 
             except Exception as e:
                 print(f"[AI] FAILED: {e}")
@@ -2295,23 +2337,37 @@ class KalshiBattleBot:
             adjusted_prob = signal.raw_prob
             calibration_method = "error"
         
-        # Step 4: Determine trade side and edge using ACTUAL prices from Kalshi
-        yes_price = market.get('yes_price', current_price)
-        no_price = market.get('no_price', 1 - current_price)  # Fallback if not available
-        
-        if adjusted_prob > yes_price:
-            # Bet YES: AI thinks YES is more likely than the market price implies
+        # Step 4: Determine trade side and edge using ASK prices (what we actually pay)
+        # We always pay the ask, not the midpoint. Using midpoint overstates edge.
+        # yes_ask = yes_mid + spread/2;  no_ask = no_mid + spread/2
+        yes_price = market.get('yes_price', current_price)   # midpoint
+        no_price = market.get('no_price', 1 - current_price)
+        spread = market.get('spread', 0.02)
+        half_spread = spread / 2
+
+        # Ask prices — what we pay to open a position
+        yes_ask = min(0.98, yes_price + half_spread)
+        no_ask  = min(0.98, no_price  + half_spread)
+
+        if adjusted_prob > yes_ask:
+            # Bet YES: AI thinks YES is more likely than what it costs to buy YES
             side = 'YES'
-            edge = adjusted_prob - yes_price
+            edge = adjusted_prob - yes_ask   # edge at actual fill price
             trade_prob = adjusted_prob
-            trade_price = yes_price
-        else:
-            # Bet NO: AI thinks NO is more likely than the market price implies
+            trade_price = yes_ask            # Kelly sizes on what we pay
+        elif (1 - adjusted_prob) > no_ask:
+            # Bet NO: AI thinks NO is more likely than what it costs to buy NO
             side = 'NO'
-            no_prob = 1 - adjusted_prob  # Our belief in NO winning
-            edge = no_prob - no_price    # Edge = belief - cost
-            trade_prob = no_prob         # Our belief in NO winning
-            trade_price = no_price       # Actual cost to buy NO
+            no_prob = 1 - adjusted_prob
+            edge = no_prob - no_ask
+            trade_prob = no_prob
+            trade_price = no_ask
+        else:
+            # No edge at ask prices — midpoint edge exists but spread eats it
+            side = 'YES' if adjusted_prob > yes_price else 'NO'
+            edge = 0.0   # forces LOW_EDGE filter below
+            trade_prob = adjusted_prob if side == 'YES' else 1 - adjusted_prob
+            trade_price = yes_ask if side == 'YES' else no_ask
         
         # Step 5: Apply contrarian edge adjustment
         contrarian_multiplier = 1.0
@@ -2417,7 +2473,7 @@ class KalshiBattleBot:
                 should_trade = False
                 reasons.append(f'RECENTLY_EXITED_{hours_since_exit:.1f}h_AGO_{exit_reason_stored[:20]}')
         
-        if len(self._positions) >= self._risk_limits.max_positions:
+        if len(self._positions) + len(self._pending_orders) >= self._risk_limits.max_positions:
             should_trade = False
             reasons.append('MAX_POSITIONS')
         
