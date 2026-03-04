@@ -375,7 +375,11 @@ class AISignalGenerator:
         days_remaining = "Unknown"
         if resolution_date:
             resolution_str = resolution_date.strftime("%Y-%m-%d %H:%M UTC")
-            delta = resolution_date - datetime.utcnow()
+            # Ensure both sides of the subtraction are timezone-aware (UTC) or both naive
+            from datetime import timezone as _tz
+            now_utc = datetime.now(_tz.utc)
+            res_aware = resolution_date if resolution_date.tzinfo else resolution_date.replace(tzinfo=_tz.utc)
+            delta = res_aware - now_utc
             days_remaining = f"{delta.days} days, {delta.seconds // 3600} hours"
         
         # Format price change
