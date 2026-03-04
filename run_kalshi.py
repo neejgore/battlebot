@@ -84,6 +84,8 @@ class KalshiBattleBot:
         # _load_state() is called so that _save_state() never writes {} for them.
         self._daily_snapshots: dict = {}
         self._portfolio_hourly: dict = {}
+        self._recently_exited: dict = {}        # exit-cooldown timestamps (restored by _load_state)
+        self._recently_exited_reason: dict = {} # exit-cooldown reasons (restored by _load_state)
         # Stats debug counter — initialised here to avoid hasattr in _get_stats hot path
         self._stats_debug_counter: int = 0
         # Snapshot file-save throttle — initialised here to avoid hasattr in _save_daily_snapshot
@@ -100,8 +102,6 @@ class KalshiBattleBot:
         self._running = False
         self._last_analysis: dict[str, datetime] = {}
         self._last_analysis_price: dict[str, float] = {}
-        self._recently_exited: dict[str, datetime] = {}  # Track exits to prevent re-entry
-        self._recently_exited_reason: dict[str, str] = {}  # Exit reason per market
         self._analysis_cooldown = 1800  # 30 minutes (overridden per time-horizon in trading loop)
         self._price_change_threshold = 0.02  # Re-analyze on 2% move
         # Probability cache: {market_id: (timestamp, price_when_cached, ai_prob, confidence)}
@@ -532,6 +532,20 @@ class KalshiBattleBot:
                     # These losses already happened - they shouldn't trigger today's kill switch
                     # The P&L is already reflected in Kalshi account balance
                     # await self._risk_engine.record_trade_result(pnl)  # DISABLED
+
+                    # B16 fix: update calibration DB with ground-truth outcome so
+                    # the calibration engine can learn from settled markets.
+                    if self._calibration and self._db_connected:
+                        try:
+                            yes_won = (result or '').lower() == 'yes'
+                            updated = await self._calibration.record_outcome_by_market(
+                                market_id=ticker,
+                                yes_won=yes_won,
+                            )
+                            if updated:
+                                print(f"[Calibration] Updated {updated} sample(s) for {ticker[:30]} → {'YES' if yes_won else 'NO'}")
+                        except Exception as _cal_err:
+                            print(f"[Calibration] record_outcome_by_market error: {_cal_err}")
                     
                     reconciled += 1
                     await asyncio.sleep(0.2)  # Rate limit API calls
@@ -2504,10 +2518,15 @@ class KalshiBattleBot:
         self._analyses[0]['reason'] = ', '.join(reasons) if reasons else 'CRITERIA_MET'
         
         if should_trade:
-            # Sync real open-position exposure into the risk engine so Kelly sizing
-            # correctly accounts for already-deployed capital.
+            # Sync total + per-market exposure so both global and per-market limits fire.
             real_exposure = sum(p.get('size', 0) for p in self._positions.values())
             self._risk_engine.sync_open_exposure(real_exposure)
+
+            market_exposures: dict = {}
+            for p in self._positions.values():
+                mid = p.get('market_id', '')
+                market_exposures[mid] = market_exposures.get(mid, 0.0) + p.get('size', 0.0)
+            self._risk_engine.sync_market_exposure(market_exposures)
 
             # Calculate position size (async with proper params)
             print(f"[Debug] Calculating size: prob={trade_prob:.2f}, price={trade_price:.2f}, edge={edge:.2f}, conf={signal.confidence:.2f}")
@@ -3306,8 +3325,26 @@ class KalshiBattleBot:
                             print(f"[ORDER FILLED] {order_id} | {fill_count} contracts @ {fill_price*100:.0f}¢")
                         
                         elif status == 'canceled' or status == 'cancelled':
-                            canceled_orders.append(order_id)
-                            print(f"[ORDER CANCELED] {order_id}")
+                            # B49 fix: a cancel can arrive *after* a partial fill.
+                            # Any contracts already filled are real capital deployed —
+                            # track them as a position so they aren't orphaned.
+                            partial_count = order_data.get('filled_count', 0)
+                            if partial_count and partial_count > 0:
+                                partial_price = order_data.get('average_fill_price',
+                                                               order['entry_price'] * 100) / 100
+                                filled_orders.append({
+                                    'order_id': order_id,
+                                    'order': order,
+                                    'fill_count': partial_count,
+                                    'fill_price': partial_price,
+                                    'partial': True,
+                                })
+                                print(f"[PARTIAL FILL + CANCEL] {order_id} | "
+                                      f"{partial_count}/{order['contracts']} contracts @ "
+                                      f"{partial_price*100:.0f}¢ — creating position")
+                            else:
+                                canceled_orders.append(order_id)
+                                print(f"[ORDER CANCELED] {order_id}")
                         
                         elif status == 'resting':
                             # Still waiting to fill - check for partial fills
@@ -3368,6 +3405,12 @@ class KalshiBattleBot:
                     
                     pos_id = order.get('id', f"pos_{order_id}")
                     fill_price = filled.get('fill_price', order['entry_price'])
+
+                    # For partial fills the actual dollar cost is proportional
+                    fill_count = filled.get('fill_count', order['contracts'])
+                    total_contracts = order.get('contracts', 1) or 1
+                    fill_ratio = min(1.0, fill_count / total_contracts) if total_contracts else 1.0
+                    actual_size = order['size'] * fill_ratio
                     
                     pos = {
                         'id': pos_id,
@@ -3375,7 +3418,7 @@ class KalshiBattleBot:
                         'market_id': order['market_id'],
                         'question': order.get('question', ''),
                         'side': order['side'],
-                        'size': order['size'],
+                        'size': actual_size,
                         'entry_price': fill_price,
                         'current_price': fill_price,
                         'contracts': filled.get('fill_count', order['contracts']),
@@ -3400,7 +3443,7 @@ class KalshiBattleBot:
                                 token_id=order['market_id'],
                                 entry_price=fill_price,
                                 entry_side=order['side'],
-                                size=order['size'],
+                                size=actual_size,
                                 raw_prob=order.get('ai_probability', 0.5),
                                 adjusted_prob=order.get('ai_probability', 0.5),
                                 edge=order.get('edge', 0),
@@ -3410,7 +3453,8 @@ class KalshiBattleBot:
                         except Exception as e:
                             print(f"[DB] Failed to log filled trade: {e}")
                     
-                    print(f"[POSITION OPENED] {order['side']} ${order['size']:.2f} @ {fill_price*100:.0f}¢ | {order.get('question', '')[:50]}...")
+                    partial_flag = " (partial)" if filled.get('partial') else ""
+                    print(f"[POSITION OPENED{partial_flag}] {order['side']} ${actual_size:.2f} @ {fill_price*100:.0f}¢ | {order.get('question', '')[:50]}...")
                     
                     # Update trade record
                     for trade in self._trades:
@@ -3613,7 +3657,7 @@ class KalshiBattleBot:
                 })
             
             # 3. Calculate account metrics
-            total_deposits = float(os.getenv('TOTAL_DEPOSITS', '150'))  # User's total deposits
+            total_deposits = float(os.getenv('TOTAL_DEPOSITS', '200'))  # User's total deposits
             # Prefer Kalshi's own portfolio valuation (same number shown in the ACCOUNT section)
             # so that Today's Peak tracks the same figure the user sees.
             account_value = self._kalshi_total if self._kalshi_total is not None else (cash + total_position_value)
@@ -3967,7 +4011,7 @@ class KalshiBattleBot:
             best_pnl = max(pnls) if pnls else 0
             worst_pnl = min(pnls) if pnls else 0
             
-            total_deposits = float(os.getenv('TOTAL_DEPOSITS', '150'))
+            total_deposits = float(os.getenv('TOTAL_DEPOSITS', '200'))
             
             return web.json_response({
                 'settlements': settlements,

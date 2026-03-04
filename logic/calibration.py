@@ -342,7 +342,30 @@ class CalibrationEngine:
         """
         db = await self._ensure_db()
         await db.update_calibration_outcome(sample_id, outcome)
-    
+
+    async def record_outcome_by_market(
+        self,
+        market_id: str,
+        yes_won: bool,
+    ) -> int:
+        """Record the resolution outcome for every pending prediction on a market.
+
+        Called from the settlement reconciliation loop so the calibration
+        engine can learn from each settled market without needing a stored
+        sample_id.  Only unresolved rows (outcome IS NULL) are updated,
+        making this safe to call multiple times (idempotent).
+
+        Args:
+            market_id: Market ticker / ID that has settled.
+            yes_won: True if YES resolved, False if NO resolved.
+
+        Returns:
+            Number of calibration rows updated.
+        """
+        db = await self._ensure_db()
+        outcome_val = 1 if yes_won else 0
+        return await db.update_calibration_outcome_by_market(market_id, outcome_val)
+
     async def get_calibration_curve(
         self,
         category: Optional[str] = None,

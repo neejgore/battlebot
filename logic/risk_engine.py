@@ -205,6 +205,18 @@ class RiskEngine:
         """
         self._synced_exposure = max(0.0, total_open_cost)
 
+    def sync_market_exposure(self, exposures: dict) -> None:
+        """Sync per-market exposure from the bot's open positions dict.
+
+        Called alongside sync_open_exposure before each position-size
+        calculation. Populates _market_exposure so the per-market cap
+        (max_percent_bankroll_per_market) actually fires.
+
+        Args:
+            exposures: {market_id: dollar_cost_basis} for all open positions.
+        """
+        self._market_exposure = {k: max(0.0, v) for k, v in exposures.items()}
+
     def sync_bankroll(self, actual_total: float) -> None:
         """Sync the risk-engine bankroll from the real Kalshi account value.
 

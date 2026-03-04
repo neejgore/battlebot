@@ -458,6 +458,36 @@ class TelemetryDB:
             """, (outcome, datetime.utcnow().isoformat(), sample_id))
             await conn.commit()
     
+    async def update_calibration_outcome_by_market(
+        self,
+        market_id: str,
+        outcome: int,  # 1 = event occurred (YES won), 0 = did not occur
+    ) -> int:
+        """Update all pending calibration samples for a market with its outcome.
+
+        Called when a market settles so the calibration learning loop receives
+        ground truth. Only rows where outcome IS NULL are updated (avoids
+        double-writing on repeated reconciliation runs).
+
+        Args:
+            market_id: Market ticker / ID.
+            outcome: 1 if YES resolved, 0 if NO resolved.
+
+        Returns:
+            Number of rows updated.
+        """
+        conn = await self._ensure_connected()
+        async with self._lock:
+            cursor = await conn.execute("""
+                UPDATE calibration_history
+                SET outcome = ?,
+                    resolved_at = ?
+                WHERE market_id = ?
+                  AND outcome IS NULL
+            """, (outcome, datetime.utcnow().isoformat(), market_id))
+            await conn.commit()
+            return cursor.rowcount
+
     async def get_calibration_data(
         self,
         category: Optional[str] = None,
