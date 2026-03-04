@@ -45,7 +45,7 @@ class KalshiBattleBot:
         # Config from env - STRICT defaults for profitability
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
-        self.min_edge = max(0.12, float(os.getenv('MIN_EDGE', 0.12)))  # 12% min edge — raised from 8% to cut low-quality bets
+        self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.07)))  # 7% adjusted-edge floor — requires ~12% raw Claude edge after shrinkage
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.55))  # 55% confidence — raised from 40%; data showed conf<0.55 loses money
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 25))  # $25 max - bigger bets on better opportunities
         self.max_days_to_resolution = float(os.getenv('MAX_DAYS_TO_RESOLUTION', 30))  # 30 days max — tighter than 45
