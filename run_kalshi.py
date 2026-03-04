@@ -288,6 +288,11 @@ class KalshiBattleBot:
                     # Order filled while bot was down - create position
                     fill_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
                     fill_count = order_data.get('filled_count', order['contracts'])
+
+                    # Scale size to actual fill (partial fills cost less than planned)
+                    total_contracts = order.get('contracts', 1) or 1
+                    fill_ratio = min(1.0, fill_count / total_contracts)
+                    actual_size = fill_count * fill_price  # true dollar cost at fill price
                     
                     pos_id = order.get('id', f"pos_{order_id}")
                     pos = {
@@ -296,7 +301,7 @@ class KalshiBattleBot:
                         'market_id': order['market_id'],
                         'question': order.get('question', ''),
                         'side': order['side'],
-                        'size': order['size'],
+                        'size': actual_size,
                         'entry_price': fill_price,
                         'current_price': fill_price,
                         'contracts': fill_count,
@@ -313,12 +318,43 @@ class KalshiBattleBot:
                     self._positions[pos_id] = pos
                     self._pending_orders.pop(order_id)
                     filled += 1
-                    print(f"[Startup] Order {order_id[:8]}... was FILLED @ {fill_price*100:.0f}¢")
+                    partial_flag = f" (partial: {fill_count}/{total_contracts})" if fill_ratio < 1.0 else ""
+                    print(f"[Startup] Order {order_id[:8]}... was FILLED{partial_flag} @ {fill_price*100:.0f}¢ (${actual_size:.2f})")
                     
                 elif status in ('canceled', 'cancelled'):
+                    # B49 fix: check for partial fill before treating as a clean cancel
+                    startup_partial = order_data.get('filled_count', 0)
+                    if startup_partial and startup_partial > 0:
+                        fill_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
+                        actual_size = startup_partial * fill_price
+                        pos_id = order.get('id', f"pos_{order_id}")
+                        pos = {
+                            'id': pos_id,
+                            'order_id': order_id,
+                            'market_id': order['market_id'],
+                            'question': order.get('question', ''),
+                            'side': order['side'],
+                            'size': actual_size,
+                            'entry_price': fill_price,
+                            'current_price': fill_price,
+                            'contracts': startup_partial,
+                            'ai_probability': order.get('ai_probability', 0.5),
+                            'edge': order.get('edge', 0),
+                            'confidence': order.get('confidence', 0),
+                            'entry_time': order.get('placed_time', datetime.utcnow().isoformat()),
+                            'unrealized_pnl': 0.0,
+                            'end_date': order.get('end_date'),
+                            'has_intel': order.get('has_intel', False),
+                            'news_count': order.get('news_count', 0),
+                            'category': order.get('category', 'unknown'),
+                        }
+                        self._positions[pos_id] = pos
+                        filled += 1
+                        print(f"[Startup] Order {order_id[:8]}... PARTIAL+CANCELED — {startup_partial}/{order.get('contracts','?')} contracts @ {fill_price*100:.0f}¢ (${actual_size:.2f}) — position created")
+                    else:
+                        canceled += 1
+                        print(f"[Startup] Order {order_id[:8]}... was CANCELED")
                     self._pending_orders.pop(order_id)
-                    canceled += 1
-                    print(f"[Startup] Order {order_id[:8]}... was CANCELED")
                     
                 else:  # still resting
                     # Cancel stale limit orders (older than 1 hour)
@@ -580,9 +616,11 @@ class KalshiBattleBot:
     async def _run_nightly_report(self) -> None:
         """Calculate and log the nightly strategy performance report."""
         now = datetime.now(timezone.utc)
-        cutoff_30d = (now - timedelta(days=30)).isoformat()
-        cutoff_7d  = (now - timedelta(days=7)).isoformat()
-        cutoff_24h = (now - timedelta(hours=24)).isoformat()
+        # Truncate to 19 chars (YYYY-MM-DDTHH:MM:SS) so that string comparison
+        # against naive trade/analysis timestamps is consistent.
+        cutoff_30d = (now - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%S')
+        cutoff_7d  = (now - timedelta(days=7)).strftime('%Y-%m-%dT%H:%M:%S')
+        cutoff_24h = (now - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%S')
 
         exits = [t for t in self._trades if t.get('action') == 'EXIT' and t.get('pnl') is not None]
         recent = [t for t in exits if t.get('timestamp', '') >= cutoff_30d]
@@ -663,7 +701,9 @@ class KalshiBattleBot:
         _series_re = re.compile(r'^([A-Z0-9]+)-\d{2}[A-Z]{3}')
         try:
             # Markets analysed in the last 24 hours — series we already cover
-            cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            # Use strftime to produce a naive-compatible ISO string (no timezone suffix)
+            # so string comparison against naive analysis timestamps works correctly.
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%S')
             covered_series: set[str] = set()
             for a in self._analyses:
                 if a.get('timestamp', '') >= cutoff:
@@ -1053,7 +1093,7 @@ class KalshiBattleBot:
     def _log_filter(self, market_id: str, question: str, reason: str, price: float = 0.0) -> None:
         """Record a market that was filtered before reaching Claude analysis."""
         self._filter_log.append({
-            'ts': datetime.utcnow().isoformat()[:19],
+            'ts': datetime.now(timezone.utc).isoformat(),
             'market_id': market_id,
             'question': question[:80],
             'reason': reason,
@@ -2305,7 +2345,7 @@ class KalshiBattleBot:
                         'reason': f"AI failed: {error_msg}",
                         'timestamp': datetime.utcnow().isoformat(),
                     })
-                    self._analyses = self._analyses[:50]
+                    self._analyses = self._analyses[:200]
                     await self._broadcast_update()
                     return
 
@@ -2427,7 +2467,7 @@ class KalshiBattleBot:
                 analysis_record['inefficiency_reasons'] = intel.inefficiency_reasons[:3]
         
         self._analyses.insert(0, analysis_record)
-        self._analyses = self._analyses[:50]
+        self._analyses = self._analyses[:200]
         
         # Log signal for backtesting (track ALL signals regardless of trade decision)
         signal_entry = {
