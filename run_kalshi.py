@@ -45,8 +45,8 @@ class KalshiBattleBot:
         # Config from env - STRICT defaults for profitability
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
-        self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.07)))  # 7% adjusted-edge floor — requires ~12% raw Claude edge after shrinkage
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.55))  # 55% confidence — raised from 40%; data showed conf<0.55 loses money
+        self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.12)))  # 12% adjusted-edge floor — tighter filter while rebuilding $60 bankroll
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.65))  # 65% confidence — raised from 55%; protect small bankroll with higher bar
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 25))  # $25 max - bigger bets on better opportunities
         self.max_days_to_resolution = float(os.getenv('MAX_DAYS_TO_RESOLUTION', 30))  # 30 days max — tighter than 45
         self.min_days_to_resolution = float(os.getenv('MIN_DAYS_TO_RESOLUTION', 0))  # No minimum — sports/weather filters handle bad short-horizon bets; BTC range needs access
@@ -2929,10 +2929,24 @@ class KalshiBattleBot:
                     # NEWS CHECK: Scan headlines for each non-BTC-range position every 2h
                     await self._check_position_news(pos_id, pos)
 
+                    # STOP-LOSS: Exit when position has lost too much
+                    # Historical data: avg loss = $7.61, avg win = $3.55 on 40% win rate.
+                    # Without a stop, losers go to 100% loss at settlement.
+                    # Cutting at -50% halves the average loss and drops break-even
+                    # win rate from 67% to ~50%, a dramatically better math profile.
+                    # Skip for positions within 24h of resolution — let them settle.
+                    stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '0.50'))
+                    near_settlement = days_to_res is not None and days_to_res <= 1.0
+                    if (gain_pct <= -stop_loss_pct
+                            and cost_basis > 0
+                            and not near_settlement):
+                        should_exit = True
+                        exit_reason_mon = f"STOP_LOSS_{abs(gain_pct)*100:.0f}pct"
+
                     # PROFIT-LOCK: Exit when position has gained significantly
                     # Logic: if we're up 50%+, the market has already priced in our view —
                     # locking in is better than waiting for a potential reversal.
-                    if gain_pct >= self._profit_lock_pct and cost_basis > 0:
+                    elif gain_pct >= self._profit_lock_pct and cost_basis > 0:
                         should_exit = True
                         exit_reason_mon = f"PROFIT_LOCK_{gain_pct*100:.0f}pct"
                     

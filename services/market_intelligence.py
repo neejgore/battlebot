@@ -328,17 +328,23 @@ class NewsService:
         return 'sports'
     
     async def _fetch_brave(self, query: str, max_results: int = 5) -> list[NewsItem]:
-        """Fetch news using Brave Search API."""
+        """Fetch news using Brave Web Search API (free tier).
+
+        Uses /web/search (free tier) rather than /news/search (paid only).
+        The web endpoint returns news articles inside both the top-level
+        'news' block and the 'web' results block.
+        """
         news_items = []
         
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(
-                    "https://api.search.brave.com/res/v1/news/search",
+                    "https://api.search.brave.com/res/v1/web/search",
                     params={
                         "q": query,
                         "count": max_results,
                         "freshness": "pd",  # Past day
+                        "result_filter": "news,web",
                     },
                     headers={
                         "X-Subscription-Token": self._brave_api_key,
@@ -348,23 +354,36 @@ class NewsService:
                 
                 if response.status_code == 200:
                     data = response.json()
-                    results = data.get('results', [])
-                    
-                    for r in results[:max_results]:
+
+                    # Pull from 'news' block first (most relevant)
+                    for r in (data.get('news', {}).get('results', []) or [])[:max_results]:
                         news_items.append(NewsItem(
                             title=r.get('title', '')[:200],
-                            snippet=r.get('description', r.get('title', ''))[:1000],  # Much more context
-                            source=r.get('meta_url', {}).get('hostname', 'News'),
+                            snippet=r.get('description', r.get('title', ''))[:1000],
+                            source=(r.get('meta_url') or {}).get('hostname', 'News'),
                             url=r.get('url', ''),
                         ))
+
+                    # Fill remaining slots from web results if news block is sparse
+                    if len(news_items) < max_results:
+                        for r in (data.get('web', {}).get('results', []) or []):
+                            if len(news_items) >= max_results:
+                                break
+                            news_items.append(NewsItem(
+                                title=r.get('title', '')[:200],
+                                snippet=r.get('description', r.get('title', ''))[:1000],
+                                source=(r.get('profile') or {}).get('name', 'Web'),
+                                url=r.get('url', ''),
+                            ))
                     
                     self._brave_searches += 1
-                    if news_items:
-                        logger.info(f"[Brave] Fetched {len(news_items)} items (total searches: {self._brave_searches})")
+                    logger.info(f"[Brave] Fetched {len(news_items)} items for '{query[:40]}' (total: {self._brave_searches})")
                 elif response.status_code == 429:
                     logger.warning("[Brave] Rate limited - falling back to Google News")
+                elif response.status_code == 401:
+                    logger.error(f"[Brave] Unauthorized (401) — check BRAVE_API_KEY is correct")
                 else:
-                    logger.warning(f"[Brave] Status {response.status_code}: {response.text[:100]}")
+                    logger.warning(f"[Brave] Status {response.status_code}: {response.text[:200]}")
                     
         except Exception as e:
             logger.warning(f"[Brave] Error: {e}")
