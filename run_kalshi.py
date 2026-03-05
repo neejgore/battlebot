@@ -1910,36 +1910,50 @@ class KalshiBattleBot:
                     
                     # FILTER 2c: HARD BLOCK ALL SPORTS - historically poor (28% win rate, -$32 losses)
                     # Sports outcomes are too unpredictable, no sustainable edge
-                    sports_patterns = [
-                        # Basketball
-                        'nba', 'ncaa', 'basketball', 'wnba', 'nbl',
-                        # Football
-                        'nfl', 'football', 'touchdown', 'quarterback',
-                        # Baseball
-                        'mlb', 'baseball',
-                        # Hockey
-                        'nhl', 'hockey',
-                        # Soccer
-                        'soccer', 'premier league', 'champions league', 'mls',
-                        # Golf
-                        'golf', 'pga', 'lpga', 'genesis invitational',
-                        # Tennis
-                        'tennis', 'atp', 'wta',
-                        # Fighting
-                        'ufc', 'boxing', 'mma', 'fight', 'bout', 'knockout', 'k.o.',
-                        'heavyweight', 'lightweight', 'middleweight', 'welterweight',
-                        # Generic vs. matchup — only if it looks like team/player names
-                        # (avoid false positives like "dollar vs euro" or "Fed vs inflation")
-                        # These are covered by sport-specific patterns above
-                        # Other sports
-                        'f1', 'nascar', 'olympics', 'world cup', 'world series',
-                        'super bowl', 'championship', 'tournament', 'playoffs',
-                        # Generic sports terms
-                        'wins the match', 'win the game', 'beat ', 'defeats ',
-                        'rebounds', 'assists', 'three-pointers', '3-pointers',
-                        'pitcher', 'batter', 'innings', 'overtime', 'penalty kick',
+                    #
+                    # Guard: economic and political markets are NEVER sports.
+                    # Without this, 'nfl' matches "i**nfl**ation" and 'mma' matches "em**mma**nuel".
+                    _econ_politics_guard = [
+                        'inflation', 'cpi', 'gdp', 'unemployment', 'federal reserve',
+                        'interest rate', 'treasury', 'yield', 'tariff', 'trade deficit',
+                        'election', 'mayoral', 'parliamentary', 'congress', 'senate',
+                        'president', 'prime minister', 'chancellor', 'minister',
                     ]
-                    if any(pattern in question_lower for pattern in sports_patterns):
+                    _is_econ_politics = any(k in question_lower for k in _econ_politics_guard)
+
+                    # Short abbreviations (3-4 chars) require word-boundary matching to avoid
+                    # false positives like 'nfl' in "inflation", 'mma' in "emmanuel", etc.
+                    _sports_abbrevs = [
+                        'nba', 'ncaa', 'wnba', 'nbl', 'nfl', 'mlb', 'nhl',
+                        'mls', 'pga', 'lpga', 'atp', 'wta', 'ufc', 'mma',
+                    ]
+                    # Longer patterns are safe as plain substrings
+                    sports_patterns = [
+                        'basketball', 'football', 'touchdown', 'quarterback',
+                        'baseball', 'hockey',
+                        'soccer', 'premier league', 'champions league',
+                        'golf', 'genesis invitational',
+                        'tennis',
+                        'boxing', 'fight night', 'knockout', 'k.o.',
+                        'heavyweight', 'lightweight', 'middleweight', 'welterweight',
+                        'nascar', 'olympics', 'world cup', 'world series',
+                        'super bowl', 'championship game', 'playoff game',
+                        'wins the match', 'win the game', 'beat the spread', 'defeats ',
+                        'rebounds', 'assists', 'three-pointers', '3-pointers',
+                        'pitcher', 'batter', 'innings', 'overtime period', 'penalty kick',
+                    ]
+                    _abbrev_hit = (
+                        not _is_econ_politics
+                        and any(
+                            bool(re.search(r'\b' + abbrev + r'\b', question_lower))
+                            for abbrev in _sports_abbrevs
+                        )
+                    )
+                    _pattern_hit = (
+                        not _is_econ_politics
+                        and any(pattern in question_lower for pattern in sports_patterns)
+                    )
+                    if _abbrev_hit or _pattern_hit:
                         self._log_filter(market_id, question_raw, 'SPORTS_QUESTION', market.get('price', 0))
                         continue  # SKIP ALL SPORTS - no edge, high losses
                     
