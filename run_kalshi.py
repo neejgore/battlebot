@@ -2084,10 +2084,15 @@ class KalshiBattleBot:
                             continue
 
                     # Cluster cap reached — no point asking Claude
+                    # Count both filled positions AND pending orders so that
+                    # markets placed-but-not-yet-filled don't bypass the cap.
                     _pre_cluster_key = self._get_cluster_key(market.get('question', ''))
                     _pre_cluster_count = sum(
                         1 for p in self._positions.values()
                         if self._get_cluster_key(p.get('question', '')) == _pre_cluster_key
+                    ) + sum(
+                        1 for o in self._pending_orders.values()
+                        if self._get_cluster_key(o.get('question', '')) == _pre_cluster_key
                     )
                     MAX_POSITIONS_PER_CLUSTER = int(os.getenv('MAX_CLUSTER_POSITIONS', '3'))
                     # Per-cluster overrides: tighter caps on low-edge speculative categories
@@ -2533,11 +2538,16 @@ class KalshiBattleBot:
         
         # CORRELATION CLUSTER CAP: Limit exposure to same news theme
         # Prevents piling into 10 DOGE-cut variants when 2-3 are sufficient.
+        # Count pending orders too — avoids bypass when orders are placed but
+        # not yet filled (the bug that caused 3 trump_speech bets to slip through).
         MAX_POSITIONS_PER_CLUSTER = int(os.getenv('MAX_CLUSTER_POSITIONS', '3'))
         cluster_key = self._get_cluster_key(market.get('question', ''))
         cluster_count = sum(
             1 for p in self._positions.values()
             if self._get_cluster_key(p.get('question', '')) == cluster_key
+        ) + sum(
+            1 for o in self._pending_orders.values()
+            if self._get_cluster_key(o.get('question', '')) == cluster_key
         )
         # Per-cluster overrides: tighter caps on speculative/low-edge categories
         _EXEC_CLUSTER_CAPS = {
