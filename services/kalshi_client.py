@@ -386,16 +386,33 @@ class KalshiClient:
             return response.json()
     
     async def cancel_order(self, order_id: str) -> dict:
-        """Cancel an open order (requires auth)."""
+        """Cancel an open order (requires auth).
+
+        Retries up to 3 times on 429 / 5xx so a transient failure does not
+        leave a ghost order open on Kalshi.
+        """
         path = f"/portfolio/orders/{order_id}"
-        headers = self._get_auth_headers('DELETE', path)
-        headers['Accept'] = 'application/json'
-        
-        async with httpx.AsyncClient(timeout=30) as client:
-            await self._rate_limit()
-            response = await client.delete(f"{self.base_url}{path}", headers=headers)
-            response.raise_for_status()
-            return response.json()
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            headers = self._get_auth_headers('DELETE', path)
+            headers['Accept'] = 'application/json'
+            async with httpx.AsyncClient(timeout=30) as client:
+                await self._rate_limit()
+                response = await client.delete(f"{self.base_url}{path}", headers=headers)
+                if response.status_code == 200:
+                    return response.json()
+                if response.status_code == 404:
+                    # Already cancelled or never existed — treat as success
+                    return {'status': 'not_found', 'order_id': order_id}
+                if response.status_code == 429 and attempt < max_attempts - 1:
+                    wait = 2 ** attempt
+                    await asyncio.sleep(wait)
+                    continue
+                if response.status_code >= 500 and attempt < max_attempts - 1:
+                    await asyncio.sleep(1)
+                    continue
+                response.raise_for_status()
+        return {}
     
     async def get_order(self, order_id: str) -> dict:
         """Get status of a specific order (requires auth)."""

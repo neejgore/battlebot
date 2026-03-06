@@ -1882,6 +1882,7 @@ class KalshiBattleBot:
                     
                     # FILTER 1: Skip entertainment/noise markets
                     if any(term in question_lower for term in ['mention', 'announcer', 'say during', 'tweet', 'post about']):
+                        self._log_filter(market_id, question_raw, 'ENTERTAINMENT_NOISE', market.get('price', 0))
                         continue
                     
                     # FILTER 2: Skip ALL player prop markets with low thresholds
@@ -1898,11 +1899,17 @@ class KalshiBattleBot:
                         continue
                     
                     # FILTER 2b: Skip point spreads and totals - too volatile, no edge
+                    # NOTE: 'over 1'-'over 9' removed — they false-positively matched
+                    # macro questions like "over 10 million deportations" or "over 1% GDP growth".
+                    # Half-point lines (.5) are purely sports and safe to block as substrings.
                     point_spread_patterns = [
-                        'total points', 'over 1', 'over 2', 'over 3', 'over 4', 'over 5',
-                        'over 6', 'over 7', 'over 8', 'over 9',
-                        'wins by over', 'wins by under', 'point spread',
+                        'total points', 'wins by over', 'wins by under', 'point spread',
                         '.5 points', 'points scored',
+                        # Half-point over/under lines — exclusively sports betting terminology
+                        'over 0.5', 'over 1.5', 'over 2.5', 'over 3.5', 'over 4.5',
+                        'over 5.5', 'over 6.5', 'over 7.5', 'over 8.5', 'over 9.5',
+                        'under 0.5', 'under 1.5', 'under 2.5', 'under 3.5', 'under 4.5',
+                        'under 5.5', 'under 6.5', 'under 7.5', 'under 8.5', 'under 9.5',
                     ]
                     if any(pattern in question_lower for pattern in point_spread_patterns):
                         self._log_filter(market_id, question_raw, 'POINT_SPREAD', market.get('price', 0))

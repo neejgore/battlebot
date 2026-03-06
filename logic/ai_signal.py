@@ -154,7 +154,7 @@ class AISignalGenerator:
     DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Keep Sonnet — news synthesis quality drives the +17pp edge
     MAX_RETRIES = 1
     TIMEOUT_SECONDS = 30.0
-    MAX_TOKENS = 800
+    MAX_TOKENS = 1500  # Raised from 800 — full 9-field JSON schema with list fields can exceed 800 tokens and truncate silently
     
     def __init__(
         self,
