@@ -232,6 +232,7 @@ class RiskEngine:
         """
         if actual_total > 0:
             self.bankroll = actual_total
+            self.daily_stats.current_bankroll = actual_total
             logger.debug(f"Bankroll synced from Kalshi: ${actual_total:.2f}")
 
     @property

@@ -191,6 +191,12 @@ class KalshiBattleBot:
                         except Exception:
                             pass
                     self._recently_exited_reason = state.get('recently_exited_reason', {})
+                    # Restore kill switch if it fired today — prevents trading resuming after restart
+                    _ks_date = state.get('kill_switch_date', '')
+                    _today = datetime.utcnow().strftime('%Y-%m-%d')
+                    if state.get('kill_switch_triggered') and _ks_date == _today:
+                        self._risk_engine.daily_stats.kill_switch_triggered = True
+                        print(f"[State] Kill switch restored from state (triggered today {_ks_date})")
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals, {len(self._recently_exited)} exit cooldowns")
                     
                     # Clear ALL reconciled trades - they have corrupted P&L data
@@ -246,12 +252,14 @@ class KalshiBattleBot:
             state_data = {
                 'positions': self._positions,
                 'pending_orders': self._pending_orders,
-                'trades': self._trades[:100],   # insert(0,...) means newest is at front
+                'trades': self._trades[:500],   # insert(0,...) means newest is at front
                 'signal_log': self._signal_log[-500:],
                 'daily_snapshots': daily_snapshots,
                 'portfolio_hourly': portfolio_hourly,
                 'recently_exited': recently_exited_serial,
                 'recently_exited_reason': self._recently_exited_reason,
+                'kill_switch_triggered': self._risk_engine.daily_stats.kill_switch_triggered,
+                'kill_switch_date': datetime.utcnow().strftime('%Y-%m-%d'),
                 'saved_at': datetime.utcnow().isoformat(),
             }
             
@@ -1868,7 +1876,7 @@ class KalshiBattleBot:
                     'KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-',
                 )
                 _EXACT_PRICE_RE = re.compile(
-                    r'(above|below|hit|reach|exceed|surpass|touch)\s+\$[\d,]+'
+                    r'(above|below|hit|reach|exceed|surpass|touch)\s+\$[\d,.]+',
                 )
 
                 for market in markets_by_urgency:
@@ -1999,8 +2007,10 @@ class KalshiBattleBot:
                         'chinese gdp', 'china gdp', 'eurozone gdp', 'uk gdp',
                         'german gdp', 'japan gdp', 'india gdp',
                         'gdp (yoy)', 'gdp growth', 'gdp reading',
-                        # Dogecoin range — AI consistently low confidence (25-30%), no edge vs BTC
+                        # Dogecoin — AI consistently low confidence, no edge
                         'dogecoin price range', 'doge price range',
+                        'doge trimmed mean', 'dogecoin trimmed mean',
+                        'doge price', 'dogecoin price',
                         # Press secretary speech markets — priced efficiently, AI has no edge (<8%)
                         'will the white house press secretary say',
                         'will the press secretary say',
@@ -2119,6 +2129,7 @@ class KalshiBattleBot:
                     # Per-cluster overrides: tighter caps on low-edge speculative categories
                     _CLUSTER_CAPS = {
                         'trump_speech':        1,  # "Will Trump say X" — generic AI reasoning, bad P&L
+                        'approval_rating':     1,  # 41.4% and 41.6% are the same bet — cap at 1
                         'weather_new_york':    1,  # Residual; new weather bets already blocked upstream
                         'weather_philadelphia': 1,
                         'weather_generic':     1,
@@ -2186,6 +2197,9 @@ class KalshiBattleBot:
         We cap how many positions we hold per cluster to avoid over-concentration.
         """
         q = question.lower()
+        # Approval ratings — highly correlated across thresholds (41.4%, 41.6% are the same bet)
+        if any(x in q for x in ['approval rating', 'approval rate', 'favorability', 'disapproval']):
+            return 'approval_rating'
         # DOGE / federal spending cuts
         if any(x in q for x in ['doge', 'elon', 'federal spending', 'budget cut', 'cut the budget',
                                   'cut between', 'cut less than', 'cut more than']):
@@ -2573,6 +2587,7 @@ class KalshiBattleBot:
         # Per-cluster overrides: tighter caps on speculative/low-edge categories
         _EXEC_CLUSTER_CAPS = {
             'trump_speech':        1,
+            'approval_rating':     1,  # 41.4% and 41.6% are the same bet — cap at 1
             'weather_new_york':    1,
             'weather_philadelphia': 1,
             'weather_generic':     1,
