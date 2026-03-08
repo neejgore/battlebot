@@ -2026,6 +2026,15 @@ class KalshiBattleBot:
                         'snow', 'rainfall', 'precipitation', 'blizzard', 'snowfall',
                         'rain in ', 'will it rain', 'inches of rain', 'inches of snow',
                         'storm in ', 'hurricane', 'tornado',
+                        # ETH/crypto exact-time price bucket markets ("price at 5pm") —
+                        # Claude gives 0.001-0.014 edge and 0.15 confidence every single time.
+                        # These are NOT range markets (which win); they're time-locked price
+                        # snapshots with no AI advantage. Blocking frees up Claude cycles for
+                        # political/economics markets where real edge exists.
+                        'ethereum price at ', 'eth price at ',
+                        'bitcoin price at ', 'btc price at ',
+                        'solana price at ', 'sol price at ',
+                        'xrp price at ', 'ripple price at ',
                     ]
                     if any(p in question_lower for p in no_intel_patterns):
                         self._log_filter(market_id, question_raw, 'NO_INTEL_PATTERN', market.get('price', 0))
