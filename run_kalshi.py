@@ -2998,6 +2998,16 @@ class KalshiBattleBot:
                     # NEWS CHECK: Scan headlines for each non-BTC-range position every 2h
                     await self._check_position_news(pos_id, pos)
 
+                    # TERMINAL WRITE-OFF: If position is down >85% AND current value < $0.50,
+                    # it is essentially worthless. A sell order at 1-2¢ will never fill on
+                    # Kalshi (no buyers for near-zero contracts). Write it off immediately
+                    # rather than letting it hang as a pending exit forever.
+                    current_value = contracts * current_price
+                    if gain_pct <= -0.85 and current_value < 0.50 and cost_basis > 0:
+                        print(f"[Write-Off] {pos_id[:8]} terminal ({gain_pct*100:.0f}%, value=${current_value:.2f}) — recording loss and removing")
+                        await self._exit_position(pos_id, current_price, unrealized_pnl, f"TERMINAL_WRITEOFF_{abs(gain_pct)*100:.0f}pct")
+                        continue
+
                     # STOP-LOSS: Exit when position has lost too much
                     # Historical data: avg loss = $7.61, avg win = $3.55 on 40% win rate.
                     # Without a stop, losers go to 100% loss at settlement.
@@ -3056,10 +3066,18 @@ class KalshiBattleBot:
                     # Skip if position already has a pending exit order
                     if position.get('pending_exit'):
                         return  # Silently skip - don't spam logs
+
+                    # TERMINAL positions (value < $0.50, price ≤ 2¢): skip the sell order.
+                    # A limit sell at 1¢ will never fill — no buyers for near-zero contracts.
+                    # Fall through to write-off logic below (removes from tracking, records loss).
+                    current_side_price = exit_price
+                    if current_side_price <= 0.02 and contracts * current_side_price < 0.50:
+                        print(f"[Write-Off] {pos_id[:8]} value ${contracts*current_side_price:.2f} — skipping unfillable sell, writing off")
+                        # Skip the sell, fall through to position removal below
+                        contracts = 0  # prevents the sell block from running
                     
                     # Use a limit sell at current bid minus 2¢ for quick fills without
                     # giving away value. Floor at 1¢ to always be marketable.
-                    current_side_price = exit_price  # exit_price is the current market price for this side
                     sell_price_cents = max(1, int(current_side_price * 100) - 2)
                     
                     print(f"[LIVE SELL] Placing limit order: {contracts} {position['side']} @ {sell_price_cents}¢")
