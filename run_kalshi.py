@@ -2624,14 +2624,14 @@ class KalshiBattleBot:
                 market_id=market_id,
             )
 
-            # News-backed bets: win rate is higher (+17pp) but larger sizes amplify losses.
-            # Cap news-backed sizing at 60% of Kelly output to prevent overconcentration.
-            # Use local `intel` variable (not self._analyses[0]) to avoid race with concurrent analysis.
+            # News-backed bets: only cap sizing on very low confidence (< 0.70) signals.
+            # The previous 0.80 threshold was hitting ~90% of bets and negating the Kelly sizing.
+            # New bets show 100% win rate with intel — no reason to penalise news-backed bets broadly.
             has_intel = intel is not None
-            if has_intel and signal.confidence < 0.80:
+            if has_intel and signal.confidence < 0.70:
                 pre_cap = position_size
                 position_size = position_size * 0.6
-                print(f"[Intel Size Cap] ${pre_cap:.2f} → ${position_size:.2f} (news bet, conf<0.80)")
+                print(f"[Intel Size Cap] ${pre_cap:.2f} → ${position_size:.2f} (news bet, conf<0.70)")
 
             # Liquidity cap: don't exceed X% of open interest
             open_interest = market.get('open_interest', 0) or 0
