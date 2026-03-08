@@ -2904,7 +2904,21 @@ class KalshiBattleBot:
                 for pos_id, pos in list(self._positions.items()):
                     market = self._markets.get(pos.get('market_id'))
                     if not market:
-                        continue
+                        # Position's market is not in the monitored dict (e.g. dropped from
+                        # _select_markets or bot just restarted).  Fetch it directly so the
+                        # stop-loss and profit-lock can still fire — never skip silently.
+                        try:
+                            raw = await self._kalshi.get_market(pos.get('market_id', ''))
+                            if raw and 'market' in raw:
+                                from services.kalshi_client import parse_kalshi_market
+                                market = parse_kalshi_market(raw['market'])
+                                # Cache it so the next loop cycle is free
+                                self._markets[pos['market_id']] = market
+                                print(f"[Monitor] Fetched untracked market for {pos_id[:8]}: {pos.get('question','')[:45]}")
+                        except Exception as _fetch_err:
+                            pass
+                        if not market:
+                            continue
                     
                     entry_price = pos['entry_price']
                     side = pos['side']
