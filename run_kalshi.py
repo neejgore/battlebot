@@ -92,9 +92,11 @@ class KalshiBattleBot:
         # Nightly strategy report — populated by _nightly_strategy_loop at midnight UTC
         self._last_nightly_report: dict = {}
         # Actual Kalshi values from API (synced every 5 min)
-        self._kalshi_cash = None       # Available cash
-        self._kalshi_portfolio = None  # Current positions value
-        self._kalshi_total = None      # Total portfolio value (market value: cash + positions at current prices)
+        # ALL three are set together in _sync_positions_with_kalshi so they stay consistent.
+        self._kalshi_cash = None            # Available cash (from balance.balance)
+        self._kalshi_positions_mv = None    # Market value of open positions (from balance.portfolio_value)
+        self._kalshi_portfolio = None       # Cost basis of open positions (sum of market_exposure) — for "capital at risk" display only
+        self._kalshi_total = None           # cash + positions_mv — single source of truth for ALL account value displays
         self._kalshi_positions_raw: list = []   # Raw positions from last sync (used by performance endpoint)
         self._settlements_cache: dict | None = None      # Cached settlements response
         self._settlements_cache_time: datetime | None = None  # When cache was populated
@@ -986,18 +988,17 @@ class KalshiBattleBot:
                         _exposure = abs(kp.get('market_exposure', 0)) / 100
                         _price = (_exposure / _contracts) if _contracts > 0 else 0.5
                     _market_value += _contracts * _price
-                # Prefer Kalshi's own portfolio_value (live market prices) over our
-                # cached-price estimate. Fall back to cached estimate only if the API
-                # field is missing (older API versions or zero positions).
-                if _kalshi_portfolio_value is not None:
-                    self._kalshi_total = self._kalshi_cash + _kalshi_portfolio_value
-                else:
-                    self._kalshi_total = self._kalshi_cash + _market_value
+                # Single source of truth for ALL dashboard value displays:
+                #   _kalshi_positions_mv  = what positions are worth RIGHT NOW
+                #   _kalshi_total         = cash + positions_mv  (every dashboard metric derives from this)
+                # Prefer Kalshi's own portfolio_value (live prices) over our cached estimate.
+                self._kalshi_positions_mv = _kalshi_portfolio_value if _kalshi_portfolio_value is not None else _market_value
+                self._kalshi_total = self._kalshi_cash + self._kalshi_positions_mv
                 _account_for_snapshot = self._kalshi_total
                 _pv_source = 'API' if _kalshi_portfolio_value is not None else 'cache'
                 print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, "
                       f"Positions(cost)=${self._kalshi_portfolio:.2f}, "
-                      f"Positions(mkt/{_pv_source})=${(_kalshi_portfolio_value or _market_value):.2f}, "
+                      f"Positions(mkt/{_pv_source})=${self._kalshi_positions_mv:.2f}, "
                       f"Total=${self._kalshi_total:.2f}")
                 await self._save_daily_snapshot(_account_for_snapshot, self._kalshi_cash, _market_value)
 
@@ -1355,27 +1356,13 @@ class KalshiBattleBot:
         # Compute positions value at CURRENT MARKET PRICES (not cost basis / market_exposure)
         # so that Total Value, Filled Positions, Account Value, and the chart all show
         # the same number: cash + what positions are actually worth right now.
-        if self._kalshi_cash is not None:
+        if self._kalshi_cash is not None and self._kalshi_total is not None:
             available = self._kalshi_cash
-            # Market-value of open positions using cached prices (same formula as _handle_performance)
-            _mv = 0.0
-            for kp in self._kalshi_positions_raw:
-                _kc = kp.get('position', 0)
-                if _kc == 0:
-                    continue
-                _kt = kp.get('ticker', '')
-                _ks = 'yes' if _kc > 0 else 'no'
-                _kc = abs(_kc)
-                _cached = self._markets.get(_kt, {})
-                _kp = _cached.get('yes_price' if _ks == 'yes' else 'no_price')
-                if _kp is None:
-                    # Fallback to cost basis per contract when no price cached yet
-                    _exp = abs(kp.get('market_exposure', 0)) / 100
-                    _kp = _exp / _kc if _kc > 0 else 0.5
-                _mv += _kc * _kp
-            positions_at_risk = round(_mv, 2)
+            # Use _kalshi_positions_mv (set by sync loop from Kalshi API) so that
+            # Total Value, Account Value, and the graph all derive from the same number.
+            positions_at_risk = round(self._kalshi_positions_mv or 0.0, 2)
             at_risk = positions_at_risk + pending_at_risk
-            total_value = round(self._kalshi_cash + _mv, 2)
+            total_value = round(self._kalshi_total, 2)
             return_pct_actual = ((total_value - self.initial_bankroll) / self.initial_bankroll) * 100 if self.initial_bankroll else 0.0
             using_kalshi = True
         else:
@@ -4601,9 +4588,9 @@ class KalshiBattleBot:
                     'unrealized_pnl': unrealized,
                 })
 
-            # 3. Canonical account value: always use _kalshi_total from the sync loop.
-            # This is the direct Kalshi API value (cash + market_exposure) refreshed every
-            # ~5 min and is immune to the cold-cache 0.50-default problem.
+            # 3. Canonical account value: cash + market value of positions (Kalshi API, ~5 min refresh).
+            # _kalshi_total = _kalshi_cash + _kalshi_positions_mv — the same value used by
+            # _get_stats() and the daily snapshot, so Total Value / Account Value / Graph all match.
             account_value = self._kalshi_total
             total_deposits = float(os.getenv('TOTAL_DEPOSITS', str(int(self.initial_bankroll))))
             total_return = account_value - total_deposits
@@ -4659,8 +4646,8 @@ class KalshiBattleBot:
                 # SINGLE SOURCE OF TRUTH: direct Kalshi API values from sync loop
                 'account': {
                     'cash': round(cash, 2),
-                    # Use _kalshi_portfolio (direct from sync) not cached-price sum
-                    'positions_value': round(self._kalshi_portfolio or total_position_value, 2),
+                    # Market value of positions (same source as total_value — cash + this = total_value)
+                    'positions_value': round(self._kalshi_positions_mv or total_position_value, 2),
                     'total_value': round(account_value, 2),
                     'total_deposits': total_deposits,
                 },
@@ -4967,8 +4954,8 @@ class KalshiBattleBot:
             best_pnl = max(pnls) if pnls else 0
             worst_pnl = min(pnls) if pnls else 0
             
-            total_deposits = float(os.getenv('TOTAL_DEPOSITS', '200'))
-            
+            total_deposits = float(os.getenv('TOTAL_DEPOSITS', str(int(self.initial_bankroll))))
+
             _response_data = {
                 'settlements': settlements,
                 'total_deposits': total_deposits,
