@@ -332,10 +332,20 @@ class CryptoEdgeService:
         range_low, range_high = bounds
 
         # 3. Fetch spot price and implied vol concurrently
-        spot_task = asyncio.create_task(self.get_spot_price(asset))
-        vol_task  = asyncio.create_task(self.get_implied_vol(asset))
-        spot = await spot_task
-        vol, vol_src = await vol_task
+        # asyncio.gather ensures both coroutines run in parallel and neither
+        # is orphaned if the other raises an exception.
+        spot, vol_result = await asyncio.gather(
+            self.get_spot_price(asset),
+            self.get_implied_vol(asset),
+            return_exceptions=True,
+        )
+        if isinstance(spot, BaseException):
+            logger.warning(f"[CryptoEdge] Spot price fetch raised: {spot}")
+            spot = None
+        if isinstance(vol_result, BaseException):
+            logger.warning(f"[CryptoEdge] Vol fetch raised: {vol_result}")
+            vol_result = (self._VOL_DEFAULTS.get(asset, 0.80), 'historical_default')
+        vol, vol_src = vol_result
 
         if spot is None:
             logger.warning(f"[CryptoEdge] Could not fetch {asset} spot price — skipping")

@@ -1105,7 +1105,7 @@ class KalshiBattleBot:
     def _log_filter(self, market_id: str, question: str, reason: str, price: float = 0.0) -> None:
         """Record a market that was filtered before reaching Claude analysis."""
         self._filter_log.append({
-            'ts': datetime.now(timezone.utc).isoformat(),
+            'ts': datetime.utcnow().isoformat(),
             'market_id': market_id,
             'question': question[:80],
             'reason': reason,
@@ -1125,7 +1125,7 @@ class KalshiBattleBot:
         internal_positions = sum(p['size'] for p in self._positions.values())
         
         # Use ACTUAL Kalshi values if available (these are ground truth)
-        if self._kalshi_total is not None and self._kalshi_portfolio is not None:
+        if self._kalshi_total is not None and self._kalshi_portfolio is not None and self._kalshi_cash is not None:
             # Kalshi API provides authoritative values
             available = self._kalshi_cash
             positions_at_risk = self._kalshi_portfolio  # Current value of filled positions
@@ -1776,7 +1776,7 @@ class KalshiBattleBot:
         # PRIORITIZE: Force-include top range series markets first (KXBTC-, KXETH-, KXNASDAQ100-
         # etc.) so they are never crowded out by high-OI macro markets.  Then fill remaining
         # slots with the best non-range short-term and ultra-short markets.
-        _RANGE_PREFIXES = ('KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-', 'KXSOL-', 'KXXRP-')
+        _RANGE_PREFIXES = ('KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXBCH-')
         _range_markets = [m for m in short_term + ultra_short
                           if any(m.get('id','').upper().startswith(p) for p in _RANGE_PREFIXES)]
         _range_markets = sorted(_range_markets, key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:10]
@@ -2012,8 +2012,10 @@ class KalshiBattleBot:
                         'chinese gdp', 'china gdp', 'eurozone gdp', 'uk gdp',
                         'german gdp', 'japan gdp', 'india gdp',
                         'gdp (yoy)', 'gdp growth', 'gdp reading',
-                        # Dogecoin — AI consistently low confidence, no edge
-                        'dogecoin price range', 'doge price range',
+                        # Dogecoin exact-price/sentiment — AI has no edge here
+                        # NOTE: 'doge price range' / 'dogecoin price range' are
+                        # intentionally EXCLUDED so KXDOGE- range-series markets
+                        # reach the quant gate in _analyze_market.
                         'doge trimmed mean', 'dogecoin trimmed mean',
                         'doge price', 'dogecoin price',
                         # Press secretary speech markets — priced efficiently, AI has no edge (<8%)
@@ -2041,7 +2043,15 @@ class KalshiBattleBot:
                         'solana price at ', 'sol price at ',
                         'xrp price at ', 'ripple price at ',
                     ]
-                    if any(p in question_lower for p in no_intel_patterns):
+                    # Known range-series markets (KXBTC-, KXDOGE-, etc.) bypass the
+                    # no_intel_patterns gate entirely — they go straight to the quant
+                    # gate in _analyze_market which is the real signal for them.
+                    _ticker_for_range_check = market_id.upper()
+                    _is_range_series_skip = any(
+                        _ticker_for_range_check.startswith(p)
+                        for p in ('KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-')
+                    )
+                    if not _is_range_series_skip and any(p in question_lower for p in no_intel_patterns):
                         self._log_filter(market_id, question_raw, 'NO_INTEL_PATTERN', market.get('price', 0))
                         continue  # Skip: no reliable news intelligence for this market
 
@@ -2381,11 +2391,22 @@ class KalshiBattleBot:
             if price_drift < 0.015 and cache_age < max_cache_age:
                 use_cache = True
 
+        signal = None  # ensure signal is always defined before use
         if use_cache:
             # Reconstruct a minimal signal result from cache — no API call needed
             from logic.ai_signal import AISignalOutput
+            _cached_raw_prob = cache_prob
+            # For range markets: re-apply quant blend using the fresh quant prob.
+            # The cache stores the previously blended value but spot/vol may have shifted
+            # since the last Claude call even if Kalshi price is stable.
+            if _quant_result and _quant_override_prob is not None:
+                _cached_raw_prob = 0.70 * _quant_override_prob + 0.30 * cache_prob
+                print(
+                    f"[QuantEdge] Cache re-blend: quant={_quant_override_prob:.1%} "
+                    f"cached_claude≈{cache_prob:.1%} → {_cached_raw_prob:.1%}"
+                )
             cached_signal = AISignalOutput(
-                raw_prob=cache_prob,
+                raw_prob=_cached_raw_prob,
                 confidence=cache_conf,
                 key_reasons=["(cached — price unchanged)"],
                 disconfirming_evidence=["(cached)"],
@@ -2466,10 +2487,13 @@ class KalshiBattleBot:
                 signal = result.signal
                 self._ai_successes += 1
 
-                # For crypto range markets: anchor Claude's raw_prob to quant model
-                # The quant probability is grounded in actual vol/spot data.
-                # We blend: 70% quant + 30% Claude to incorporate any news signal
-                # Claude picked up, while keeping the math-based estimate dominant.
+                # Capture Claude's raw probability BEFORE blending so calibration
+                # records the un-blended Claude estimate. This keeps the calibration
+                # feedback loop clean: it learns Claude's bias, not the quant blend.
+                _claude_raw_prob_for_calibration = signal.raw_prob
+
+                # For crypto range markets: anchor Claude's raw_prob to quant model.
+                # Blend: 70% quant (math-grounded) + 30% Claude (news signal).
                 if _quant_result and _quant_override_prob is not None:
                     blended_prob = 0.70 * _quant_override_prob + 0.30 * signal.raw_prob
                     print(
@@ -2488,14 +2512,15 @@ class KalshiBattleBot:
                         information_quality=signal.information_quality,
                     )
 
-                # Store in probability cache for reuse when price is stable
+                # Store blended prob in cache (for sizing/edge on next hit)
                 self._prob_cache[market_id] = (datetime.utcnow(), current_price, signal.raw_prob, signal.confidence)
-                # Record prediction for future calibration learning
+                # Record CLAUDE's raw prob (pre-blend) for calibration learning —
+                # the calibrator measures Claude's bias, not the quant formula's.
                 if self._calibration and self._db_connected:
                     try:
                         await self._calibration.record_prediction(
                             market_id=market_id,
-                            raw_prob=signal.raw_prob,
+                            raw_prob=_claude_raw_prob_for_calibration,
                             market_price=current_price,
                             category=market.get('category'),
                             calibrated_prob=None,  # filled in after calibration below
@@ -3027,7 +3052,7 @@ class KalshiBattleBot:
                                 self._markets[pos['market_id']] = market
                                 print(f"[Monitor] Fetched untracked market for {pos_id[:8]}: {pos.get('question','')[:45]}")
                         except Exception as _fetch_err:
-                            pass
+                            print(f"[Monitor] Failed to fetch market for {pos_id[:8]} ({pos.get('market_id','')[:25]}): {_fetch_err}")
                         if not market:
                             continue
                     
@@ -3169,11 +3194,13 @@ class KalshiBattleBot:
                     if position.get('pending_exit'):
                         return  # Silently skip - don't spam logs
 
-                    # TERMINAL positions (value < $0.50, price ≤ 2¢): skip the sell order.
-                    # A limit sell at 1¢ will never fill — no buyers for near-zero contracts.
-                    # Fall through to write-off logic below (removes from tracking, records loss).
+                    # TERMINAL positions (value < $0.50, price ≤ 5¢): skip the sell order.
+                    # The monitor fires TERMINAL_WRITEOFF at gain_pct <= -0.85 and value < $0.50.
+                    # Limit sells at 1-4¢ rarely fill on Kalshi — no buyers for near-zero contracts.
+                    # Using 5¢ here matches the monitor's $0.50 / typical-contract-count threshold
+                    # so positions exited via TERMINAL_WRITEOFF always skip the unfillable sell.
                     current_side_price = exit_price
-                    if current_side_price <= 0.02 and contracts * current_side_price < 0.50:
+                    if current_side_price <= 0.05 and contracts * current_side_price < 0.50:
                         print(f"[Write-Off] {pos_id[:8]} value ${contracts*current_side_price:.2f} — skipping unfillable sell, writing off")
                         # Skip the sell, fall through to position removal below
                         contracts = 0  # prevents the sell block from running
