@@ -83,6 +83,9 @@ class KalshiBattleBot:
         self._kalshi_cash = None       # Available cash
         self._kalshi_portfolio = None  # Current positions value
         self._kalshi_total = None      # Total portfolio value
+        self._kalshi_positions_raw: list = []   # Raw positions from last sync (used by performance endpoint)
+        self._settlements_cache: dict | None = None      # Cached settlements response
+        self._settlements_cache_time: datetime | None = None  # When cache was populated
         
         # All attributes that _load_state() will populate must be initialised BEFORE
         # _load_state() is called so that _save_state() never writes {} for them.
@@ -917,6 +920,9 @@ class KalshiBattleBot:
             # Step 2: Fetch open positions from Kalshi.
             result = await self._kalshi.get_positions()
             kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
+            # Cache for performance endpoint so it doesn't need its own live API calls.
+            if kalshi_positions:
+                self._kalshi_positions_raw = kalshi_positions
             
             # Step 3: Compute portfolio value from market_exposure (cost basis in cents).
             # Kalshi's balance API does NOT return portfolio_value — using positions data
@@ -4241,13 +4247,12 @@ class KalshiBattleBot:
         not from internal trade tracking which can be buggy.
         """
         try:
-            # 1. Get actual account balance from Kalshi (ground truth)
-            balance_result = await self._kalshi.get_balance()
-            cash = balance_result.get('balance', 0) / 100.0  # cents to dollars
-            
-            # 2. Get positions value from Kalshi
-            positions_result = await self._kalshi.get_positions()
-            kalshi_positions = positions_result.get('market_positions', [])
+            # 1. Use cached values from the sync loop — no live API calls needed here.
+            # The sync loop (_sync_positions_with_kalshi) refreshes these every ~5 min.
+            # Making fresh API calls on every 15-second dashboard poll was adding 1-2s
+            # of latency per load and burning Kalshi rate-limit budget unnecessarily.
+            cash = self._kalshi_cash if self._kalshi_cash is not None else 0.0
+            kalshi_positions = self._kalshi_positions_raw
             
             # Calculate position values
             total_position_cost = 0
@@ -4339,7 +4344,8 @@ class KalshiBattleBot:
                 
                 exposure_by_category[cat] = exposure_by_category.get(cat, 0) + cost
             
-            # 8. Save daily snapshot (and start-of-day value for today's P&L)
+            # 8. Save daily snapshot (intraday high/low tracking for the chart).
+            # Snapshot saving is lightweight (in-memory dict write + occasional file write).
             await self._save_daily_snapshot(account_value, cash, total_position_value)
             
             # 9. Today's P&L = current account value - start of day value (single source of truth)
@@ -4522,8 +4528,18 @@ class KalshiBattleBot:
         P&L Calculation:
         - WIN (our side == result): P&L = contracts * (1.0 - avg_entry_price)
         - LOSS (our side != result): P&L = contracts * (-avg_entry_price)
+        
+        Cached for 5 minutes — settlements don't change frequently and the
+        calculation requires 1 + N_settled_tickers API calls which is expensive.
         """
         try:
+            # Return cached result if fresh enough (5 minute TTL).
+            _SETTLEMENTS_TTL = 300
+            if (self._settlements_cache is not None
+                    and self._settlements_cache_time is not None
+                    and (datetime.utcnow() - self._settlements_cache_time).total_seconds() < _SETTLEMENTS_TTL):
+                return web.json_response(self._settlements_cache)
+
             # Get all fills from Kalshi (our trade history)
             result = await self._kalshi.get_fills(limit=500)
             fills = result.get('fills', [])
@@ -4658,7 +4674,7 @@ class KalshiBattleBot:
             
             total_deposits = float(os.getenv('TOTAL_DEPOSITS', '200'))
             
-            return web.json_response({
+            _response_data = {
                 'settlements': settlements,
                 'total_deposits': total_deposits,
                 'summary': {
@@ -4680,7 +4696,10 @@ class KalshiBattleBot:
                 },
                 'data_source': 'kalshi_fills_api',
                 'timestamp': datetime.utcnow().isoformat(),
-            })
+            }
+            self._settlements_cache = _response_data
+            self._settlements_cache_time = datetime.utcnow()
+            return web.json_response(_response_data)
             
         except Exception as e:
             import traceback
