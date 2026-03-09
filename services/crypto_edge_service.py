@@ -66,6 +66,7 @@ class CryptoEdgeService:
         'ETH':    0.90,
         'SOL':    1.20,
         'DOGE':   1.60,
+        'XRP':    1.10,   # similar volatility tier to SOL
     }
 
     def __init__(self) -> None:
@@ -255,7 +256,7 @@ class CryptoEdgeService:
         if up.startswith("KXDOGE") or "dogecoin" in ql or " doge " in ql:
             return "DOGE"
         if up.startswith("KXXRP") or "ripple" in ql or " xrp " in ql:
-            return "ETH"  # XRP: use ETH vol as proxy (similar risk profile)
+            return "XRP"  # uses XRPUSDT spot + realized vol (Deribit DVOL not available for XRP)
         return "BTC"  # safe default for unknown crypto range
 
     # ------------------------------------------------------------------
@@ -279,8 +280,9 @@ class CryptoEdgeService:
 
         Uses the Black-Scholes digital range formula:
             P = N(d_high) - N(d_low)
-        where d = [ln(K/S0) - (σ²/2)*T] / (σ*√T)
+        where d = [ln(K/S0) + (σ²/2)*T] / (σ*√T)
         and N is the standard normal CDF.
+        (The +σ²/2 comes from subtracting the negative Itô drift: μ = -σ²/2)
         """
         if hours_to_expiry <= 0 or vol <= 0 or spot <= 0 or low >= high:
             return 0.5

@@ -1394,6 +1394,7 @@ class KalshiBattleBot:
         """Clean shutdown."""
         self._running = False
         self._save_state()
+        await self._crypto_edge.close()
         if self._db_connected:
             await self._db.close()
         if self._runner:
@@ -2375,7 +2376,7 @@ class KalshiBattleBot:
             cache_time, cache_price, cache_prob, cache_conf = cached
             price_drift = abs(current_price - cache_price)
             cache_age = (datetime.utcnow() - cache_time).total_seconds()
-            hours_to_res = market.get('hours_to_resolution', 9999)
+            hours_to_res = market.get('hours_to_resolution') or 9999
             max_cache_age = 300 if hours_to_res <= 24 else 3600  # 5 min for ultra-short, 1 hr otherwise
             if price_drift < 0.015 and cache_age < max_cache_age:
                 use_cache = True
