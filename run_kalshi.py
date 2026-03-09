@@ -4505,60 +4505,64 @@ class KalshiBattleBot:
     async def _handle_performance(self, request):
         """API endpoint for real performance data from Kalshi.
         
-        This calculates performance directly from Kalshi API data,
-        not from internal trade tracking which can be buggy.
+        Uses _kalshi_total (cash + market_exposure from sync loop) as the
+        canonical account value. This avoids the 0.50-default price bug where
+        a cold _markets cache would stamp a wrong start_of_day_value and corrupt
+        all of today's P&L, Today's Peak, and chart data for the entire day.
         """
         try:
-            # 1. Use cached values from the sync loop — no live API calls needed here.
-            # The sync loop (_sync_positions_with_kalshi) refreshes these every ~5 min.
-            # Making fresh API calls on every 15-second dashboard poll was adding 1-2s
-            # of latency per load and burning Kalshi rate-limit budget unnecessarily.
-            if self._kalshi_cash is None:
-                # Sync hasn't completed yet (bot just started). Return a loading sentinel
-                # so the dashboard shows '--' rather than '-$200 / -100%'.
+            # 1. Require both cash and total to be synced.
+            if self._kalshi_cash is None or self._kalshi_total is None:
                 return web.json_response({'error': 'syncing', 'message': 'Waiting for initial Kalshi sync...'})
+
             cash = self._kalshi_cash
             kalshi_positions = self._kalshi_positions_raw
-            
-            # Calculate position values
+
+            # 2. Per-position detail (for breakdown table and unrealized P&L column).
+            # Uses cached prices with market_exposure/contracts as fallback — no 0.50 guesses.
             total_position_cost = 0
             total_position_value = 0
             positions_detail = []
-            
+
             for pos in kalshi_positions:
                 contracts = pos.get('position', 0)
                 if contracts == 0:
                     continue
-                    
+
                 ticker = pos.get('ticker', '')
                 side = 'yes' if contracts > 0 else 'no'
                 contracts = abs(contracts)
-                
-                # Use in-memory price cache (updated every 30s by _price_refresh_loop).
-                # Avoids firing 1 API call per position on every dashboard load, which
-                # trips Kalshi's 429 rate limit when combined with the refresh loop.
-                # Cache is at most ~60s stale — acceptable for display purposes.
+
                 cached_market = self._markets.get(ticker, {})
-                yes_price = cached_market.get('yes_price', 0.50)
-                no_price = cached_market.get('no_price', 1 - yes_price)
+                yes_price = cached_market.get('yes_price')
+                no_price = cached_market.get('no_price')
+
+                # Fallback: derive price from Kalshi's market_exposure (≈ current market value)
+                # Never default to 0.50 — that corrupts account_value when cache is cold.
+                if yes_price is None:
+                    _exp = abs(pos.get('market_exposure', 0)) / 100
+                    yes_price = (_exp / contracts) if side == 'yes' and contracts > 0 else (1 - _exp / contracts if contracts > 0 else 0.5)
+                if no_price is None:
+                    no_price = 1 - yes_price
+
                 current_price = yes_price if side == 'yes' else no_price
                 question = cached_market.get('question', ticker)[:50]
-                
-                # Get entry price from our internal position records
-                entry_price = 0.50  # default
+
+                # Entry price from internal records
+                entry_price = current_price  # default to current (zero unrealized) when unknown
                 for p in self._positions.values():
                     if p.get('market_id') == ticker:
-                        entry_price = p.get('entry_price', 0.50)
+                        entry_price = p.get('entry_price', current_price)
                         question = p.get('question', question)[:50]
                         break
-                
+
                 cost = contracts * entry_price
                 value = contracts * current_price
-                unrealized = value - cost  # same sign for both YES and NO: higher price = gain
-                
+                unrealized = value - cost
+
                 total_position_cost += cost
                 total_position_value += value
-                
+
                 positions_detail.append({
                     'ticker': ticker,
                     'question': question,
@@ -4569,36 +4573,33 @@ class KalshiBattleBot:
                     'cost': cost,
                     'unrealized_pnl': unrealized,
                 })
-            
-            # 3. Calculate account metrics.
-            total_deposits = float(os.getenv('TOTAL_DEPOSITS', '200'))  # User's total deposits
-            # Use cash (from fresh API call) + current position market value (from cached prices).
-            # Do NOT use self._kalshi_total from sync: that reflects cost-basis of positions,
-            # not current market value, and the dashboard should show what positions are worth NOW.
-            account_value = cash + total_position_value
+
+            # 3. Canonical account value: always use _kalshi_total from the sync loop.
+            # This is the direct Kalshi API value (cash + market_exposure) refreshed every
+            # ~5 min and is immune to the cold-cache 0.50-default problem.
+            account_value = self._kalshi_total
+            total_deposits = float(os.getenv('TOTAL_DEPOSITS', str(int(self.initial_bankroll))))
             total_return = account_value - total_deposits
             return_pct = (total_return / total_deposits * 100) if total_deposits > 0 else 0
-            
-            # 4. Calculate unrealized P&L
+
+            # 4. Unrealized P&L (per-position detail only — for breakdown table)
             unrealized_pnl = sum(p['unrealized_pnl'] for p in positions_detail)
-            
-            # 5. Count winning vs losing positions
+
+            # 5. Winning/losing position counts
             winning_positions = len([p for p in positions_detail if p['unrealized_pnl'] > 0])
             losing_positions = len([p for p in positions_detail if p['unrealized_pnl'] < 0])
-            
-            # 6. Get today's activity — include both filled (ENTRY) and pending (ORDER_PLACED)
+
+            # 6. Today's activity
             today_str = datetime.utcnow().strftime('%Y-%m-%d')
-            today_entries = [t for t in self._trades 
-                           if t.get('action') in ('ENTRY', 'ORDER_PLACED') and 
+            today_entries = [t for t in self._trades
+                           if t.get('action') in ('ENTRY', 'ORDER_PLACED') and
                            t.get('timestamp', '').startswith(today_str)]
-            
-            # 7. Calculate exposure breakdown
+
+            # 7. Exposure breakdown by category
             exposure_by_category = {}
             for p in positions_detail:
                 ticker = p['ticker']
                 cost = p['cost']
-                
-                # Categorize by ticker prefix
                 if 'SNOW' in ticker or 'RAIN' in ticker:
                     cat = 'Weather'
                 elif 'BTC' in ticker or 'ETH' in ticker or 'SOL' in ticker:
@@ -4607,15 +4608,14 @@ class KalshiBattleBot:
                     cat = 'Sports'
                 else:
                     cat = 'Other'
-                
                 exposure_by_category[cat] = exposure_by_category.get(cat, 0) + cost
-            
-            # 8. Save daily snapshot (intraday high/low tracking for the chart).
-            # Snapshot saving is lightweight (in-memory dict write + occasional file write).
-            await self._save_daily_snapshot(account_value, cash, total_position_value)
-            
-            # 9. Today's P&L = current account value - start of day value (single source of truth)
-            today_str = datetime.utcnow().strftime('%Y-%m-%d')
+
+            # 8. NOTE: _save_daily_snapshot is NOT called here.
+            # Snapshots are owned exclusively by _sync_positions_with_kalshi (every ~5 min)
+            # which uses the same _kalshi_total-based value. Calling it here with potentially
+            # cold-cache prices was corrupting start_of_day_value and today_pnl.
+
+            # 9. Today's P&L from snapshot (set by sync loop)
             today_snapshot = self._daily_snapshots.get(today_str, {})
             start_of_day_value = today_snapshot.get('start_of_day_value')
             if start_of_day_value is not None:
@@ -4624,15 +4624,16 @@ class KalshiBattleBot:
             else:
                 today_pnl = None
                 today_pnl_pct = None
-            
-            # 10. Portfolio history: daily (14 days) + today's hourly for chart
+
+            # 10. Portfolio history
             history_daily, history_today_hourly = self._get_performance_history()
             
             return web.json_response({
-                # SINGLE SOURCE OF TRUTH: Kalshi account value only
+                # SINGLE SOURCE OF TRUTH: direct Kalshi API values from sync loop
                 'account': {
                     'cash': round(cash, 2),
-                    'positions_value': round(total_position_value, 2),
+                    # Use _kalshi_portfolio (direct from sync) not cached-price sum
+                    'positions_value': round(self._kalshi_portfolio or total_position_value, 2),
                     'total_value': round(account_value, 2),
                     'total_deposits': total_deposits,
                 },
