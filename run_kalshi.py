@@ -1337,14 +1337,32 @@ class KalshiBattleBot:
         # Internal calculation for reference
         internal_positions = sum(p['size'] for p in self._positions.values())
         
-        # Use ACTUAL Kalshi values if available (these are ground truth)
-        if self._kalshi_total is not None and self._kalshi_portfolio is not None and self._kalshi_cash is not None:
-            # Kalshi API provides authoritative values
+        # Use ACTUAL Kalshi values if available (these are ground truth).
+        # Compute positions value at CURRENT MARKET PRICES (not cost basis / market_exposure)
+        # so that Total Value, Filled Positions, Account Value, and the chart all show
+        # the same number: cash + what positions are actually worth right now.
+        if self._kalshi_cash is not None:
             available = self._kalshi_cash
-            positions_at_risk = self._kalshi_portfolio  # Current value of filled positions
-            at_risk = positions_at_risk + pending_at_risk  # Total at risk
-            total_value = self._kalshi_total  # Cash + positions
-            return_pct_actual = ((self._kalshi_total - self.initial_bankroll) / self.initial_bankroll) * 100 if self.initial_bankroll else 0.0
+            # Market-value of open positions using cached prices (same formula as _handle_performance)
+            _mv = 0.0
+            for kp in self._kalshi_positions_raw:
+                _kc = kp.get('position', 0)
+                if _kc == 0:
+                    continue
+                _kt = kp.get('ticker', '')
+                _ks = 'yes' if _kc > 0 else 'no'
+                _kc = abs(_kc)
+                _cached = self._markets.get(_kt, {})
+                _kp = _cached.get('yes_price' if _ks == 'yes' else 'no_price')
+                if _kp is None:
+                    # Fallback to cost basis per contract when no price cached yet
+                    _exp = abs(kp.get('market_exposure', 0)) / 100
+                    _kp = _exp / _kc if _kc > 0 else 0.5
+                _mv += _kc * _kp
+            positions_at_risk = round(_mv, 2)
+            at_risk = positions_at_risk + pending_at_risk
+            total_value = round(self._kalshi_cash + _mv, 2)
+            return_pct_actual = ((total_value - self.initial_bankroll) / self.initial_bankroll) * 100 if self.initial_bankroll else 0.0
             using_kalshi = True
         else:
             # Kalshi hasn't synced yet (first startup, or transient API error).
@@ -1464,7 +1482,7 @@ class KalshiBattleBot:
             'unrealized_pnl': unrealized_pnl,
             'total_pnl': realized_pnl + unrealized_pnl,
             'return_pct': return_pct,
-            'kalshi_synced': self._kalshi_total is not None,  # Shows if using real Kalshi data
+            'kalshi_synced': self._kalshi_cash is not None,  # Shows if using real Kalshi data
             # Today's performance
             'today_pnl': today_pnl,
             'today_wins': today_wins,
