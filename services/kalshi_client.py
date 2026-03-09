@@ -35,6 +35,7 @@ class KalshiClient:
     # We stay well under with a 0.2s minimum gap between calls (5 req/s max).
     _MIN_CALL_INTERVAL = 0.2  # seconds between API calls
     _last_call_time: float = 0.0
+    _rate_lock: Optional[asyncio.Lock] = None  # Created lazily per event-loop
 
     def __init__(self, 
                  api_key_id: Optional[str] = None,
@@ -118,12 +119,21 @@ class KalshiClient:
         return base64.b64encode(signature).decode()
     
     async def _rate_limit(self):
-        """Enforce minimum gap between Kalshi API calls to avoid 429s."""
-        now = time.monotonic()
-        gap = now - KalshiClient._last_call_time
-        if gap < self._MIN_CALL_INTERVAL:
-            await asyncio.sleep(self._MIN_CALL_INTERVAL - gap)
-        KalshiClient._last_call_time = time.monotonic()
+        """Enforce minimum gap between Kalshi API calls to avoid 429s.
+
+        Uses a per-class asyncio.Lock to close the TOCTOU race where two
+        concurrent coroutines both read the same stale _last_call_time,
+        compute the same sleep duration, sleep in parallel, and then both
+        issue HTTP calls simultaneously — causing actual 429s.
+        """
+        if KalshiClient._rate_lock is None:
+            KalshiClient._rate_lock = asyncio.Lock()
+        async with KalshiClient._rate_lock:
+            now = time.monotonic()
+            gap = now - KalshiClient._last_call_time
+            if gap < self._MIN_CALL_INTERVAL:
+                await asyncio.sleep(self._MIN_CALL_INTERVAL - gap)
+            KalshiClient._last_call_time = time.monotonic()
 
     async def _get_with_retry(self, client: httpx.AsyncClient, url: str, **kwargs) -> httpx.Response:
         """GET with automatic retry on 429 (exponential backoff, max 3 attempts)."""
@@ -373,15 +383,21 @@ class KalshiClient:
             return response.json()
     
     async def get_positions(self) -> dict:
-        """Get current positions (requires auth)."""
+        """Get current positions (requires auth).
+
+        Passes limit=200 to cover up to 200 open positions in one call.
+        Kalshi's default page size is 50; without an explicit limit positions
+        beyond the first page are silently omitted, causing phantom-removal bugs.
+        """
         path = "/portfolio/positions"
         headers = self._get_auth_headers('GET', path)
         headers['Accept'] = 'application/json'
-        
+
         async with httpx.AsyncClient(timeout=30) as client:
             response = await self._get_with_retry(
                 client, f"{self.base_url}{path}",
-                headers=headers
+                headers=headers,
+                params={'limit': 200},
             )
             return response.json()
     

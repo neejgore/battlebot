@@ -523,18 +523,27 @@ class KalshiBattleBot:
                     # Kalshi fills API 'price' field is in DOLLARS (e.g., 0.18 = 18 cents)
                     price = fill.get('price', 0.50)
                     fill_side = fill.get('side', '')
-                    
+
                     if action == 'buy':
                         net_contracts += count
                         total_buy_contracts += count
                         total_cost += price * count
-                        side = fill_side
+                        if fill_side:  # Only update side if the field is present
+                            side = fill_side
                     elif action == 'sell':
                         net_contracts -= count
-                
-                # Skip if no net position (fully closed via sells)
-                if net_contracts <= 0:
+
+                # Skip if no net position (fully closed via normal sells or already-posted settlement fills).
+                # Use total_buy_contracts as fallback so markets that settled before this loop ran
+                # (where Kalshi has already posted the settlement sell fill) are still reconciled.
+                effective_contracts = net_contracts if net_contracts > 0 else (
+                    total_buy_contracts if total_buy_contracts > 0 else 0
+                )
+                if effective_contracts <= 0:
                     continue
+                # If net_contracts was <=0 but we have buys, use total_buy_contracts for P&L
+                if net_contracts <= 0:
+                    net_contracts = total_buy_contracts
                 
                 # avg_price is per-contract cost (use total buys, not net, to get true cost basis)
                 avg_price = total_cost / total_buy_contracts if total_buy_contracts > 0 else 0.5
@@ -556,7 +565,19 @@ class KalshiBattleBot:
                         continue
                     
                     # Market settled! Calculate P&L
-                    # Lowercase both sides — Kalshi may return 'Yes', 'YES', or 'yes'
+                    # Lowercase both sides — Kalshi may return 'Yes', 'YES', or 'yes'.
+                    # If the fill API did not return a 'side' field, fall back to the
+                    # ENTRY record in self._trades (or the open position if still tracked).
+                    if not side:
+                        _entry = entry_by_ticker.get(ticker, {})
+                        side = _entry.get('side', '')
+                        if not side:
+                            _pos_match = next(
+                                (p for p in self._positions.values()
+                                 if p.get('market_id') == ticker), None
+                            )
+                            if _pos_match:
+                                side = _pos_match.get('side', '')
                     our_side = (side or '').lower()
                     if our_side == (result or '').lower():
                         exit_price = 1.0
@@ -791,7 +812,13 @@ class KalshiBattleBot:
                 # organic _save_state() call doesn't restore a stale kill-switch from
                 # yesterday's date into today's session.
                 self._save_state()
-                await self._run_nightly_report()
+                # Run the nightly report in its own try/except so a report failure
+                # does not count as a full-loop error and defer the next midnight
+                # sleep by 23 hours (which would skip tomorrow's daily reset).
+                try:
+                    await self._run_nightly_report()
+                except Exception as _rpt_err:
+                    print(f"[Nightly] Report failed (non-fatal): {_rpt_err}")
             except Exception as e:
                 print(f"[NightlyLoop Error] {e}")
                 await asyncio.sleep(3600)  # retry in 1h on error
@@ -1180,7 +1207,7 @@ class KalshiBattleBot:
             positions_at_risk = self._kalshi_portfolio  # Current value of filled positions
             at_risk = positions_at_risk + pending_at_risk  # Total at risk
             total_value = self._kalshi_total  # Cash + positions
-            return_pct_actual = ((self._kalshi_total - self.initial_bankroll) / self.initial_bankroll) * 100
+            return_pct_actual = ((self._kalshi_total - self.initial_bankroll) / self.initial_bankroll) * 100 if self.initial_bankroll else 0.0
             using_kalshi = True
         else:
             # Fallback to internal calculations (less accurate)
@@ -1267,7 +1294,7 @@ class KalshiBattleBot:
         if return_pct_actual is not None:
             return_pct = return_pct_actual
         else:
-            return_pct = ((total_value - self.initial_bankroll) / self.initial_bankroll) * 100
+            return_pct = ((total_value - self.initial_bankroll) / self.initial_bankroll) * 100 if self.initial_bankroll else 0.0
 
         runtime = "0h 0m 0s"
         if self._start_time:
@@ -1329,7 +1356,7 @@ class KalshiBattleBot:
             'profit_lock_pct': float(os.getenv('PROFIT_LOCK_PCT', '0.50')),
             'kill_switch': self._risk_engine.daily_stats.kill_switch_triggered,
             'daily_drawdown': self._risk_engine.daily_stats.current_drawdown_pct,
-            'exposure_ratio': at_risk / self.initial_bankroll,
+            'exposure_ratio': (at_risk / self.initial_bankroll) if self.initial_bankroll else 0.0,
             'trading_allowed': self._risk_engine.is_trading_allowed,
             # Intelligence features
             'use_intelligence': self._use_intelligence,
@@ -1503,7 +1530,8 @@ class KalshiBattleBot:
                         
                 except Exception as e:
                     if '429' in str(e):
-                        print(f"[Rate Limited] Pausing for 3 seconds...")
+                        pages_fetched += 1  # Count against safety limit to prevent livelock
+                        print(f"[Rate Limited] Pausing for 3 seconds (attempt {pages_fetched})...")
                         await asyncio.sleep(3)
                         continue
                     print(f"[Fetch error] {e}")
@@ -3828,7 +3856,10 @@ class KalshiBattleBot:
                     fill_count = filled.get('fill_count', order['contracts'])
                     total_contracts = order.get('contracts', 1) or 1
                     fill_ratio = min(1.0, fill_count / total_contracts) if total_contracts else 1.0
-                    actual_size = order['size'] * fill_ratio
+                    # Use actual fill price × contracts for accurate cost basis.
+                    # order['size'] uses the midpoint price at analysis time (pre-slippage)
+                    # and would understate exposure by up to 15% with configured slippage.
+                    actual_size = fill_count * fill_price
                     
                     pos = {
                         'id': pos_id,
@@ -4543,23 +4574,23 @@ class KalshiBattleBot:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         self._websockets.add(ws)
-        
-        # Send initial state
-        await ws.send_str(json.dumps({
-            'type': 'init',
-            'stats': self._get_stats(),
-            'positions': list(self._positions.values()),
-            'trades': self._trades[:50],
-            'analyses': self._analyses[:20],
-            'monitored': list(self._monitored.values()),
-        }))
-        
         try:
+            # Send initial state — inside try so disconnect during send still
+            # triggers the finally cleanup and removes ws from the set.
+            await ws.send_str(json.dumps({
+                'type': 'init',
+                'stats': self._get_stats(),
+                'positions': list(self._positions.values()),
+                'trades': self._trades[:50],
+                'analyses': self._analyses[:20],
+                'monitored': list(self._monitored.values()),
+            }))
             async for msg in ws:
                 pass
+        except Exception:
+            pass
         finally:
             self._websockets.discard(ws)
-        
         return ws
 
 
