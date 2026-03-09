@@ -47,8 +47,8 @@ class KalshiBattleBot:
         # Config from env - STRICT defaults for profitability
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
-        self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.08)))  # 8% edge floor — measured at fill price (see _analyze_market)
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.65))  # 65% confidence
+        self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.12)))  # 12% edge floor — data shows 8-11% range is net-negative
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.80))  # 80% confidence — historical: 0.65-0.79 range loses money, only >=0.80 is profitable
         # max_position_size scales with bankroll: default 15% of INITIAL_BANKROLL.
         # At $1000 bankroll this is $150/bet; set MAX_POSITION_SIZE env var to override.
         _default_max_pos = float(os.getenv('INITIAL_BANKROLL', 100)) * 0.15
@@ -3009,6 +3009,22 @@ class KalshiBattleBot:
         if signal.confidence < self.min_confidence:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
+
+        # Require meaningful intelligence for non-crypto-range markets.
+        # Crypto range markets use the quant model (vol/spot math) as their signal — they
+        # intentionally skip the Brave news fetch for efficiency, so has_intel=False is
+        # expected and correct for them. For every other market (political, economic, etc.)
+        # there is no quant model — Claude is flying blind without news. Historical data:
+        # no-intel non-range trades = 50% WR, -$27.34 net across 30 trades.
+        if not _is_crypto_range_q:
+            _has_intel_flag = analysis_record.get('has_intel', False)
+            _news_ct = analysis_record.get('news_count', 0)
+            if not _has_intel_flag:
+                should_trade = False
+                reasons.append('NO_INTEL_NON_RANGE')
+            elif _news_ct < 2:
+                should_trade = False
+                reasons.append(f'WEAK_INTEL_{_news_ct}_articles')
 
         _held_market_ids = {p.get('market_id') for p in self._positions.values()}
         _pending_market_ids = {o.get('market_id') for o in self._pending_orders.values()}
