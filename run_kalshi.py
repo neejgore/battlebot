@@ -787,6 +787,10 @@ class KalshiBattleBot:
                 # the report sees a clean slate for the new day.
                 await self._risk_engine.reset_daily_stats()
                 print("[Nightly] Daily risk stats reset for new day")
+                # Persist the reset immediately so a crash between now and the next
+                # organic _save_state() call doesn't restore a stale kill-switch from
+                # yesterday's date into today's session.
+                self._save_state()
                 await self._run_nightly_report()
             except Exception as e:
                 print(f"[NightlyLoop Error] {e}")
@@ -841,11 +845,17 @@ class KalshiBattleBot:
             kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
             
             if not kalshi_positions:
-                print("[Sync] No positions found on Kalshi")
+                # An empty response means either we genuinely have no open positions,
+                # OR the API is returning a partial/bad response (token expiry, 200-with-null,
+                # pagination issue). Clearing local positions on a bad response would be
+                # catastrophic — we'd lose all tracking and charge phantom losses.
+                # Safe policy: if we have local positions, treat an empty Kalshi response
+                # as a data fetch failure and skip this sync cycle entirely.
                 if self._positions:
-                    print(f"[Sync] WARNING: Bot has {len(self._positions)} phantom positions - clearing them")
-                    self._positions.clear()
-                    self._save_state()
+                    print(f"[Sync] WARNING: Kalshi returned 0 positions but bot tracks "
+                          f"{len(self._positions)} — skipping sync (likely API glitch)")
+                    return
+                print("[Sync] No positions on Kalshi or in bot — nothing to reconcile")
                 return
             
             print(f"[Sync] Found {len(kalshi_positions)} positions on Kalshi")
@@ -866,28 +876,33 @@ class KalshiBattleBot:
                     exposure = kp.get('market_exposure', 0)
                     print(f"[Sync] Kalshi: {ticker[:30]}... | pos={pos} | exposure={exposure}¢")
             
-            # Check for phantom positions (in bot but not on Kalshi)
-            # Positions gone from Kalshi: remove only. Do NOT infer P&L or record EXIT.
-            # Settled P&L is only from Kalshi fills (Settlements tab). This avoids phantom losses.
+            # Check for phantom positions (in bot but not on Kalshi).
+            # Guard: if Kalshi returned fewer positions than we track locally, do NOT charge
+            # P&L — this almost certainly means a paginated/partial API response, not a
+            # genuine settlement. Charging losses on a partial response would falsely trigger
+            # the daily drawdown kill-switch. Only remove + charge when Kalshi plausibly
+            # returned a complete picture (at least as many positions as we know about).
+            _kalshi_count = len(kalshi_by_ticker)
+            _local_count = len(self._positions)
+            _safe_to_charge_pnl = _kalshi_count >= _local_count or _local_count == 0
             removed = 0
             for pos_id in list(self._positions.keys()):
                 pos = self._positions[pos_id]
                 market_id = pos.get('market_id', '')
                 if market_id not in kalshi_by_ticker:
-                    # Position no longer on Kalshi — either settled or filled via a cancel-race
-                    # in _check_pending_exits. Record the loss/gain properly so risk engine
-                    # and dashboard statistics are accurate, and block re-entry via _recently_exited.
                     entry_price = pos.get('entry_price', 0)
                     contracts = pos.get('contracts', 0)
-                    # Use 0 as exit price (worst case). Reconcile loop will correct it later.
                     pnl_estimate = -entry_price * contracts
-                    print(f"[Sync] Position no longer on Kalshi — recording estimated exit (${pnl_estimate:+.2f}): {pos.get('question', '')[:40]}...")
+                    print(f"[Sync] Position no longer on Kalshi — removing "
+                          f"(${pnl_estimate:+.2f} est, charge={_safe_to_charge_pnl}): "
+                          f"{pos.get('question', '')[:40]}...")
                     self._positions.pop(pos_id)
                     self._recently_exited[market_id] = datetime.utcnow()
                     self._recently_exited_reason[market_id] = 'SYNC_REMOVED'
-                    if contracts > 0 and not pos.get('pending_exit'):
-                        # Only charge P&L if this wasn't a pending normal sell
-                        # (those are handled by _check_pending_exits with real fill prices)
+                    if _safe_to_charge_pnl and contracts > 0 and not pos.get('pending_exit'):
+                        # Only charge P&L when we're confident the API response is complete
+                        # (guarded above) and this wasn't a pending sell (real P&L comes
+                        # from _check_pending_exits when the fill is confirmed).
                         await self._risk_engine.record_trade_result(pnl_estimate)
                     removed += 1
             if removed:
@@ -2594,6 +2609,12 @@ class KalshiBattleBot:
                     signal.confidence,
                     _claude_raw_prob_for_calibration,  # raw Claude prob (used for re-blending)
                 )
+                # Evict oldest entries to keep memory bounded.
+                # Each entry ≈200 bytes; 2000 entries ≈ 400KB maximum.
+                _PROB_CACHE_MAX = 2000
+                if len(self._prob_cache) > _PROB_CACHE_MAX:
+                    _oldest_key = min(self._prob_cache, key=lambda k: self._prob_cache[k][0])
+                    del self._prob_cache[_oldest_key]
                 # Record CLAUDE's raw prob (pre-blend) for calibration learning —
                 # the calibrator measures Claude's bias, not the quant formula's.
                 if self._calibration and self._db_connected:
