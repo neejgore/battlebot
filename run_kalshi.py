@@ -1553,6 +1553,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/api/debug-reconcile', self._handle_debug_reconcile)
         self._app.router.add_get('/api/filters', self._handle_filters)
         self._app.router.add_get('/api/nightly', self._handle_nightly)
+        self._app.router.add_get('/healthz', self._handle_healthz)
         
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
@@ -4434,6 +4435,10 @@ class KalshiBattleBot:
         """Serve the dashboard HTML."""
         return web.Response(text=DASHBOARD_HTML, content_type='text/html')
     
+    async def _handle_healthz(self, request):
+        """Railway health check — returns 200 as soon as the HTTP server is up."""
+        return web.Response(text='ok', content_type='text/plain')
+
     async def _handle_state(self, request):
         """API endpoint for current state."""
         return web.json_response({
