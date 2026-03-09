@@ -49,13 +49,13 @@ class KalshiBattleBot:
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
         self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.08)))  # 8% edge floor — measured at fill price (see _analyze_market)
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.65))  # 65% confidence
-        # max_position_size scales with bankroll: default 10% of INITIAL_BANKROLL.
-        # At $1000 bankroll this is $100/bet; set MAX_POSITION_SIZE env var to override.
-        _default_max_pos = float(os.getenv('INITIAL_BANKROLL', 100)) * 0.10
+        # max_position_size scales with bankroll: default 15% of INITIAL_BANKROLL.
+        # At $1000 bankroll this is $150/bet; set MAX_POSITION_SIZE env var to override.
+        _default_max_pos = float(os.getenv('INITIAL_BANKROLL', 100)) * 0.15
         self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', _default_max_pos))
         self.max_days_to_resolution = float(os.getenv('MAX_DAYS_TO_RESOLUTION', 30))  # 30 days max — tighter than 45
         self.min_days_to_resolution = float(os.getenv('MIN_DAYS_TO_RESOLUTION', 0))  # No minimum — sports/weather filters handle bad short-horizon bets; BTC range needs access
-        self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.10))  # 10% Kelly — conservative sizing
+        self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.25))  # 25% (Quarter-Kelly) — standard conservative sizing
         self.max_oi_pct = float(os.getenv('MAX_OI_PCT', 0.10))  # Max 10% of open interest
         self.simulate_prices = os.getenv('SIMULATE_PRICES', 'false').lower() == 'true'
         
