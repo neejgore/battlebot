@@ -204,16 +204,26 @@ class CryptoEdgeService:
     # ------------------------------------------------------------------
 
     def parse_range_from_ticker(self, ticker: str) -> Optional[tuple[float, float]]:
-        """Extract (low, high) from Kalshi ticker like KXBTC-26MAR06-B95000T96000."""
+        """Extract (low, high) from Kalshi ticker like KXBTC-26MAR06-B95000T96000.
+
+        Handles both integer prices (BTC: B95000T96000) and decimal prices
+        (XRP: B2T2.50, ETH: B2100T2200).
+        """
         up = ticker.upper()
-        m = re.search(r"-B(\d+)T(\d+)", up)
+        m = re.search(r"-B([\d.]+)T([\d.]+)", up)
         if m:
-            return float(m.group(1)), float(m.group(2))
-        # Reverse order guard (shouldn't happen but be safe)
-        m = re.search(r"-T(\d+)B(\d+)", up)
+            lo, hi = float(m.group(1)), float(m.group(2))
+            if lo >= hi:  # degenerate parse (e.g. T missing decimal part)
+                return None
+            return lo, hi
+        # Reverse order guard
+        m = re.search(r"-T([\d.]+)B([\d.]+)", up)
         if m:
-            lo, hi = float(m.group(2)), float(m.group(1))
-            return (min(lo, hi), max(lo, hi))
+            a, b = float(m.group(1)), float(m.group(2))
+            lo, hi = min(a, b), max(a, b)
+            if lo >= hi:
+                return None
+            return lo, hi
         return None
 
     def parse_range_from_question(self, question: str) -> Optional[tuple[float, float]]:
@@ -282,7 +292,10 @@ class CryptoEdgeService:
         def d(K: float) -> float:
             return (math.log(K / spot) - drift) / sigma_sqrt_T
 
-        prob = self._ncdf(-d(high)) - self._ncdf(-d(low))
+        # P(low ≤ S_T ≤ high) = N(d(high)) - N(d(low))
+        # where d(K) = (ln(K/S_0) + σ²/2*T) / (σ√T) = standardised log-distance
+        # = P(S_T ≤ high) - P(S_T ≤ low)  [CDF evaluated at boundary strikes]
+        prob = self._ncdf(d(high)) - self._ncdf(d(low))
         return max(0.0, min(1.0, prob))
 
     # ------------------------------------------------------------------

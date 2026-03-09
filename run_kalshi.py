@@ -2285,39 +2285,10 @@ class KalshiBattleBot:
         print(f"[AI] Analyzing: {question}...")
         self._ai_calls += 1
         
-        # Step 1: Gather market intelligence (news, domain data, overreaction detection)
-        intel: MarketIntelligence = None
-        if self._use_intelligence:
-            try:
-                intel = await self._intelligence.gather_intelligence(
-                    market_id=market_id,
-                    market_question=market.get('question', ''),
-                    current_price=current_price,
-                    spread=market.get('spread', 0.02),
-                    volume=market.get('volume_24h', 0),
-                    open_interest=market.get('open_interest', 0),
-                    category=market.get('category'),
-                )
-                if intel.news_items:
-                    print(f"[Intel] Found {len(intel.news_items)} news items, inefficiency={intel.inefficiency_score:.2f}")
-                if intel.overreaction_detected:
-                    print(f"[Intel] OVERREACTION detected: {intel.overreaction_direction} {intel.overreaction_magnitude:.1%}")
-            except Exception as e:
-                print(f"[Intel] Failed to gather: {e}")
-                intel = None
-        
-        # Build overreaction info string for AI
-        overreaction_info = None
-        if intel and intel.overreaction_detected:
-            overreaction_info = (
-                f"ALERT: Market moved {intel.overreaction_magnitude:.1%} {intel.overreaction_direction} recently. "
-                f"Price change 24h: {intel.recent_price_change:+.1%}. "
-                f"This could be an overreaction - consider if the move is justified."
-            )
-        
-        # Step 2a: Quantitative edge check for crypto range markets
-        # For KXBTC-/KXETH- etc., compute log-normal probability from Deribit IV + Binance spot
-        # before spending a Claude API call. If quant model sees no edge, skip immediately.
+        # Step 1: Quant gate for crypto range markets — runs BEFORE intel gathering.
+        # Range markets (KXBTC-/KXETH-/etc.) are math problems, not news problems.
+        # The log-normal model using Deribit IV + Binance spot is the primary signal.
+        # If it sees no edge we skip early without spending any Brave/Claude API budget.
         _ticker_upper_q = market_id.upper()
         _RANGE_PREFIXES_Q = ('KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-')
         _is_crypto_range_q = any(_ticker_upper_q.startswith(p) for p in _RANGE_PREFIXES_Q)
@@ -2344,7 +2315,6 @@ class KalshiBattleBot:
                         f"edge={_quant_result.edge:+.1%} "
                         f"[{_quant_result.vol_source}]"
                     )
-                    # Gate: if quant model sees no edge, skip Claude call entirely
                     QUANT_MIN_EDGE = float(os.getenv('CRYPTO_QUANT_MIN_EDGE', str(self.min_edge)))
                     if _quant_result.edge < QUANT_MIN_EDGE:
                         reason = f"QUANT_NO_EDGE_{_quant_result.edge*100:+.0f}pct"
@@ -2354,11 +2324,45 @@ class KalshiBattleBot:
                             f"threshold {QUANT_MIN_EDGE:.1%}"
                         )
                         return
-                    # Pass quant probability to Claude as the ground-truth anchor
                     _quant_override_prob = _quant_result.quant_prob
+                else:
+                    # evaluate_range_market returned None (NASDAQ or unparseable) — fall through to normal flow
+                    pass
             except Exception as _qe:
                 print(f"[QuantEdge] Evaluation error (non-fatal): {_qe}")
                 _quant_result = None
+
+        # Step 2: Gather market intelligence (news, domain data, overreaction detection).
+        # Skipped for crypto range markets — news is irrelevant for price bucket predictions;
+        # the quant model already provides the information edge.
+        intel: MarketIntelligence = None
+        if self._use_intelligence and not _is_crypto_range_q:
+            try:
+                intel = await self._intelligence.gather_intelligence(
+                    market_id=market_id,
+                    market_question=market.get('question', ''),
+                    current_price=current_price,
+                    spread=market.get('spread', 0.02),
+                    volume=market.get('volume_24h', 0),
+                    open_interest=market.get('open_interest', 0),
+                    category=market.get('category'),
+                )
+                if intel.news_items:
+                    print(f"[Intel] Found {len(intel.news_items)} news items, inefficiency={intel.inefficiency_score:.2f}")
+                if intel.overreaction_detected:
+                    print(f"[Intel] OVERREACTION detected: {intel.overreaction_direction} {intel.overreaction_magnitude:.1%}")
+            except Exception as e:
+                print(f"[Intel] Failed to gather: {e}")
+                intel = None
+        
+        # Build overreaction info string for AI
+        overreaction_info = None
+        if intel and intel.overreaction_detected:
+            overreaction_info = (
+                f"ALERT: Market moved {intel.overreaction_magnitude:.1%} {intel.overreaction_direction} recently. "
+                f"Price change 24h: {intel.recent_price_change:+.1%}. "
+                f"This could be an overreaction - consider if the move is justified."
+            )
 
         # Step 2b: Get historical performance for learning
         historical = self._get_historical_performance()
