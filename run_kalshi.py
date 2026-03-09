@@ -229,6 +229,12 @@ class KalshiBattleBot:
                         except Exception:
                             pass
                     self._recently_exited_reason = state.get('recently_exited_reason', {})
+                    # Restore kill-switch state (same date-gate as primary path)
+                    _ks_date_bak = state.get('kill_switch_date', '')
+                    _today_bak = datetime.utcnow().strftime('%Y-%m-%d')
+                    if state.get('kill_switch_triggered') and _ks_date_bak == _today_bak:
+                        self._risk_engine.daily_stats.kill_switch_triggered = True
+                        print(f"[State] Kill-switch restored from backup (triggered today)")
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades from backup")
         except json.JSONDecodeError as e:
             print(f"[State] WARNING: Corrupted state file, starting fresh: {e}")
@@ -2156,15 +2162,22 @@ class KalshiBattleBot:
                     # PRE-FILTER: Skip Claude call if we know the market will be rejected anyway.
                     # These checks mirror _analyze_market but cost nothing vs an API call.
 
-                    # Already holding this market
-                    if market_id in [p.get('market_id') for p in self._positions.values()]:
+                    # Already holding this market (filled) or have a pending buy order for it
+                    _held_ids = {p.get('market_id') for p in self._positions.values()}
+                    _pending_ids = {o.get('market_id') for o in self._pending_orders.values()}
+                    if market_id in _held_ids or market_id in _pending_ids:
                         continue
 
                     # Recently exited — still in cooldown
                     recent_exit = self._recently_exited.get(market_id)
                     if recent_exit:
                         exit_reason_stored = self._recently_exited_reason.get(market_id, '')
-                        cooldown_hours = 6.0 if 'PROFIT_LOCK' in exit_reason_stored or 'NEAR_SETTLEMENT' in exit_reason_stored else 2.0
+                        if 'PROFIT_LOCK' in exit_reason_stored or 'NEAR_SETTLEMENT' in exit_reason_stored:
+                            cooldown_hours = 6.0
+                        elif 'TERMINAL_WRITEOFF' in exit_reason_stored:
+                            cooldown_hours = 24.0  # Dead markets must not be re-entered until settled
+                        else:
+                            cooldown_hours = 2.0
                         if (datetime.utcnow() - recent_exit).total_seconds() / 3600 < cooldown_hours:
                             continue
 
@@ -2712,18 +2725,26 @@ class KalshiBattleBot:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
 
-        if market_id in [p.get('market_id') for p in self._positions.values()]:
+        _held_market_ids = {p.get('market_id') for p in self._positions.values()}
+        _pending_market_ids = {o.get('market_id') for o in self._pending_orders.values()}
+        if market_id in _held_market_ids or market_id in _pending_market_ids:
             should_trade = False
             reasons.append('ALREADY_IN_POSITION')
         
         # Don't re-enter markets we recently exited
         # Cooldown varies by exit reason:
-        #  - PROFIT_LOCK exit: 6h cooldown (position won, don't re-buy same thing)
-        #  - Other exits: 2h cooldown (prevent chasing)
+        #  - PROFIT_LOCK / NEAR_SETTLEMENT: 6h (won, don't re-buy)
+        #  - TERMINAL_WRITEOFF: 24h (position is terminal/dead — stay away until resolution)
+        #  - Other exits: 2h (prevent chasing)
         recent_exit = self._recently_exited.get(market_id)
         if recent_exit:
             exit_reason_stored = self._recently_exited_reason.get(market_id, '')
-            cooldown_hours = 6.0 if 'PROFIT_LOCK' in exit_reason_stored or 'NEAR_SETTLEMENT' in exit_reason_stored else 2.0
+            if 'PROFIT_LOCK' in exit_reason_stored or 'NEAR_SETTLEMENT' in exit_reason_stored:
+                cooldown_hours = 6.0
+            elif 'TERMINAL_WRITEOFF' in exit_reason_stored:
+                cooldown_hours = 24.0
+            else:
+                cooldown_hours = 2.0
             hours_since_exit = (datetime.utcnow() - recent_exit).total_seconds() / 3600
             if hours_since_exit < cooldown_hours:
                 should_trade = False
@@ -3343,8 +3364,10 @@ class KalshiBattleBot:
                             # parse_kalshi_market does not return hours_to_resolution;
                             # overwriting wholesale would strip the value computed during
                             # market scanning and break Kelly horizon / cache TTL logic.
+                            # 'price' is the midpoint alias used by cache-bust and calibration anchor.
+                            # It must be refreshed here or the drift check always sees ≈0.
                             _price_fields = ('yes_price', 'no_price', 'last_price',
-                                             'volume', 'open_interest', 'liquidity')
+                                             'price', 'volume', 'open_interest', 'liquidity')
                             for _f in _price_fields:
                                 if _f in updated:
                                     self._markets.setdefault(market_id, {})
@@ -3446,8 +3469,27 @@ class KalshiBattleBot:
                     position.pop('pending_exit', None)
                     print(f"[EXIT CANCELED] Position {pos_id} still open - sell order was canceled")
                     self._save_state()
-                
-                # If still 'resting', do nothing - wait for fill
+
+                elif status in ('resting', 'open', ''):
+                    # Sell order still unfilled — enforce a 30-minute staleness timeout.
+                    # Without this, a resting exit order for an illiquid market would lock
+                    # the position forever (monitor sees pending_exit → returns, never retries).
+                    placed_time_str = pending_exit.get('placed_time', '')
+                    if placed_time_str:
+                        try:
+                            placed_dt = datetime.fromisoformat(placed_time_str)
+                            age_minutes = (datetime.utcnow() - placed_dt).total_seconds() / 60
+                            STALE_EXIT_MINUTES = 30
+                            if age_minutes > STALE_EXIT_MINUTES:
+                                print(f"[EXIT STALE] Order {exit_order_id} resting {age_minutes:.0f}m — cancelling and retrying")
+                                try:
+                                    await self._kalshi.cancel_order(exit_order_id)
+                                except Exception:
+                                    pass
+                                position.pop('pending_exit', None)
+                                self._save_state()
+                        except Exception:
+                            pass
                 
                 await asyncio.sleep(0.5)  # Rate limit
                 

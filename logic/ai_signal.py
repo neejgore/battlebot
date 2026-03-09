@@ -493,18 +493,28 @@ Respond with ONLY a valid JSON object. No other text."""
             ValidationError: If schema validation fails
         """
         # Try to extract JSON from response
-        # First, try the whole response
         text = response_text.strip()
-        
-        # Remove markdown code blocks if present
+
+        # Strip markdown code fences (```json ... ``` or ``` ... ```)
         if text.startswith("```"):
-            # Find the JSON content
             match = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
             if match:
                 text = match.group(1).strip()
-        
-        # Parse JSON
-        data = json.loads(text)
+            else:
+                # Truncated response: opening fence but no closing fence.
+                # Strip the opening fence line and attempt to parse the rest.
+                text = re.sub(r'^```(?:json)?\s*', '', text).strip()
+
+        # Fallback: if text still can't parse directly, try to extract the first
+        # {...} object from a prose-wrapped response (e.g. "Here is my analysis: {...}")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            obj_match = re.search(r'\{[\s\S]*\}', text)
+            if obj_match:
+                data = json.loads(obj_match.group(0))
+            else:
+                raise  # Re-raise original error if no JSON object found at all
         
         # Validate with Pydantic
         return AISignalOutput.model_validate(data)
