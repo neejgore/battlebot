@@ -953,7 +953,32 @@ class KalshiBattleBot:
                       f"Total=${self._kalshi_total:.2f}")
                 # Sync risk engine bankroll and save snapshot with real total.
                 self._risk_engine.sync_bankroll(self._kalshi_total)
-                await self._save_daily_snapshot(self._kalshi_total, self._kalshi_cash, self._kalshi_portfolio)
+
+                # For daily P&L tracking, compute market value (not cost basis) using the
+                # bot's price cache — the same formula used by _handle_performance. This
+                # ensures start_of_day_value and current account_value are always on the
+                # same footing, so "today's P&L" reflects real daily movement, not just
+                # unrealized entry gains.
+                _market_value = 0.0
+                for kp in kalshi_positions:
+                    _contracts = kp.get('position', 0)
+                    if _contracts == 0:
+                        continue
+                    _ticker = kp.get('ticker', '')
+                    _side = 'yes' if _contracts > 0 else 'no'
+                    _contracts = abs(_contracts)
+                    _cached = self._markets.get(_ticker, {})
+                    if _side == 'yes':
+                        _price = _cached.get('yes_price')
+                    else:
+                        _price = _cached.get('no_price')
+                    # Fallback: derive from market_exposure if no cached price yet
+                    if _price is None:
+                        _exposure = abs(kp.get('market_exposure', 0)) / 100
+                        _price = (_exposure / _contracts) if _contracts > 0 else 0.5
+                    _market_value += _contracts * _price
+                _account_for_snapshot = self._kalshi_cash + _market_value
+                await self._save_daily_snapshot(_account_for_snapshot, self._kalshi_cash, _market_value)
 
             if not kalshi_positions:
                 # An empty response means either we genuinely have no open positions,
