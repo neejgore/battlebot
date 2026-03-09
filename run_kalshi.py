@@ -3157,9 +3157,11 @@ class KalshiBattleBot:
         # Contract cap: floor at 200; effectively uncapped since Kelly dollar limit fires first.
         MAX_CONTRACTS_PER_ORDER = max(200, int(self.max_position_size / 0.10))
         MIN_PRICE_CENTS = 15   # Don't trade below 15¢ — cheap contracts have low win rate
-        # Cap at 80¢: contracts above 80¢ need >80% accuracy to profit even with small slippage.
-        # e.g., 80¢ YES + 2¢ slippage = 82¢ fill → win $0.18, lose $0.82 → need 82% accuracy.
-        MAX_PRICE_CENTS = 80
+        # Cap at 50¢: at 51% historical hit rate, break-even requires entry < 51¢.
+        # At 50¢: win=$0.50, lose=$0.50 → break-even at 50%. At 40¢: win=$0.60, lose=$0.40 → 
+        # break-even at 40% — the lower the entry price, the better the win/loss ratio.
+        # Raising this above 50¢ requires proportionally higher AI accuracy to stay profitable.
+        MAX_PRICE_CENTS = 50
         
         # Use the correct price for the side we're trading
         if side.upper() == 'YES':
