@@ -47,7 +47,7 @@ class KalshiBattleBot:
         # Config from env - STRICT defaults for profitability
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
-        self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.10)))  # 10% edge floor — measured at fill price (see _analyze_market)
+        self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.08)))  # 8% edge floor — measured at fill price (see _analyze_market)
         self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.65))  # 65% confidence
         # max_position_size scales with bankroll: default 10% of INITIAL_BANKROLL.
         # At $1000 bankroll this is $100/bet; set MAX_POSITION_SIZE env var to override.
@@ -2900,7 +2900,7 @@ class KalshiBattleBot:
         half_spread = spread / 2
 
         # Expected fill prices — ask + realistic slippage (must match _enter_position)
-        _slip = max(0.02, yes_price * 0.03)   # 3% or 2¢ min (matches order placement)
+        _slip = max(0.04, yes_price * 0.07)   # 7% or 4¢ min (matches order placement)
         yes_fill = min(0.98, yes_price + half_spread + _slip)
         no_fill  = min(0.98, no_price  + half_spread + _slip)
 
@@ -3195,12 +3195,12 @@ class KalshiBattleBot:
                     print(f"[Order] Size ${size:.2f} too small for 1 contract at {price_cents}¢")
                     return
 
-                # Slippage: 2¢ minimum or 3% of mid price — must match the fill-price
+                # Slippage: 4¢ minimum or 7% of mid price — must match the fill-price
                 # estimate used in the edge gate (_analyze_market step 4).
-                # Old 15% / 10¢ minimum was destroying edge: a 50¢ contract filled at
-                # 60¢, requiring 60%+ accuracy just to break even. At 3%, a 50¢ contract
-                # fills at ~52¢, requiring only 52%+ accuracy — leaving real profit margin.
-                slippage_cents = max(2, int(price_cents * 0.03))
+                # At 7%/4¢, a 50¢ contract orders at 54¢ (~3¢ above a typical 2¢-spread ask)
+                # which fills immediately. At 3% the order sat below the ask as a resting
+                # limit, waited 10 min, then cancelled — causing near-zero fill rate.
+                slippage_cents = max(4, int(price_cents * 0.07))
                 order_price_cents = min(price_cents + slippage_cents, 95)
 
                 # Recompute contracts at the actual order price (not midpoint) so the
