@@ -185,7 +185,7 @@ class KalshiBattleBot:
             
         try:
             if os.path.exists(self._state_file):
-                with open(self._state_file, 'r') as f:
+                with open(self._state_file, 'r', encoding='utf-8', errors='replace') as f:
                     state = json.load(f)
                     self._positions = state.get('positions', {})
                     self._pending_orders = state.get('pending_orders', {})
@@ -220,7 +220,7 @@ class KalshiBattleBot:
                             
             elif os.path.exists(self._state_file + '.backup'):
                 print(f"[State] Main file missing, loading from backup...")
-                with open(self._state_file + '.backup', 'r') as f:
+                with open(self._state_file + '.backup', 'r', encoding='utf-8', errors='replace') as f:
                     state = json.load(f)
                     self._positions = state.get('positions', {})
                     self._pending_orders = state.get('pending_orders', {})
@@ -308,9 +308,18 @@ class KalshiBattleBot:
                 status = order_data.get('status', '').lower()
                 
                 if status == 'executed':
-                    # Order filled while bot was down - create position
-                    fill_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
-                    fill_count = order_data.get('filled_count', order['contracts'])
+                    # Order filled while bot was down - create position.
+                    # Kalshi API may use 'fill_count' OR 'filled_count' depending on SDK version.
+                    # average_fill_price may not exist; derive from taker+maker cost if available.
+                    fill_count = (order_data.get('fill_count')
+                                  or order_data.get('filled_count')
+                                  or order['contracts'])
+                    _taker = order_data.get('taker_fill_cost', 0)
+                    _maker = order_data.get('maker_fill_cost', 0)
+                    if (_taker + _maker) > 0 and fill_count > 0:
+                        fill_price = (_taker + _maker) / fill_count / 100  # costs in cents
+                    else:
+                        fill_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
 
                     # Scale size to actual fill (partial fills cost less than planned)
                     total_contracts = order.get('contracts', 1) or 1
@@ -1552,6 +1561,13 @@ class KalshiBattleBot:
                     break
             
             print(f"[Fetch Complete] {len(all_markets)} markets from {pages_fetched} pages")
+            # If the fetch returned zero markets (e.g., 50 consecutive 429s burned the safety
+            # limit before any page was loaded), abort and keep the existing _markets intact.
+            # Wiping _markets here would leave the trading loop with nothing to analyze for
+            # up to 15 minutes and give no indication in the logs that something went wrong.
+            if not all_markets:
+                print(f"[Fetch] WARNING: 0 markets fetched — preserving existing {len(self._markets)} cached markets")
+                return
             
             # Deduplicate by ticker (pagination may have overlap)
             seen = set()
@@ -1871,7 +1887,10 @@ class KalshiBattleBot:
         # Cap per-series (top 2 buckets each) so one liquid series cannot crowd out others.
         # A flat [:10] cap could let KXBTC- fill every slot, blocking DOGE/SOL/XRP/BCH/NASDAQ.
         _range_by_series: dict[str, list] = {p: [] for p in _RANGE_PREFIXES}
-        for m in short_term + ultra_short:
+        # Include medium_term range markets too — monthly KXBTC-/KXETH-/etc. buckets
+        # would otherwise be excluded from the guaranteed priority slots and silently
+        # crowded out if 20+ high-OI non-range medium-term markets exist.
+        for m in short_term + ultra_short + medium_term:
             mid = m.get('id', '').upper()
             for p in _RANGE_PREFIXES:
                 if mid.startswith(p):
@@ -2470,10 +2489,14 @@ class KalshiBattleBot:
                 _quant_result = None
 
         # Step 2: Gather market intelligence (news, domain data, overreaction detection).
-        # Skipped for crypto range markets — news is irrelevant for price bucket predictions;
-        # the quant model already provides the information edge.
+        # Skipped for crypto range markets where quant succeeded — news is less
+        # informative than the vol model for BTC/ETH/DOGE/SOL/XRP/BCH bucket bets.
+        # BUT: for KXNASDAQ100- and any range market where quant returned None
+        # (no supported asset), we DO want intelligence — Claude is flying blind
+        # without it. The `_quant_result is None` fallback re-enables news gathering
+        # for any range series that lacks a quant model.
         intel: MarketIntelligence = None
-        if self._use_intelligence and not _is_crypto_range_q:
+        if self._use_intelligence and (not _is_crypto_range_q or _quant_result is None):
             try:
                 intel = await self._intelligence.gather_intelligence(
                     market_id=market_id,
@@ -2877,8 +2900,12 @@ class KalshiBattleBot:
         
         if should_trade:
             # Sync total + per-market exposure so both global and per-market limits fire.
-            real_exposure = sum(p.get('size', 0) for p in self._positions.values())
-            self._risk_engine.sync_open_exposure(real_exposure, position_count=len(self._positions))
+            # Include pending orders in both exposure and count so the max_positions
+            # check fires correctly before pending orders fill (not just after).
+            pending_exposure = sum(o.get('size', 0) for o in self._pending_orders.values())
+            real_exposure = sum(p.get('size', 0) for p in self._positions.values()) + pending_exposure
+            total_open_count = len(self._positions) + len(self._pending_orders)
+            self._risk_engine.sync_open_exposure(real_exposure, position_count=total_open_count)
 
             market_exposures: dict = {}
             for p in self._positions.values():
@@ -3461,8 +3488,13 @@ class KalshiBattleBot:
                                 if _f in updated:
                                     self._markets.setdefault(market_id, {})
                                     self._markets[market_id][_f] = updated[_f]
-                                    self._monitored.setdefault(market_id, {})
-                                    self._monitored[market_id][_f] = updated[_f]
+                                    # Only update _monitored if the market is ALREADY in it.
+                                    # Using setdefault here re-inserts markets that _select_markets
+                                    # intentionally removed (expired/finalized/de-prioritized),
+                                    # creating sparse dicts with missing metadata that confuse
+                                    # trading filters. Update in-place only.
+                                    if market_id in self._monitored:
+                                        self._monitored[market_id][_f] = updated[_f]
                             self._price_update_count += 1
                     except Exception as _pref:
                         print(f"[Price Refresh] {market_id[:25]}: {_pref}")
@@ -3493,8 +3525,18 @@ class KalshiBattleBot:
                 status = order_data.get('status', '').lower()
                 
                 if status == 'executed':
-                    # Sell order filled - finalize the exit
-                    fill_price = order_data.get('average_fill_price', pending_exit.get('exit_price', 0.5) * 100) / 100
+                    # Sell order filled - finalize the exit.
+                    # Derive fill price from taker+maker costs if available (most accurate),
+                    # then try average_fill_price (may not exist in Kalshi API v2),
+                    # then fall back to the limit price we placed the order at.
+                    _contracts = position.get('contracts', 1) or 1
+                    _taker = order_data.get('taker_fill_cost', 0)
+                    _maker = order_data.get('maker_fill_cost', 0)
+                    if (_taker + _maker) > 0:
+                        fill_price = (_taker + _maker) / _contracts / 100
+                    else:
+                        fill_price = order_data.get('average_fill_price',
+                                                    pending_exit.get('exit_price', 0.5) * 100) / 100
                     reason = pending_exit.get('reason', 'UNKNOWN')
                     
                     # Calculate final PnL using ACTUAL fill prices and contract count
@@ -3773,9 +3815,18 @@ class KalshiBattleBot:
                         status = order_data.get('status', '').lower()
                         
                         if status == 'executed':
-                            # Order fully filled
-                            fill_count = order_data.get('filled_count', order['contracts'])
-                            fill_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
+                            # Order fully filled.
+                            # Try both field names (SDK v1 uses 'filled_count', v2 uses 'fill_count').
+                            fill_count = (order_data.get('fill_count')
+                                          or order_data.get('filled_count')
+                                          or order['contracts'])
+                            _taker = order_data.get('taker_fill_cost', 0)
+                            _maker = order_data.get('maker_fill_cost', 0)
+                            if (_taker + _maker) > 0 and fill_count > 0:
+                                fill_price = (_taker + _maker) / fill_count / 100
+                            else:
+                                fill_price = order_data.get('average_fill_price',
+                                                            order['entry_price'] * 100) / 100
                             filled_orders.append({
                                 'order_id': order_id,
                                 'order': order,
@@ -3788,10 +3839,17 @@ class KalshiBattleBot:
                             # B49 fix: a cancel can arrive *after* a partial fill.
                             # Any contracts already filled are real capital deployed —
                             # track them as a position so they aren't orphaned.
-                            partial_count = order_data.get('filled_count', 0)
+                            partial_count = (order_data.get('fill_count')
+                                             or order_data.get('filled_count')
+                                             or 0)
                             if partial_count and partial_count > 0:
-                                partial_price = order_data.get('average_fill_price',
-                                                               order['entry_price'] * 100) / 100
+                                _taker = order_data.get('taker_fill_cost', 0)
+                                _maker = order_data.get('maker_fill_cost', 0)
+                                if (_taker + _maker) > 0 and partial_count > 0:
+                                    partial_price = (_taker + _maker) / partial_count / 100
+                                else:
+                                    partial_price = order_data.get('average_fill_price',
+                                                                   order['entry_price'] * 100) / 100
                                 filled_orders.append({
                                     'order_id': order_id,
                                     'order': order,
@@ -3828,9 +3886,16 @@ class KalshiBattleBot:
                                             # that was partially filled before we cancelled it needs
                                             # a position created for the already-filled contracts,
                                             # just like the API-reported-cancel path at line ~3773.
-                                            stale_partial = order_data.get('filled_count', 0)
+                                            stale_partial = (order_data.get('fill_count')
+                                                             or order_data.get('filled_count')
+                                                             or 0)
                                             if stale_partial > 0:
-                                                stale_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
+                                                _st = order_data.get('taker_fill_cost', 0)
+                                                _sm = order_data.get('maker_fill_cost', 0)
+                                                if (_st + _sm) > 0:
+                                                    stale_price = (_st + _sm) / stale_partial / 100
+                                                else:
+                                                    stale_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
                                                 filled_orders.append({
                                                     'order_id': order_id,
                                                     'order': order,

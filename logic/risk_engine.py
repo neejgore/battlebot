@@ -236,6 +236,11 @@ class RiskEngine:
         if actual_total > 0:
             self.bankroll = actual_total
             self.daily_stats.current_bankroll = actual_total
+            # After syncing the real balance, check the kill-switch.
+            # Without this, losses that arrive via sync_bankroll (e.g., settled
+            # positions the bot never tracked via record_trade_result) are invisible
+            # to the kill-switch — the bot keeps trading through unlimited drawdown.
+            self.daily_stats.check_kill_switch()
             logger.debug(f"Bankroll synced from Kalshi: ${actual_total:.2f}")
 
     @property
@@ -346,9 +351,14 @@ class RiskEngine:
                 remaining_market_limit,
             )
             
-            # Calculate Kelly size with edge throttle
+            # Calculate Kelly size with edge throttle.
+            # Kelly fraction must be applied to TOTAL bankroll, not just available
+            # capital — otherwise every deployed dollar shrinks the sizing base,
+            # causing the 10th position to be sized at 1/10th of what the formula
+            # intends. The `effective_max` cap (which includes `available`) prevents
+            # the result from exceeding what the bot can actually deploy.
             size = calculate_kelly_size(
-                bankroll=available,
+                bankroll=self.bankroll,
                 true_prob=adjusted_prob,
                 market_price=market_price,
                 fractional_multiplier=self.fractional_kelly,
