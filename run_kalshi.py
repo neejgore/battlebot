@@ -153,6 +153,13 @@ class KalshiBattleBot:
         # Profit-lock threshold — read once from env, not per-position per-cycle
         self._profit_lock_pct: float = float(os.getenv('PROFIT_LOCK_PCT', '0.50'))
         
+        # Kill-switch fire date: set once (False→True transition), never overwritten.
+        # Persisted to state so a restart after midnight doesn't keep the switch active.
+        self._kill_switch_fire_date: str = ''
+
+        # 500ms order rate-limit gate (workspace rule: min 500ms between placements)
+        self._last_order_time: datetime = datetime.utcnow() - timedelta(seconds=1)
+
         # Price updates counter (incremented by WS ticker callback and REST refresh)
         self._price_update_count = 0
         
@@ -217,7 +224,14 @@ class KalshiBattleBot:
                     _today = datetime.utcnow().strftime('%Y-%m-%d')
                     if state.get('kill_switch_triggered') and _ks_date == _today:
                         self._risk_engine.daily_stats.kill_switch_triggered = True
+                        self._kill_switch_fire_date = _ks_date
                         print(f"[State] Kill switch restored from state (triggered today {_ks_date})")
+                    # Restore analysis cooldowns to prevent burst re-analysis on restart
+                    for k, v in state.get('last_analysis', {}).items():
+                        try:
+                            self._last_analysis[k] = datetime.fromisoformat(v)
+                        except Exception:
+                            pass
                     # Restore today's starting bankroll so kill-switch drawdown is measured
                     # from the correct baseline.  Without this, if the bankroll has grown
                     # (e.g. $100 → $120), starting_bankroll resets to the env-var $100 on
@@ -302,16 +316,12 @@ class KalshiBattleBot:
                 'recently_exited': recently_exited_serial,
                 'recently_exited_reason': self._recently_exited_reason,
                 'kill_switch_triggered': self._risk_engine.daily_stats.kill_switch_triggered,
-                # Only record the date at the moment the kill-switch fires (False→True).
-                # Writing today's date on EVERY save causes a UTC-midnight race: if the
-                # bot saves at 00:01 UTC with kill_switch_triggered=True from yesterday,
-                # the date becomes today, and the restore check ("_ks_date == _today")
-                # incorrectly keeps the kill-switch active into the new trading day.
-                'kill_switch_date': (
-                    datetime.utcnow().strftime('%Y-%m-%d')
-                    if self._risk_engine.daily_stats.kill_switch_triggered
-                    else ''
-                ),
+                # Persist the exact date the kill-switch fired (set once on False→True
+                # transition; never overwritten here).
+                'kill_switch_date': self._kill_switch_fire_date,
+                # Persist per-market analysis timestamps so cooldowns survive restarts
+                # and prevent burst re-analysis + potential duplicate orders on startup.
+                'last_analysis': {k: v.isoformat() for k, v in self._last_analysis.items()},
                 'saved_at': datetime.utcnow().isoformat(),
             }
             
@@ -951,9 +961,6 @@ class KalshiBattleBot:
                 print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, "
                       f"Positions(cost)=${self._kalshi_portfolio:.2f}, "
                       f"Total=${self._kalshi_total:.2f}")
-                # Sync risk engine bankroll and save snapshot with real total.
-                self._risk_engine.sync_bankroll(self._kalshi_total)
-
                 # For daily P&L tracking, compute market value (not cost basis) using the
                 # bot's price cache — the same formula used by _handle_performance. This
                 # ensures start_of_day_value and current account_value are always on the
@@ -979,6 +986,17 @@ class KalshiBattleBot:
                     _market_value += _contracts * _price
                 _account_for_snapshot = self._kalshi_cash + _market_value
                 await self._save_daily_snapshot(_account_for_snapshot, self._kalshi_cash, _market_value)
+
+                # Sync the risk engine with current market value (not cost basis) so the
+                # kill-switch sees real unrealized losses, not just settled cash changes.
+                _ks_was_triggered = self._risk_engine.daily_stats.kill_switch_triggered
+                self._risk_engine.sync_bankroll(_account_for_snapshot)
+                # Stamp kill-switch fire date exactly once on False→True transition.
+                if (not _ks_was_triggered
+                        and self._risk_engine.daily_stats.kill_switch_triggered
+                        and not self._kill_switch_fire_date):
+                    self._kill_switch_fire_date = datetime.utcnow().strftime('%Y-%m-%d')
+                    print(f"[KILL SWITCH] Triggered — fire date stamped: {self._kill_switch_fire_date}")
 
             if not kalshi_positions:
                 # An empty response means either we genuinely have no open positions,
@@ -1493,6 +1511,15 @@ class KalshiBattleBot:
     
     async def start(self):
         """Start the Kalshi bot and dashboard."""
+        # Fail fast if API credentials are missing in LIVE mode — without them every
+        # Kalshi API call silently returns 401 and the bot runs indefinitely doing nothing.
+        if not self.dry_run:
+            if not self._kalshi.api_key_id or not self._kalshi._private_key:
+                raise ValueError(
+                    "LIVE mode requires KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY "
+                    "(or KALSHI_PRIVATE_KEY_PATH) to be set. Bot cannot start."
+                )
+
         # Setup web app
         self._app = web.Application()
         self._app.router.add_get('/', self._handle_index)
@@ -3132,9 +3159,10 @@ class KalshiBattleBot:
             print(f"[Order] Capping contracts: {contracts} → {MAX_CONTRACTS_PER_ORDER} (max per order)")
             contracts = MAX_CONTRACTS_PER_ORDER
         
-        # Recalculate actual size based on capped contracts
+        # actual_size and contracts are recalculated at order price inside the live block below.
+        # These midpoint-based values are only used as the dry-run fallback.
         actual_size = contracts * entry_price
-        
+
         # In LIVE mode, actually place the order on Kalshi
         order_id = None
         if not self.dry_run:
@@ -3142,14 +3170,30 @@ class KalshiBattleBot:
                 if contracts < 1:
                     print(f"[Order] Size ${size:.2f} too small for 1 contract at {price_cents}¢")
                     return
-                
+
                 # Use AGGRESSIVE slippage to ensure orders fill quickly
                 # Slippage: 10¢ or 15%, whichever is larger - this ensures fills
                 slippage_cents = max(10, int(price_cents * 0.15))
                 order_price_cents = min(price_cents + slippage_cents, 95)
-                
+
+                # Recompute contracts at the actual order price (not midpoint) so the
+                # Kelly dollar budget is not exceeded by the slippage premium.
+                order_price = order_price_cents / 100
+                contracts = int(size / order_price) if order_price > 0 else 0
+                if contracts > MAX_CONTRACTS_PER_ORDER:
+                    contracts = MAX_CONTRACTS_PER_ORDER
+                actual_size = contracts * order_price
+                if contracts < 1:
+                    print(f"[Order] Size ${size:.2f} too small for 1 contract at {order_price_cents}¢")
+                    return
+
                 print(f"[Order] Placing: {contracts} {side} @ {order_price_cents}¢ (market: {price_cents}¢, slippage: {slippage_cents}¢)")
-                
+
+                # Enforce 500ms minimum between order placements (workspace rule)
+                _elapsed = (datetime.utcnow() - self._last_order_time).total_seconds()
+                if _elapsed < 0.5:
+                    await asyncio.sleep(0.5 - _elapsed)
+
                 result = await self._kalshi.place_order(
                     ticker=market_id,
                     side=side.lower(),  # 'yes' or 'no'
@@ -3158,6 +3202,7 @@ class KalshiBattleBot:
                     order_type='limit',
                 )
                 order_id = result.get('order', {}).get('order_id')
+                self._last_order_time = datetime.utcnow()
                 if not order_id:
                     print(f"[Order Error] Kalshi returned no order_id — aborting")
                     return  # Can't track an order with no ID
@@ -3492,6 +3537,17 @@ class KalshiBattleBot:
         position = self._positions.get(pos_id)
         if not position:
             return
+
+        # Respect retry cooldown set after a failed sell attempt (prevents rapid storm during
+        # API outages where the monitor re-fires every 10s on the same position).
+        _retry_after = position.get('exit_retry_after')
+        if _retry_after:
+            try:
+                if datetime.utcnow().isoformat() < _retry_after:
+                    return
+            except Exception:
+                pass
+            position.pop('exit_retry_after', None)
         
         # In LIVE mode, actually sell the position on Kalshi
         if not self.dry_run:
@@ -3545,7 +3601,9 @@ class KalshiBattleBot:
                     
             except Exception as e:
                 print(f"[Order Error] Failed to place sell order on Kalshi: {e}")
-                return  # Keep position, don't exit
+                # Set a 5-min cooldown to prevent rapid retry storms during API outages
+                position['exit_retry_after'] = (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+                return  # Keep position, retry after cooldown
         
         # For dry run mode, or after sell is confirmed (called from sync loop)
         self._positions.pop(pos_id, None)
@@ -3863,13 +3921,22 @@ class KalshiBattleBot:
                                     )
                                     if _stale_partial and _stale_partial > 0:
                                         _remaining = position.get('contracts', 0) - _stale_partial
+                                        _entry_price = position.get('entry_price', 0.5)
+                                        _exit_px = pending_exit.get('exit_price', 0.5)
+                                        _partial_pnl = _stale_partial * (_exit_px - _entry_price)
                                         if _remaining > 0:
                                             position['contracts'] = _remaining
-                                            print(f"[EXIT STALE] Partial fill detected: "
-                                                  f"{_stale_partial} sold, {_remaining} remain")
+                                            position['size'] = _remaining * _entry_price
+                                            print(f"[EXIT STALE] Partial fill: "
+                                                  f"{_stale_partial} sold @ {_exit_px:.2f}, "
+                                                  f"pnl=${_partial_pnl:+.2f}, {_remaining} remain")
                                         else:
-                                            # Fully filled by the time we checked — don't retry
                                             print(f"[EXIT STALE] Order fully filled during cancel check")
+                                        # Record partial P&L so bankroll and kill-switch stay accurate
+                                        try:
+                                            await self._risk_engine.record_trade_result(_partial_pnl)
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     pass
                                 position.pop('pending_exit', None)
@@ -4605,10 +4672,13 @@ class KalshiBattleBot:
         
         # _daily_snapshots and _portfolio_hourly are always initialised in __init__ and
         # loaded from the state file by _load_state(), so no hasattr guard needed here.
-        
-        # Start-of-day value (first we see today)
+
+        bot_uptime_secs = (now - self._start_time).total_seconds() if self._start_time else 999
+
+        # Start-of-day value — only lock in after 60s of uptime so cold-start transient
+        # prices don't corrupt the baseline used for today's P&L comparison.
         snapshot = self._daily_snapshots.get(today_str, {})
-        if snapshot.get('start_of_day_value') is None:
+        if snapshot.get('start_of_day_value') is None and bot_uptime_secs >= 60:
             snapshot['start_of_day_value'] = val
         snapshot['account_value'] = val
         snapshot['cash'] = round(cash, 2)
@@ -4616,7 +4686,6 @@ class KalshiBattleBot:
         snapshot['timestamp'] = now.isoformat()
         
         # Track intraday high watermark — shows "was up X, now at Y" pattern
-        bot_uptime_secs = (now - self._start_time).total_seconds() if self._start_time else 999
         current_high = snapshot.get('intraday_high')
         start_val = snapshot.get('start_of_day_value', val)
         if current_high is None:
@@ -4883,6 +4952,10 @@ class KalshiBattleBot:
             
         except Exception as e:
             import traceback
+            # Set a short error-TTL so the dashboard backs off during API outages instead
+            # of hammering Kalshi with a fresh traverse every 30 seconds indefinitely.
+            self._settlements_cache_time = datetime.utcnow()
+            self._settlements_cache = {'error': str(e), 'settlements': [], 'summary': {}, 'today': {}}
             return web.json_response({
                 'error': str(e),
                 'traceback': traceback.format_exc()
@@ -5209,12 +5282,24 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 if (data.trades) renderTrades(data.trades);
                 if (data.analyses) renderAnalyses(data.analyses);
                 if (data.monitored) renderMarkets(data.monitored);
-                
-                // Fetch real performance and settlements from Kalshi API
-                fetchPerformance();
+
+                // Debounce: only trigger a performance refresh once per 3s of WS activity.
+                // Without this, a burst of fill events fires N parallel fetchPerformance()
+                // calls, which can complete out-of-order and overwrite newer DOM values with stale ones.
+                if (!ws._perfDebounce) {
+                    ws._perfDebounce = setTimeout(() => {
+                        ws._perfDebounce = null;
+                        fetchPerformance();
+                    }, 3000);
+                }
             };
         }
         
+        // Escape HTML special characters before inserting user-supplied strings into innerHTML.
+        function esc(str) {
+            return String(str || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        }
+
         function updateStats(s) {
             // Legacy stats (At Risk section).
             // available and total_value are 0 when Kalshi hasn't synced yet — show '--'
@@ -5438,7 +5523,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             const html = positions.map(p => `
                 <div class="position">
                     <div class="position-header">
-                        <div class="position-title">${p.question}</div>
+                        <div class="position-title">${esc(p.question)}</div>
                         <span class="position-side ${p.side.toLowerCase()}">${p.side}</span>
                     </div>
                     <div class="position-details">
@@ -5473,7 +5558,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 return `
                     <div class="trade ${actionClass} ${isLoss ? 'loss' : ''}">
                         <div class="trade-info">
-                            <div>${t.question}</div>
+                            <div>${esc(t.question)}</div>
                             <div style="color:#8b949e;font-size:11px;">${t.side} @ ${(displayPrice*100).toFixed(0)}¢ · $${t.size.toFixed(2)} · ${new Date(t.timestamp).toLocaleTimeString()}${t.reason ? ' · ' + t.reason : ''}</div>
                         </div>
                         ${isExit ? `<div class="${t.pnl >= 0 ? 'green' : 'red'}">${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}</div>` : ''}
@@ -5517,7 +5602,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 return `
                 <div class="analysis">
                     <div class="analysis-header">
-                        <div style="flex:1;font-size:13px;">${a.question}</div>
+                        <div style="flex:1;font-size:13px;">${esc(a.question)}</div>
                         <span class="analysis-decision ${isTrade ? 'trade' : 'skip'}">${isTrade ? '✓ TRADE' : '✗ SKIP'}</span>
                     </div>
                     <div style="display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin:6px 0 4px 0;">

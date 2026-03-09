@@ -273,20 +273,21 @@ class WebSocketClient:
             True if reconnection successful, False otherwise
         """
         self._reconnect_count += 1
-        
-        if self._reconnect_count > self.max_reconnect_attempts:
-            logger.error(f"Max reconnection attempts ({self.max_reconnect_attempts}) exceeded")
-            return False
-        
+
+        # Use exponential backoff capped at 60s — never give up permanently.
+        # A hard cap of 10 attempts with flat delay would kill the price feed after
+        # ~50s of outage; a live trading bot must reconnect indefinitely.
+        delay = min(self.reconnect_delay * (2 ** min(self._reconnect_count - 1, 6)), 60)
+
         logger.warning(
-            f"Attempting reconnection ({self._reconnect_count}/{self.max_reconnect_attempts}) "
-            f"in {self.reconnect_delay}s..."
+            f"Attempting reconnection #{self._reconnect_count} in {delay:.0f}s..."
         )
-        
-        await asyncio.sleep(self.reconnect_delay)
-        
+
+        await asyncio.sleep(delay)
+
         try:
             await self.connect()
+            self._reconnect_count = 0  # Reset counter on success
             return True
         except Exception as e:
             logger.error(f"Reconnection failed: {e}")
@@ -312,14 +313,12 @@ class WebSocketClient:
             except ConnectionClosed as e:
                 logger.warning(f"WebSocket connection closed: {e}")
                 if self._running:
-                    if not await self._reconnect():
-                        break
-                        
+                    await self._reconnect()
+
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
                 if self._running:
-                    if not await self._reconnect():
-                        break
+                    await self._reconnect()
         
         await self.disconnect()
     

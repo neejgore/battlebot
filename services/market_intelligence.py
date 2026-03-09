@@ -93,6 +93,7 @@ class NewsService:
         self._cache_ttl = timedelta(minutes=30)  # 30 min cache - balance freshness vs API costs
         self._brave_api_key = os.getenv('BRAVE_API_KEY')
         self._brave_searches = 0  # Track usage
+        self._brave_rate_limited_until: datetime | None = None  # 429 backoff expiry
         
         if self._brave_api_key:
             logger.info("[News] Brave Search API configured (primary source)")
@@ -334,8 +335,12 @@ class NewsService:
         The web endpoint returns news articles inside both the top-level
         'news' block and the 'web' results block.
         """
+        # Respect 429 backoff window — don't hammer while rate-limited
+        if self._brave_rate_limited_until and datetime.utcnow() < self._brave_rate_limited_until:
+            return []
+
         news_items = []
-        
+
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(
@@ -389,7 +394,8 @@ class NewsService:
                     )
                     self._brave_api_key = None
                 elif response.status_code == 429:
-                    logger.warning("[Brave] Rate limited - falling back to Google News")
+                    self._brave_rate_limited_until = datetime.utcnow() + timedelta(seconds=60)
+                    logger.warning("[Brave] Rate limited (429) — backing off 60s")
                 elif response.status_code == 401:
                     logger.error(f"[Brave] Unauthorized (401) — check BRAVE_API_KEY is correct")
                 else:
