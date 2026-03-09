@@ -2071,14 +2071,16 @@ class KalshiBattleBot:
                     break
         _range_markets = []
         for p in _RANGE_PREFIXES:
-            _top2 = sorted(_range_by_series[p],
-                           key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:2]
-            _range_markets.extend(_top2)
+            _top3 = sorted(_range_by_series[p],
+                           key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:3]
+            _range_markets.extend(_top3)
         _range_ids = {m['id'] for m in _range_markets}
         # Exclude range markets from the other buckets to avoid analysing the same market twice
         _short_non_range = [m for m in short_term if m['id'] not in _range_ids]
         _ultra_non_range  = [m for m in ultra_short  if m['id'] not in _range_ids]
-        selected = _range_markets + _short_non_range[:50] + _ultra_non_range[:10] + medium_term[:20]
+        # Ultra-short markets resolve within 24h — widest coverage here for maximum trade frequency.
+        # Short-term gives diversity; medium-term is low-churn so a small cap is fine.
+        selected = _range_markets + _short_non_range[:100] + _ultra_non_range[:60] + medium_term[:25]
         
         # Log what we found
         print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
