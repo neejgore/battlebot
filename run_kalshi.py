@@ -2652,6 +2652,21 @@ class KalshiBattleBot:
                     print(f"[Liquidity Cap] ${position_size:.2f} → ${max_size_by_liquidity:.2f} (OI={open_interest}, max {self.max_oi_pct*100:.0f}%)")
                     position_size = max_size_by_liquidity
 
+            # CRYPTO RANGE CAP: BTC/ETH/SOL/XRP range bucket markets are high-variance.
+            # A single bad bet ($14.88) wiped out 6 consecutive wins (+$10.25).
+            # Cap these at $8 so one miss can never erase a full day of wins.
+            _market_id_upper = market_id.upper()
+            _RANGE_PREFIXES = ('KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXBCH-')
+            _is_range_market = any(_market_id_upper.startswith(p) for p in _RANGE_PREFIXES)
+            _q_lower_range = market.get('question', '').lower()
+            _is_range_question = any(x in _q_lower_range for x in
+                                     ['bitcoin price range', 'ethereum price range', 'btc price range',
+                                      'eth price range', 'solana price range', 'nasdaq price range'])
+            CRYPTO_RANGE_MAX = float(os.getenv('CRYPTO_RANGE_MAX_SIZE', '8.0'))
+            if (_is_range_market or _is_range_question) and position_size > CRYPTO_RANGE_MAX:
+                print(f"[Crypto Range Cap] ${position_size:.2f} → ${CRYPTO_RANGE_MAX:.2f} (range market size limit)")
+                position_size = CRYPTO_RANGE_MAX
+
             print(f"[Debug] Position size: ${position_size:.2f}")
 
             if position_size > 0:
