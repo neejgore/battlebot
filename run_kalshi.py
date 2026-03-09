@@ -94,7 +94,29 @@ class KalshiBattleBot:
         self._stats_debug_counter: int = 0
         # Snapshot file-save throttle — initialised here to avoid hasattr in _save_daily_snapshot
         self._last_snapshot_file_save: datetime | None = None
-        
+
+        # Risk Engine must be created BEFORE _load_state() so the kill-switch restore
+        # logic inside _load_state() can write to self._risk_engine.daily_stats.
+        # All env vars it needs (initial_bankroll, kelly_fraction, min_edge,
+        # max_position_size) are already set above.
+        self._risk_limits = RiskLimits(
+            max_daily_drawdown=0.10,  # 10% daily loss circuit breaker (was 15%)
+            max_position_size=self.max_position_size,
+            max_percent_bankroll_per_market=0.25,
+            max_total_open_risk=0.90,
+            max_positions=25,
+            profit_take_pct=999.0,    # DISABLED - let bets settle naturally
+            stop_loss_pct=999.0,      # DISABLED - let bets settle naturally
+            time_stop_hours=720,
+            edge_scale=0.10,
+            min_edge=self.min_edge,
+        )
+        self._risk_engine = RiskEngine(
+            initial_bankroll=self.initial_bankroll,
+            fractional_kelly=self.kelly_fraction,
+            limits=self._risk_limits,
+        )
+
         self._load_state()
         # After loading, wipe today's stale intraday_high from the previous session so the
         # dashboard never shows a leftover peak from a prior run as today's high.
@@ -134,25 +156,8 @@ class KalshiBattleBot:
         # Calibration
         self._calibration: CalibrationEngine = None
         
-        # Risk Engine - selective but confident
-        self._risk_limits = RiskLimits(
-            max_daily_drawdown=0.10,  # 10% daily loss circuit breaker (was 15%)
-            max_position_size=self.max_position_size,  # $30 max
-            max_percent_bankroll_per_market=0.25,  # 25% per market - fewer bets = bigger size
-            max_total_open_risk=0.90,  # 90% max exposure - 10% reserve
-            max_positions=25,  # Max 25 positions - deploy more capital
-            profit_take_pct=999.0,  # DISABLED - let bets settle naturally
-            stop_loss_pct=999.0,  # DISABLED - let bets settle naturally
-            time_stop_hours=720,  # 30 days max - but prefer settlement
-            edge_scale=0.10,
-            min_edge=self.min_edge,
-        )
-        self._risk_engine = RiskEngine(
-            initial_bankroll=self.initial_bankroll,
-            fractional_kelly=self.kelly_fraction,
-            limits=self._risk_limits,
-        )
-        
+        # (_risk_limits and _risk_engine are initialised earlier, before _load_state())
+
         # Market Intelligence Service (news, domain data, inefficiency detection)
         self._intelligence = get_intelligence_service()
         self._use_intelligence = os.getenv('USE_INTELLIGENCE', 'true').lower() == 'true'
