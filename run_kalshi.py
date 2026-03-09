@@ -5852,7 +5852,28 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         
         connect();
-        
+
+        // REST fallback for main stats — fires every 5 s regardless of WS status.
+        // The WS is the real-time layer; this baseline poll ensures the stats section
+        // never stays at $0.00 just because Railway's proxy is slow to upgrade the
+        // WebSocket connection (or the connection dropped between reconnect attempts).
+        async function fetchState() {
+            try {
+                const res = await fetch('/api/state');
+                if (!res.ok) return;
+                const d = await res.json();
+                if (d.stats) {
+                    updateStats(d.stats);
+                    renderPositions(d.positions || []);
+                    renderTrades(d.trades || []);
+                    renderAnalyses(d.analyses || []);
+                    renderMarkets(d.monitored || []);
+                }
+            } catch(e) { /* ignore — WS may already be handling it */ }
+        }
+        fetchState();
+        setInterval(fetchState, 5000);
+
         // Initial performance fetch and regular updates
         fetchPerformance();
         fetchSettlements();
