@@ -24,6 +24,7 @@ from logic.calibration import CalibrationEngine, CalibrationResult
 from logic.risk_engine import RiskEngine, RiskLimits
 from data.database import TelemetryDB
 from services.kalshi_client import KalshiClient, parse_kalshi_market
+from services.kalshi_websocket import KalshiWebSocketClient
 from services.market_intelligence import get_intelligence_service, MarketIntelligence
 from services.crypto_edge_service import CryptoEdgeService, CryptoEdgeResult
 
@@ -58,6 +59,14 @@ class KalshiBattleBot:
         # Kalshi client
         use_demo = os.getenv('KALSHI_USE_DEMO', 'false').lower() == 'true'
         self._kalshi = KalshiClient(use_demo=use_demo)
+
+        # Kalshi WebSocket client — provides real-time ticker and fill updates.
+        # Shares the same credentials as the REST client.
+        self._ws_client = KalshiWebSocketClient(
+            api_key_id=self._kalshi.api_key_id,
+            private_key=self._kalshi._private_key,
+            use_demo=use_demo,
+        )
 
         # Quantitative edge engine for crypto range markets
         self._crypto_edge = CryptoEdgeService()
@@ -144,7 +153,7 @@ class KalshiBattleBot:
         # Profit-lock threshold — read once from env, not per-position per-cycle
         self._profit_lock_pct: float = float(os.getenv('PROFIT_LOCK_PCT', '0.50'))
         
-        # Price updates counter (no WebSocket for Kalshi, use polling)
+        # Price updates counter (incremented by WS ticker callback and REST refresh)
         self._price_update_count = 0
         
         # AI Signal Generator
@@ -921,8 +930,10 @@ class KalshiBattleBot:
             result = await self._kalshi.get_positions()
             kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
             # Cache for performance endpoint so it doesn't need its own live API calls.
-            if kalshi_positions:
-                self._kalshi_positions_raw = kalshi_positions
+            # Always update (including to []) so the performance tab doesn't show stale
+            # positions after they all close. The "no positions" early-return below only
+            # fires when our own _positions dict is also empty — i.e. genuinely nothing open.
+            self._kalshi_positions_raw = kalshi_positions
             
             # Step 3: Compute portfolio value from market_exposure (cost basis in cents).
             # Kalshi's balance API does NOT return portfolio_value — using positions data
@@ -1427,7 +1438,8 @@ class KalshiBattleBot:
             'open_positions': len(self._positions),
             'markets_monitored': len(self._monitored),
             'analyses_count': len(self._analyses),
-            'ws_connected': False,  # Kalshi uses polling, not WebSocket
+            'ws_connected': self._ws_client.is_connected,
+            'ws_stats': self._ws_client.get_stats(),
             'price_updates': self._price_update_count,
             'ai_available': self._ai_generator._client is not None,
             'ai_calls': self._ai_calls,
@@ -1538,7 +1550,13 @@ class KalshiBattleBot:
         if not self.dry_run:
             await self._reconcile_settlements_from_fills()
 
+        # Register WebSocket callbacks before starting the run loop so we
+        # never miss a fill or ticker that arrives right after connect.
+        self._ws_client.add_ticker_callback(self._on_ws_ticker)
+        self._ws_client.add_fill_callback(self._on_ws_fill)
+
         # Start background tasks
+        asyncio.create_task(self._ws_client.run())           # Real-time WS feed
         asyncio.create_task(self._market_loop())
         asyncio.create_task(self._trading_loop())
         asyncio.create_task(self._position_monitor_loop())
@@ -1560,6 +1578,7 @@ class KalshiBattleBot:
     async def _shutdown(self):
         """Clean shutdown."""
         self._running = False
+        await self._ws_client.stop()
         self._save_state()
         await self._crypto_edge.close()
         if self._db_connected:
@@ -3541,41 +3560,137 @@ class KalshiBattleBot:
         self._save_state()
         await self._broadcast_update()
     
+    # ------------------------------------------------------------------
+    # WebSocket callbacks
+    # ------------------------------------------------------------------
+
+    def _on_ws_ticker(
+        self,
+        ticker: str,
+        yes_bid,   # int cents or None
+        yes_ask,   # int cents or None
+        last_price,  # int cents or None
+        volume,
+        open_interest,
+    ) -> None:
+        """Handle a real-time ticker update from the Kalshi WebSocket.
+
+        Updates the in-memory price caches for the market so that the
+        trading loop and performance endpoint always see fresh prices
+        without waiting for the 30-second REST poll.
+        """
+        # Compute dollar prices from cent integers
+        if yes_bid is not None and yes_ask is not None and yes_ask > yes_bid:
+            yes_price = (yes_bid + yes_ask) / 2 / 100
+            spread = (yes_ask - yes_bid) / 100
+        elif last_price is not None:
+            yes_price = last_price / 100
+            spread = 0.02
+        else:
+            return  # Nothing useful to update
+
+        no_price = round(1.0 - yes_price, 6)
+
+        update = {
+            'yes_price': yes_price,
+            'no_price': no_price,
+            'price': yes_price,
+            'spread': spread,
+        }
+        if last_price is not None:
+            update['last_price'] = last_price / 100
+        if volume is not None:
+            update['volume'] = volume
+        if open_interest is not None:
+            update['open_interest'] = open_interest
+            update['liquidity'] = open_interest * yes_price
+
+        # Update both caches (same approach as _price_refresh_loop)
+        if ticker in self._markets:
+            self._markets[ticker].update(update)
+        if ticker in self._monitored:
+            self._monitored[ticker].update(update)
+
+        self._price_update_count += 1
+
+    def _on_ws_fill(self, fill: dict) -> None:
+        """Handle a real-time fill notification from the Kalshi WebSocket.
+
+        Marks the filled order in _pending_orders for immediate processing.
+        The position sync loop wakes up via ws_client.fill_event and polls
+        the REST API to confirm the fill details (count, exact price).
+        """
+        order_id = fill.get('order_id', '')
+        if not order_id:
+            return
+        if order_id in self._pending_orders:
+            print(f"[WS Fill] Pending entry order filled: {order_id}")
+        # fill_event is set inside KalshiWebSocketClient._handle_fill;
+        # no duplicate set needed here.
+
+    # ------------------------------------------------------------------
+    # Price refresh loop (REST fallback)
+    # ------------------------------------------------------------------
+
     async def _price_refresh_loop(self):
-        """Periodically refresh prices from Kalshi API."""
+        """Periodically refresh prices from Kalshi API (REST fallback).
+
+        When the WebSocket is connected, this loop skips per-market API calls
+        entirely — prices are kept fresh by _on_ws_ticker in real time.  The
+        loop still runs on a longer interval to:
+          1. Keep WS subscriptions in sync with the current _monitored set.
+          2. Catch any markets that may have been missed during a reconnect.
+
+        When WS is disconnected, the loop falls back to the original 30-second
+        per-market REST poll so prices never go stale.
+        """
+        _POLL_INTERVAL_REST = 30    # seconds between full REST refresh
+        _POLL_INTERVAL_WS   = 300   # seconds between REST refresh when WS is live
+
         while self._running:
             try:
-                for market_id in list(self._monitored.keys()):
-                    try:
-                        result = await self._kalshi.get_market(market_id)
-                        if result and 'market' in result:
-                            updated = parse_kalshi_market(result['market'])
-                            # Merge price fields only — do NOT replace the whole dict.
-                            # parse_kalshi_market does not return hours_to_resolution;
-                            # overwriting wholesale would strip the value computed during
-                            # market scanning and break Kelly horizon / cache TTL logic.
-                            # 'price' is the midpoint alias used by cache-bust and calibration anchor.
-                            # It must be refreshed here or the drift check always sees ≈0.
-                            _price_fields = ('yes_price', 'no_price', 'last_price',
-                                             'price', 'volume', 'open_interest', 'liquidity')
-                            for _f in _price_fields:
-                                if _f in updated:
-                                    self._markets.setdefault(market_id, {})
-                                    self._markets[market_id][_f] = updated[_f]
-                                    # Only update _monitored if the market is ALREADY in it.
-                                    # Using setdefault here re-inserts markets that _select_markets
-                                    # intentionally removed (expired/finalized/de-prioritized),
-                                    # creating sparse dicts with missing metadata that confuse
-                                    # trading filters. Update in-place only.
-                                    if market_id in self._monitored:
-                                        self._monitored[market_id][_f] = updated[_f]
-                            self._price_update_count += 1
-                    except Exception as _pref:
-                        print(f"[Price Refresh] {market_id[:25]}: {_pref}")
-                    await asyncio.sleep(1)  # Rate limit
+                monitored_tickers = list(self._monitored.keys())
+
+                # Always keep WS subscriptions aligned with monitored markets
+                if monitored_tickers:
+                    await self._ws_client.sync_subscriptions(monitored_tickers)
+
+                ws_live = self._ws_client.is_connected
+
+                if ws_live:
+                    # WS is delivering live prices — skip per-market REST calls
+                    # to avoid wasting rate-limit budget.
+                    pass
+                else:
+                    # WS is down — fall back to REST polling for every market
+                    for market_id in monitored_tickers:
+                        try:
+                            result = await self._kalshi.get_market(market_id)
+                            if result and 'market' in result:
+                                updated = parse_kalshi_market(result['market'])
+                                # Merge price fields only — do NOT replace the whole dict.
+                                # parse_kalshi_market does not return hours_to_resolution;
+                                # overwriting wholesale would strip the value computed during
+                                # market scanning and break Kelly horizon / cache TTL logic.
+                                _price_fields = ('yes_price', 'no_price', 'last_price',
+                                                 'price', 'volume', 'open_interest', 'liquidity')
+                                for _f in _price_fields:
+                                    if _f in updated:
+                                        self._markets.setdefault(market_id, {})
+                                        self._markets[market_id][_f] = updated[_f]
+                                        if market_id in self._monitored:
+                                            self._monitored[market_id][_f] = updated[_f]
+                                self._price_update_count += 1
+                        except Exception as _pref:
+                            print(f"[Price Refresh] {market_id[:25]}: {_pref}")
+                        await asyncio.sleep(1)  # Rate limit between per-market calls
+
             except Exception as e:
                 print(f"[Price Refresh Error] {e}")
-            await asyncio.sleep(30)  # Refresh every 30 seconds
+
+            # Sleep until next cycle — much longer when WS is live
+            poll_secs = _POLL_INTERVAL_WS if self._ws_client.is_connected else _POLL_INTERVAL_REST
+            await asyncio.sleep(poll_secs)
     
     async def _check_pending_exits(self):
         """Check status of pending sell/exit orders."""
@@ -3905,7 +4020,15 @@ class KalshiBattleBot:
                 
                 # Then check pending BUY orders
                 if not self._pending_orders:
-                    await asyncio.sleep(10)
+                    # Wait up to 10 s, but wake immediately if the WS fires a fill.
+                    # This avoids a 10-second delay when there is no live activity.
+                    try:
+                        await asyncio.wait_for(
+                            self._ws_client.fill_event.wait(), timeout=10
+                        )
+                        self._ws_client.fill_event.clear()
+                    except asyncio.TimeoutError:
+                        pass
                     continue  # Still loop to trigger full sync periodically
                 
                 # Check each pending order's status directly
@@ -4136,8 +4259,18 @@ class KalshiBattleBot:
             except Exception as e:
                 import traceback as _tb; print(f"[Position Sync Error] {e}"); _tb.print_exc()
 
-            await asyncio.sleep(10)  # Check every 10 seconds
-    
+            # When WS is live, wait up to 10 s OR until a fill event wakes us.
+            # This means a fill received via WebSocket is processed with
+            # near-zero latency instead of waiting out the full 10-second sleep.
+            try:
+                await asyncio.wait_for(
+                    self._ws_client.fill_event.wait(), timeout=10
+                )
+                self._ws_client.fill_event.clear()
+                print("[Sync] WS fill event received — re-checking orders immediately")
+            except asyncio.TimeoutError:
+                pass
+
     async def _broadcast_update(self):
         """Send update to all connected WebSocket clients."""
         if not self._websockets:
@@ -4251,7 +4384,11 @@ class KalshiBattleBot:
             # The sync loop (_sync_positions_with_kalshi) refreshes these every ~5 min.
             # Making fresh API calls on every 15-second dashboard poll was adding 1-2s
             # of latency per load and burning Kalshi rate-limit budget unnecessarily.
-            cash = self._kalshi_cash if self._kalshi_cash is not None else 0.0
+            if self._kalshi_cash is None:
+                # Sync hasn't completed yet (bot just started). Return a loading sentinel
+                # so the dashboard shows '--' rather than '-$200 / -100%'.
+                return web.json_response({'error': 'syncing', 'message': 'Waiting for initial Kalshi sync...'})
+            cash = self._kalshi_cash
             kalshi_positions = self._kalshi_positions_raw
             
             # Calculate position values
@@ -4545,11 +4682,14 @@ class KalshiBattleBot:
             fills = result.get('fills', [])
             
             if not fills:
-                return web.json_response({
+                _empty = {
                     'settlements': [],
                     'summary': {'total': 0, 'wins': 0, 'losses': 0, 'total_pnl': 0},
                     'today': {'wins': 0, 'losses': 0, 'pnl': 0},
-                })
+                }
+                self._settlements_cache = _empty
+                self._settlements_cache_time = datetime.utcnow()
+                return web.json_response(_empty)
             
             # Group fills by ticker
             fills_by_ticker = {}
@@ -5108,7 +5248,14 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 const perfRes = await fetch('/api/performance');
                 const p = await perfRes.json();
                 if (p.error) {
-                    console.error('Performance API error:', p.error);
+                    if (p.error === 'syncing') {
+                        // Bot just started — sync not complete yet. Retry in 5s.
+                        document.getElementById('accountValue') && (document.getElementById('accountValue').textContent = 'Syncing…');
+                        document.getElementById('totalReturn') && (document.getElementById('totalReturn').textContent = '—');
+                        setTimeout(fetchPerformance, 5000);
+                    } else {
+                        console.error('Performance API error:', p.error);
+                    }
                     return;
                 }
                 if (!p.account || !p.performance) {
