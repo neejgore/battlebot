@@ -923,15 +923,20 @@ class KalshiBattleBot:
         
         try:
             # Step 1: Fetch cash balance from Kalshi.
-            # NOTE: Kalshi's /portfolio/balance only returns CASH (available to spend).
-            # It does NOT return portfolio_value — that field is always absent/zero.
-            # We compute portfolio value separately from positions data below.
+            # Kalshi's /portfolio/balance returns BOTH cash (balance) AND
+            # portfolio_value (current market value of open positions at live prices).
+            # Using portfolio_value directly is more accurate than recomputing from
+            # cached prices, which may be a few minutes stale.
             _balance_ok = False
+            _kalshi_portfolio_value = None  # market value direct from Kalshi API
             try:
                 balance_result = await self._kalshi.get_balance()
                 print(f"[Sync] Raw balance response: {balance_result}")
                 balance_cents = balance_result.get('balance', 0)
                 self._kalshi_cash = balance_cents / 100
+                pv_cents = balance_result.get('portfolio_value', 0) or 0
+                if pv_cents > 0:
+                    _kalshi_portfolio_value = pv_cents / 100
                 _balance_ok = True
             except Exception as e:
                 print(f"[Sync] Could not fetch balance: {e}")
@@ -981,14 +986,19 @@ class KalshiBattleBot:
                         _exposure = abs(kp.get('market_exposure', 0)) / 100
                         _price = (_exposure / _contracts) if _contracts > 0 else 0.5
                     _market_value += _contracts * _price
-                # _kalshi_total = market value (cash + what positions are worth NOW)
-                # This is the single source of truth for all 3 dashboard displays.
-                self._kalshi_total = self._kalshi_cash + _market_value
+                # Prefer Kalshi's own portfolio_value (live market prices) over our
+                # cached-price estimate. Fall back to cached estimate only if the API
+                # field is missing (older API versions or zero positions).
+                if _kalshi_portfolio_value is not None:
+                    self._kalshi_total = self._kalshi_cash + _kalshi_portfolio_value
+                else:
+                    self._kalshi_total = self._kalshi_cash + _market_value
                 _account_for_snapshot = self._kalshi_total
+                _pv_source = 'API' if _kalshi_portfolio_value is not None else 'cache'
                 print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, "
                       f"Positions(cost)=${self._kalshi_portfolio:.2f}, "
-                      f"Positions(mkt)=${_market_value:.2f}, "
-                      f"Total(mkt)=${self._kalshi_total:.2f}")
+                      f"Positions(mkt/{_pv_source})=${(_kalshi_portfolio_value or _market_value):.2f}, "
+                      f"Total=${self._kalshi_total:.2f}")
                 await self._save_daily_snapshot(_account_for_snapshot, self._kalshi_cash, _market_value)
 
                 # Sync the risk engine with current market value (not cost basis) so the
