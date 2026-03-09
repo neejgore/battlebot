@@ -67,6 +67,7 @@ class CryptoEdgeService:
         'SOL':    1.20,
         'DOGE':   1.60,
         'XRP':    1.10,   # similar volatility tier to SOL
+        'BCH':    0.95,   # Bitcoin Cash: higher than BTC, lower than altcoins
     }
 
     def __init__(self) -> None:
@@ -256,7 +257,9 @@ class CryptoEdgeService:
         if up.startswith("KXDOGE") or "dogecoin" in ql or " doge " in ql:
             return "DOGE"
         if up.startswith("KXXRP") or "ripple" in ql or " xrp " in ql:
-            return "XRP"  # uses XRPUSDT spot + realized vol (Deribit DVOL not available for XRP)
+            return "XRP"   # uses XRPUSDT spot + realized vol (Deribit DVOL not available for XRP)
+        if up.startswith("KXBCH") or "bitcoin cash" in ql or " bch " in ql:
+            return "BCH"   # uses BCHUSDT spot + realized vol
         return "BTC"  # safe default for unknown crypto range
 
     # ------------------------------------------------------------------

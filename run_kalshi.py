@@ -2382,8 +2382,12 @@ class KalshiBattleBot:
         # Cache is valid for up to 2h if price moved <1.5¢ since last call
         cached = self._prob_cache.get(market_id)
         use_cache = False
+        cache_claude_prob = None  # raw pre-blend Claude prob stored in 5th cache slot
         if cached:
-            cache_time, cache_price, cache_prob, cache_conf = cached
+            # Cache tuple: (time, price, blended_prob, conf [, raw_claude_prob])
+            # The 5th slot was added to allow correct re-blending on cache hits.
+            cache_time, cache_price, cache_prob, cache_conf = cached[:4]
+            cache_claude_prob = cached[4] if len(cached) > 4 else cache_prob
             price_drift = abs(current_price - cache_price)
             cache_age = (datetime.utcnow() - cache_time).total_seconds()
             hours_to_res = market.get('hours_to_resolution') or 9999
@@ -2396,14 +2400,14 @@ class KalshiBattleBot:
             # Reconstruct a minimal signal result from cache — no API call needed
             from logic.ai_signal import AISignalOutput
             _cached_raw_prob = cache_prob
-            # For range markets: re-apply quant blend using the fresh quant prob.
-            # The cache stores the previously blended value but spot/vol may have shifted
-            # since the last Claude call even if Kalshi price is stable.
+            # For range markets: re-apply quant blend using fresh quant prob + stored
+            # raw Claude prob (5th cache slot). This gives the correct 70/30 split —
+            # previously cache_prob was the already-blended value, giving ~91% quant weight.
             if _quant_result and _quant_override_prob is not None:
-                _cached_raw_prob = 0.70 * _quant_override_prob + 0.30 * cache_prob
+                _cached_raw_prob = 0.70 * _quant_override_prob + 0.30 * cache_claude_prob
                 print(
                     f"[QuantEdge] Cache re-blend: quant={_quant_override_prob:.1%} "
-                    f"cached_claude≈{cache_prob:.1%} → {_cached_raw_prob:.1%}"
+                    f"claude={cache_claude_prob:.1%} → {_cached_raw_prob:.1%}"
                 )
             cached_signal = AISignalOutput(
                 raw_prob=_cached_raw_prob,
@@ -2512,8 +2516,15 @@ class KalshiBattleBot:
                         information_quality=signal.information_quality,
                     )
 
-                # Store blended prob in cache (for sizing/edge on next hit)
-                self._prob_cache[market_id] = (datetime.utcnow(), current_price, signal.raw_prob, signal.confidence)
+                # Store blended prob + raw Claude prob in cache.
+                # Slot 5 (raw Claude prob) is used on cache hits to re-blend correctly
+                # with a fresh quant estimate without compounding the blend.
+                self._prob_cache[market_id] = (
+                    datetime.utcnow(), current_price,
+                    signal.raw_prob,   # blended prob (used for edge/sizing)
+                    signal.confidence,
+                    _claude_raw_prob_for_calibration,  # raw Claude prob (used for re-blending)
+                )
                 # Record CLAUDE's raw prob (pre-blend) for calibration learning —
                 # the calibrator measures Claude's bias, not the quant formula's.
                 if self._calibration and self._db_connected:
@@ -3194,42 +3205,38 @@ class KalshiBattleBot:
                     if position.get('pending_exit'):
                         return  # Silently skip - don't spam logs
 
-                    # TERMINAL positions (value < $0.50, price ≤ 5¢): skip the sell order.
+                    # TERMINAL positions (value < $0.50, price ≤ 5¢): skip the sell entirely.
                     # The monitor fires TERMINAL_WRITEOFF at gain_pct <= -0.85 and value < $0.50.
-                    # Limit sells at 1-4¢ rarely fill on Kalshi — no buyers for near-zero contracts.
-                    # Using 5¢ here matches the monitor's $0.50 / typical-contract-count threshold
-                    # so positions exited via TERMINAL_WRITEOFF always skip the unfillable sell.
+                    # Limit sells at 1-5¢ rarely fill on Kalshi — no buyers for near-zero contracts.
                     current_side_price = exit_price
-                    if current_side_price <= 0.05 and contracts * current_side_price < 0.50:
-                        print(f"[Write-Off] {pos_id[:8]} value ${contracts*current_side_price:.2f} — skipping unfillable sell, writing off")
-                        # Skip the sell, fall through to position removal below
-                        contracts = 0  # prevents the sell block from running
-                    
-                    # Use a limit sell at current bid minus 2¢ for quick fills without
-                    # giving away value. Floor at 1¢ to always be marketable.
-                    sell_price_cents = max(1, int(current_side_price * 100) - 2)
-                    
-                    print(f"[LIVE SELL] Placing limit order: {contracts} {position['side']} @ {sell_price_cents}¢")
-                    
-                    result = await self._kalshi.sell_position(
-                        ticker=position['market_id'],
-                        side=position['side'].lower(),
-                        count=contracts,
-                        price=sell_price_cents,
-                        order_type='limit',
+                    _is_terminal_writeoff = (
+                        current_side_price <= 0.05 and contracts * current_side_price < 0.50
                     )
-                    exit_order_id = result.get('order', {}).get('order_id')
-                    print(f"[LIVE SELL] Order placed @ {sell_price_cents}¢ | Order ID: {exit_order_id}")
-                    
-                    # Track as pending exit - don't remove position until sell fills
-                    position['pending_exit'] = {
-                        'order_id': exit_order_id,
-                        'exit_price': exit_price,
-                        'reason': reason,
-                        'placed_time': datetime.utcnow().isoformat(),
-                    }
-                    self._save_state()
-                    return  # Don't record exit yet - wait for fill confirmation
+                    if _is_terminal_writeoff:
+                        print(f"[Write-Off] {pos_id[:8]} value ${contracts*current_side_price:.2f} — skipping unfillable sell, falling through to removal")
+                        # Fall through — do NOT return — so position removal below runs
+                    else:
+                        # Normal sell path: limit order at bid minus 2¢, floor at 1¢
+                        sell_price_cents = max(1, int(current_side_price * 100) - 2)
+                        print(f"[LIVE SELL] Placing limit order: {contracts} {position['side']} @ {sell_price_cents}¢")
+                        result = await self._kalshi.sell_position(
+                            ticker=position['market_id'],
+                            side=position['side'].lower(),
+                            count=contracts,
+                            price=sell_price_cents,
+                            order_type='limit',
+                        )
+                        exit_order_id = result.get('order', {}).get('order_id')
+                        print(f"[LIVE SELL] Order placed @ {sell_price_cents}¢ | Order ID: {exit_order_id}")
+                        # Track as pending exit — don't remove position until sell fills
+                        position['pending_exit'] = {
+                            'order_id': exit_order_id,
+                            'exit_price': exit_price,
+                            'reason': reason,
+                            'placed_time': datetime.utcnow().isoformat(),
+                        }
+                        self._save_state()
+                        return  # Wait for fill confirmation before recording exit
                     
             except Exception as e:
                 print(f"[Order Error] Failed to place sell order on Kalshi: {e}")
