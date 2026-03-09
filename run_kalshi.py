@@ -897,44 +897,47 @@ class KalshiBattleBot:
         print("[Sync] Fetching actual data from Kalshi...")
         
         try:
-            # Fetch actual balance and portfolio value from Kalshi
+            # Step 1: Fetch cash balance from Kalshi.
+            # NOTE: Kalshi's /portfolio/balance only returns CASH (available to spend).
+            # It does NOT return portfolio_value — that field is always absent/zero.
+            # We compute portfolio value separately from positions data below.
+            _balance_ok = False
             try:
                 balance_result = await self._kalshi.get_balance()
-                
-                # Debug: Log raw response to see what fields are available
                 print(f"[Sync] Raw balance response: {balance_result}")
-                
-                # Kalshi returns all values in cents
                 balance_cents = balance_result.get('balance', 0)
-                portfolio_cents = balance_result.get('portfolio_value', 0)
-                
-                self._kalshi_cash = balance_cents / 100  # Convert to dollars
-                self._kalshi_portfolio = portfolio_cents / 100  # Convert to dollars
-                self._kalshi_total = self._kalshi_cash + self._kalshi_portfolio
-                
-                print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, Positions=${self._kalshi_portfolio:.2f}, Total=${self._kalshi_total:.2f}")
-                
-                # Keep risk-engine bankroll in sync with actual Kalshi portfolio value.
-                # Without this, Kelly sizing and exposure limits use the stale initial
-                # bankroll — understating available capital after wins, overstating after losses.
-                self._risk_engine.sync_bankroll(self._kalshi_total)
-                
-                # Keep intraday peak in sync with the same number the user sees on the dashboard
-                await self._save_daily_snapshot(self._kalshi_total, self._kalshi_cash, self._kalshi_portfolio)
+                self._kalshi_cash = balance_cents / 100
+                _balance_ok = True
             except Exception as e:
                 print(f"[Sync] Could not fetch balance: {e}")
                 import traceback
                 traceback.print_exc()
-                # Preserve last-known Kalshi values on transient failure.
-                # Resetting to None triggers the stats fallback which adds corrupted
-                # realized_pnl to the calculation, producing wildly inflated dashboard
-                # numbers (e.g. $824 when account is actually $578).
-                # Stale values are far less harmful than fabricated ones.
-                # Values reset to None only if they were never set (first startup).
-            
+                # Preserve last-known cash value on transient failure.
+
+            # Step 2: Fetch open positions from Kalshi.
             result = await self._kalshi.get_positions()
             kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
             
+            # Step 3: Compute portfolio value from market_exposure (cost basis in cents).
+            # Kalshi's balance API does NOT return portfolio_value — using positions data
+            # is the only way to get the amount deployed. This gives COST BASIS (what was
+            # paid), not current market value, but it's the correct "capital at risk" figure
+            # that, when added to cash, equals total deposits minus any realized losses.
+            if _balance_ok and self._kalshi_cash is not None:
+                _portfolio_exposure_cents = sum(
+                    abs(kp.get('market_exposure', 0))
+                    for kp in kalshi_positions
+                    if kp.get('position', 0) != 0
+                )
+                self._kalshi_portfolio = _portfolio_exposure_cents / 100
+                self._kalshi_total = self._kalshi_cash + self._kalshi_portfolio
+                print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, "
+                      f"Positions(cost)=${self._kalshi_portfolio:.2f}, "
+                      f"Total=${self._kalshi_total:.2f}")
+                # Sync risk engine bankroll and save snapshot with real total.
+                self._risk_engine.sync_bankroll(self._kalshi_total)
+                await self._save_daily_snapshot(self._kalshi_total, self._kalshi_cash, self._kalshi_portfolio)
+
             if not kalshi_positions:
                 # An empty response means either we genuinely have no open positions,
                 # OR the API is returning a partial/bad response (token expiry, 200-with-null,
@@ -4296,11 +4299,12 @@ class KalshiBattleBot:
                     'unrealized_pnl': unrealized,
                 })
             
-            # 3. Calculate account metrics
+            # 3. Calculate account metrics.
             total_deposits = float(os.getenv('TOTAL_DEPOSITS', '200'))  # User's total deposits
-            # Prefer Kalshi's own portfolio valuation (same number shown in the ACCOUNT section)
-            # so that Today's Peak tracks the same figure the user sees.
-            account_value = self._kalshi_total if self._kalshi_total is not None else (cash + total_position_value)
+            # Use cash (from fresh API call) + current position market value (from cached prices).
+            # Do NOT use self._kalshi_total from sync: that reflects cost-basis of positions,
+            # not current market value, and the dashboard should show what positions are worth NOW.
+            account_value = cash + total_position_value
             total_return = account_value - total_deposits
             return_pct = (total_return / total_deposits * 100) if total_deposits > 0 else 0
             
