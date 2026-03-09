@@ -149,7 +149,8 @@ class RiskEngine:
         self._positions: dict[str, PositionWithExitRules] = {}
         self._market_exposure: dict[str, float] = {}  # market_id -> exposure
         self._exit_cooldowns: dict[str, datetime] = {}  # token_id -> cooldown expiry
-        self._synced_exposure: float = 0.0  # Real exposure synced from bot's open positions
+        self._synced_exposure: float = 0.0         # Real exposure synced from bot's open positions
+        self._synced_position_count: int = 0        # Real position count synced from bot's dict
         self._lock = asyncio.Lock()
         
         # Initialize daily stats — pass the configured drawdown limit so the
@@ -193,7 +194,7 @@ class RiskEngine:
         # If the bot has synced real exposure, use the larger of the two to be conservative
         return max(internal, self._synced_exposure)
     
-    def sync_open_exposure(self, total_open_cost: float) -> None:
+    def sync_open_exposure(self, total_open_cost: float, position_count: int = 0) -> None:
         """Sync the actual exposure from the bot's real open positions.
 
         Called by the bot before each position-size calculation so that the
@@ -202,8 +203,10 @@ class RiskEngine:
 
         Args:
             total_open_cost: Sum of cost_basis for all currently open positions.
+            position_count: Number of currently open positions (used for max_positions check).
         """
         self._synced_exposure = max(0.0, total_open_cost)
+        self._synced_position_count = max(0, position_count)
 
     def sync_market_exposure(self, exposures: dict) -> None:
         """Sync per-market exposure from the bot's open positions dict.
@@ -296,9 +299,13 @@ class RiskEngine:
                 logger.warning("Trading halted - kill switch triggered")
                 return 0.0
             
-            # Check position count
-            if len(self._positions) >= self.limits.max_positions:
-                logger.warning(f"Max positions ({self.limits.max_positions}) reached")
+            # Check position count.
+            # NOTE: self._positions is never populated (all tracking is in the main
+            # bot's self._positions dict). Use the external count if provided; the
+            # calling code passes current_positions_count via sync_open_exposure.
+            # We use _synced_position_count set by sync_open_exposure() instead.
+            if self._synced_position_count >= self.limits.max_positions:
+                logger.warning(f"Max positions ({self.limits.max_positions}) reached ({self._synced_position_count} open)")
                 return 0.0
             
             # Get available capital

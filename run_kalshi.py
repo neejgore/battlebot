@@ -579,6 +579,12 @@ class KalshiBattleBot:
                             if _pos_match:
                                 side = _pos_match.get('side', '')
                     our_side = (side or '').lower()
+                    # If side is empty after all three fallbacks (fills API, _trades,
+                    # _positions), we cannot determine WIN vs LOSS. Skip rather than
+                    # recording a guaranteed-wrong LOSS that corrupts calibration data.
+                    if not our_side:
+                        print(f"[Reconcile] Skipping {ticker[:30]} — cannot determine side (fills API omitted it and no trade/position record found)")
+                        continue
                     if our_side == (result or '').lower():
                         exit_price = 1.0
                         pnl = (exit_price - avg_price) * net_contracts
@@ -919,21 +925,25 @@ class KalshiBattleBot:
                 if market_id not in kalshi_by_ticker:
                     entry_price = pos.get('entry_price', 0)
                     contracts = pos.get('contracts', 0)
-                    pnl_estimate = -entry_price * contracts
+                    # Don't assume total loss. The position is gone from Kalshi because
+                    # it settled (WIN or LOSS) or was externally closed. We don't know
+                    # the outcome here, and sync_bankroll() (called just above at line 859)
+                    # already reflects the real account value. Charging a fake negative
+                    # pnl_estimate would push risk engine bankroll below Kalshi actuals,
+                    # potentially triggering a false kill-switch for ~5 minutes.
+                    # Rely solely on sync_bankroll for accuracy; skip record_trade_result.
+                    pnl_estimate = 0.0  # Neutral — sync_bankroll already captured real outcome
                     print(f"[Sync] Position no longer on Kalshi — removing "
-                          f"(${pnl_estimate:+.2f} est, charge={_safe_to_charge_pnl}): "
+                          f"(charge skipped, sync_bankroll handles real P&L): "
                           f"{pos.get('question', '')[:40]}...")
                     self._positions.pop(pos_id)
                     self._recently_exited[market_id] = datetime.utcnow()
                     self._recently_exited_reason[market_id] = 'SYNC_REMOVED'
-                    if _safe_to_charge_pnl and contracts > 0 and not pos.get('pending_exit'):
-                        # Only charge P&L when we're confident the API response is complete
-                        # (guarded above) and this wasn't a pending sell (real P&L comes
-                        # from _check_pending_exits when the fill is confirmed).
-                        await self._risk_engine.record_trade_result(pnl_estimate)
+                    # Save state after EACH removal so a crash mid-loop doesn't
+                    # cause double-removal (and double-pnl) on the next restart.
                     removed += 1
+                    self._save_state()
             if removed:
-                self._save_state()
                 await self._broadcast_update()
             
             # Check for missing positions (on Kalshi but not in bot)
@@ -1430,14 +1440,18 @@ class KalshiBattleBot:
         print(f"\nDashboard: http://localhost:{self.port}")
         print("Press Ctrl+C to stop\n")
         
-        # CRITICAL: Cancel ALL stale resting orders on startup (LIVE mode only)
-        if not self.dry_run:
-            await self._cancel_all_resting_orders()
-        
-        # Sync pending orders from previous session (LIVE mode only)
+        # Sync pending orders FIRST — before canceling resting orders — so fills
+        # that completed during downtime are detected and promoted to positions.
+        # _cancel_all_resting_orders() clears _pending_orders afterward, making the
+        # guard at the original location always False and _sync_pending_orders_on_startup
+        # unreachable. Swapping the order fixes this.
         if not self.dry_run and self._pending_orders:
             print(f"[Startup] Checking {len(self._pending_orders)} pending orders from previous session...")
             await self._sync_pending_orders_on_startup()
+
+        # CRITICAL: Cancel ALL stale resting orders on startup (LIVE mode only)
+        if not self.dry_run:
+            await self._cancel_all_resting_orders()
         
         # Sync positions with Kalshi to ensure accuracy (LIVE mode only)
         if not self.dry_run:
@@ -2864,7 +2878,7 @@ class KalshiBattleBot:
         if should_trade:
             # Sync total + per-market exposure so both global and per-market limits fire.
             real_exposure = sum(p.get('size', 0) for p in self._positions.values())
-            self._risk_engine.sync_open_exposure(real_exposure)
+            self._risk_engine.sync_open_exposure(real_exposure, position_count=len(self._positions))
 
             market_exposures: dict = {}
             for p in self._positions.values():
@@ -3809,8 +3823,24 @@ class KalshiBattleBot:
                                         print(f"[STALE ORDER] {order_id} | {age_minutes:.0f}min old - canceling...")
                                         try:
                                             await self._kalshi.cancel_order(order_id)
-                                            canceled_orders.append(order_id)
-                                            print(f"[ORDER CANCELED] {order_id} (stale)")
+                                            # B49 fix (stale path): check for partial fill before
+                                            # treating the cancel as a clean cancel. A resting order
+                                            # that was partially filled before we cancelled it needs
+                                            # a position created for the already-filled contracts,
+                                            # just like the API-reported-cancel path at line ~3773.
+                                            stale_partial = order_data.get('filled_count', 0)
+                                            if stale_partial > 0:
+                                                stale_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
+                                                filled_orders.append({
+                                                    'order_id': order_id,
+                                                    'order': order,
+                                                    'fill_count': stale_partial,
+                                                    'fill_price': stale_price,
+                                                })
+                                                print(f"[STALE PARTIAL] {order_id} had {stale_partial} filled contracts @ {stale_price*100:.0f}¢ before cancel — creating position")
+                                            else:
+                                                canceled_orders.append(order_id)
+                                                print(f"[ORDER CANCELED] {order_id} (stale)")
                                         except Exception as cancel_err:
                                             print(f"[Cancel Error] {order_id}: {cancel_err}")
                                 except Exception as time_err:
@@ -4372,7 +4402,8 @@ class KalshiBattleBot:
                     if action == 'buy':
                         total_bought += count
                         total_cost += price * count
-                        side = fill_side
+                        if fill_side:  # Only update side if field is present (mirrors reconcile fix)
+                            side = fill_side
                         if not earliest_fill_time or fill_time < earliest_fill_time:
                             earliest_fill_time = fill_time
                     elif action == 'sell':
