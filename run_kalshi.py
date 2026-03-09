@@ -905,6 +905,16 @@ class KalshiBattleBot:
                 actual_size = market_exposure_cents / 100 if market_exposure_cents > 0 else contracts * entry_price
                 
                 if ticker not in existing_tickers:
+                    # Don't re-add positions we intentionally wrote off or exited.
+                    # TERMINAL_WRITEOFF removes the position locally but leaves it on
+                    # Kalshi (no sell order placed). Without this guard, the sync loop
+                    # would re-add it every 5 minutes, double-counting losses.
+                    if ticker in self._recently_exited:
+                        hours_since = (datetime.utcnow() - self._recently_exited[ticker]).total_seconds() / 3600
+                        if hours_since < 48:  # 48h window covers all realistic settlement delays
+                            print(f"[Sync] Skipping re-add of recently exited position: {ticker[:30]} ({hours_since:.1f}h ago)")
+                            continue
+
                     # Add missing position
                     pos_id = f"pos_kalshi_{ticker[:20]}_{int(datetime.utcnow().timestamp())}"
                     cached_market = self._markets.get(ticker, {})
@@ -1777,9 +1787,20 @@ class KalshiBattleBot:
         # etc.) so they are never crowded out by high-OI macro markets.  Then fill remaining
         # slots with the best non-range short-term and ultra-short markets.
         _RANGE_PREFIXES = ('KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXBCH-')
-        _range_markets = [m for m in short_term + ultra_short
-                          if any(m.get('id','').upper().startswith(p) for p in _RANGE_PREFIXES)]
-        _range_markets = sorted(_range_markets, key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:10]
+        # Cap per-series (top 2 buckets each) so one liquid series cannot crowd out others.
+        # A flat [:10] cap could let KXBTC- fill every slot, blocking DOGE/SOL/XRP/BCH/NASDAQ.
+        _range_by_series: dict[str, list] = {p: [] for p in _RANGE_PREFIXES}
+        for m in short_term + ultra_short:
+            mid = m.get('id', '').upper()
+            for p in _RANGE_PREFIXES:
+                if mid.startswith(p):
+                    _range_by_series[p].append(m)
+                    break
+        _range_markets = []
+        for p in _RANGE_PREFIXES:
+            _top2 = sorted(_range_by_series[p],
+                           key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:2]
+            _range_markets.extend(_top2)
         _range_ids = {m['id'] for m in _range_markets}
         # Exclude range markets from the other buckets to avoid analysing the same market twice
         _short_non_range = [m for m in short_term if m['id'] not in _range_ids]
@@ -1855,13 +1876,22 @@ class KalshiBattleBot:
                     q = m.get('question', '').lower()
                     ticker = m.get('id', '').upper()
 
-                    # Heavily deprioritize intraday crypto price and weather markets:
-                    # Claude has <30% confidence on these, and we're usually at cluster cap.
-                    # Push them to the back of the queue so political/policy markets
-                    # get analyzed first every cycle.
-                    is_crypto_price = any(x in q for x in ['bitcoin price', 'ethereum price', 'btc price', 'eth price', 'bitcoin range', 'btc range']) \
-                        or any(x in ticker for x in ['KXBTC', 'KXETH', 'KXBTCD', 'KXETHD'])
-                    is_weather = any(x in q for x in ['snow', 'temperature', 'high temp', 'high of', 'low of', '°', 'degrees'])
+                    # Deprioritize exact-price crypto ladders and weather (no edge).
+                    # Range series (KXBTC-, KXETH-, etc.) are intentionally NOT deprioritized
+                    # — they have a quant edge and should be analyzed promptly each cycle.
+                    _EXACT_PRICE_TICKERS = ('KXBTCD', 'KXETHD', 'KXBTC15M', 'KXETH15M',
+                                             'KXDOGED', 'KXSOL15M', 'KXXRP15M', 'KXBCH15M')
+                    _RANGE_SERIES = ('KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-',
+                                     'KXSOL-', 'KXXRP-', 'KXBCH-')
+                    _is_range_series = any(ticker.startswith(p) for p in _RANGE_SERIES)
+                    _is_exact_price_ticker = any(ticker.startswith(p) for p in _EXACT_PRICE_TICKERS)
+                    is_crypto_price = not _is_range_series and (
+                        _is_exact_price_ticker
+                        or any(x in q for x in ['bitcoin price', 'ethereum price',
+                                                 'btc price', 'eth price'])
+                    )
+                    is_weather = any(x in q for x in ['snow', 'temperature', 'high temp',
+                                                       'high of', 'low of', '°', 'degrees'])
                     depriority = 10.0 if (is_crypto_price or is_weather) else 0.0
 
                     time_score = min(hours, 168) / 168  # Normalize to 0-1 (cap at 1 week)
@@ -3227,16 +3257,24 @@ class KalshiBattleBot:
                             order_type='limit',
                         )
                         exit_order_id = result.get('order', {}).get('order_id')
-                        print(f"[LIVE SELL] Order placed @ {sell_price_cents}¢ | Order ID: {exit_order_id}")
-                        # Track as pending exit — don't remove position until sell fills
-                        position['pending_exit'] = {
-                            'order_id': exit_order_id,
-                            'exit_price': exit_price,
-                            'reason': reason,
-                            'placed_time': datetime.utcnow().isoformat(),
-                        }
-                        self._save_state()
-                        return  # Wait for fill confirmation before recording exit
+                        if not exit_order_id:
+                            # API accepted the request but returned no order_id.
+                            # Setting pending_exit with None would cause _check_pending_exits
+                            # to skip it forever (it guards on order_id). Fall through to
+                            # immediate removal instead — treat as an immediate write-off.
+                            print(f"[LIVE SELL] Warning: no order_id returned — falling through to immediate removal")
+                        else:
+                            print(f"[LIVE SELL] Order placed @ {sell_price_cents}¢ | Order ID: {exit_order_id}")
+                            # Track as pending exit — don't remove position until sell fills
+                            position['pending_exit'] = {
+                                'order_id': exit_order_id,
+                                'exit_price': exit_price,
+                                'reason': reason,
+                                'placed_time': datetime.utcnow().isoformat(),
+                            }
+                            self._save_state()
+                            return  # Wait for fill confirmation before recording exit
+                        # If we reach here, order_id was None — fall through to position removal
                     
             except Exception as e:
                 print(f"[Order Error] Failed to place sell order on Kalshi: {e}")
@@ -3301,8 +3339,18 @@ class KalshiBattleBot:
                         result = await self._kalshi.get_market(market_id)
                         if result and 'market' in result:
                             updated = parse_kalshi_market(result['market'])
-                            self._markets[market_id] = updated
-                            self._monitored[market_id] = updated
+                            # Merge price fields only — do NOT replace the whole dict.
+                            # parse_kalshi_market does not return hours_to_resolution;
+                            # overwriting wholesale would strip the value computed during
+                            # market scanning and break Kelly horizon / cache TTL logic.
+                            _price_fields = ('yes_price', 'no_price', 'last_price',
+                                             'volume', 'open_interest', 'liquidity')
+                            for _f in _price_fields:
+                                if _f in updated:
+                                    self._markets.setdefault(market_id, {})
+                                    self._markets[market_id][_f] = updated[_f]
+                                    self._monitored.setdefault(market_id, {})
+                                    self._monitored[market_id][_f] = updated[_f]
                             self._price_update_count += 1
                     except:
                         pass
