@@ -47,9 +47,12 @@ class KalshiBattleBot:
         # Config from env - STRICT defaults for profitability
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
-        self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.12)))  # 12% adjusted-edge floor — tighter filter while rebuilding $60 bankroll
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.65))  # 65% confidence — raised from 55%; protect small bankroll with higher bar
-        self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', 25))  # $25 max - bigger bets on better opportunities
+        self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.10)))  # 10% edge floor — measured at fill price (see _analyze_market)
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.65))  # 65% confidence
+        # max_position_size scales with bankroll: default 10% of INITIAL_BANKROLL.
+        # At $1000 bankroll this is $100/bet; set MAX_POSITION_SIZE env var to override.
+        _default_max_pos = float(os.getenv('INITIAL_BANKROLL', 100)) * 0.10
+        self.max_position_size = float(os.getenv('MAX_POSITION_SIZE', _default_max_pos))
         self.max_days_to_resolution = float(os.getenv('MAX_DAYS_TO_RESOLUTION', 30))  # 30 days max — tighter than 45
         self.min_days_to_resolution = float(os.getenv('MIN_DAYS_TO_RESOLUTION', 0))  # No minimum — sports/weather filters handle bad short-horizon bets; BTC range needs access
         self.kelly_fraction = float(os.getenv('FRACTIONAL_KELLY', 0.10))  # 10% Kelly — conservative sizing
@@ -2887,37 +2890,37 @@ class KalshiBattleBot:
             adjusted_prob = signal.raw_prob
             calibration_method = "error"
         
-        # Step 4: Determine trade side and edge using ASK prices (what we actually pay)
-        # We always pay the ask, not the midpoint. Using midpoint overstates edge.
-        # yes_ask = yes_mid + spread/2;  no_ask = no_mid + spread/2
+        # Step 4: Determine trade side and edge using FILL prices (what we actually pay).
+        # Fill price = mid + bid-ask spread/2 + order slippage.
+        # Using mid or even just ask overstates edge — orders fill significantly above ask.
+        # Slippage model must match _enter_position exactly: max(2¢, 3% of mid).
         yes_price = market.get('yes_price', current_price)   # midpoint
         no_price = market.get('no_price', 1 - current_price)
         spread = market.get('spread', 0.02)
         half_spread = spread / 2
 
-        # Ask prices — what we pay to open a position
-        yes_ask = min(0.98, yes_price + half_spread)
-        no_ask  = min(0.98, no_price  + half_spread)
+        # Expected fill prices — ask + realistic slippage (must match _enter_position)
+        _slip = max(0.02, yes_price * 0.03)   # 3% or 2¢ min (matches order placement)
+        yes_fill = min(0.98, yes_price + half_spread + _slip)
+        no_fill  = min(0.98, no_price  + half_spread + _slip)
 
-        if adjusted_prob > yes_ask:
-            # Bet YES: AI thinks YES is more likely than what it costs to buy YES
+        if adjusted_prob > yes_fill:
             side = 'YES'
-            edge = adjusted_prob - yes_ask   # edge at actual fill price
+            edge = adjusted_prob - yes_fill   # true edge at actual fill price
             trade_prob = adjusted_prob
-            trade_price = yes_ask            # Kelly sizes on what we pay
-        elif (1 - adjusted_prob) > no_ask:
-            # Bet NO: AI thinks NO is more likely than what it costs to buy NO
+            trade_price = yes_fill            # Kelly sizes on what we actually pay
+        elif (1 - adjusted_prob) > no_fill:
             side = 'NO'
             no_prob = 1 - adjusted_prob
-            edge = no_prob - no_ask
+            edge = no_prob - no_fill
             trade_prob = no_prob
-            trade_price = no_ask
+            trade_price = no_fill
         else:
-            # No edge at ask prices — midpoint edge exists but spread eats it
+            # No edge even after accounting for fill price
             side = 'YES' if adjusted_prob > yes_price else 'NO'
             edge = 0.0   # forces LOW_EDGE filter below
             trade_prob = adjusted_prob if side == 'YES' else 1 - adjusted_prob
-            trade_price = yes_ask if side == 'YES' else no_ask
+            trade_price = yes_fill if side == 'YES' else no_fill
         
         # Step 5: Apply contrarian edge adjustment
         contrarian_multiplier = 1.0
@@ -3150,9 +3153,12 @@ class KalshiBattleBot:
         pos_id = f"pos_{int(datetime.utcnow().timestamp()*1000)}"
         
         # STRICT LIMITS - prevent runaway orders
-        MAX_CONTRACTS_PER_ORDER = 25  # Max 25 contracts - bigger bets on quality opportunities
-        MIN_PRICE_CENTS = 15  # Don't trade below 15¢ - cheap contracts have 6% win rate
-        MAX_PRICE_CENTS = 95  # Allow up to 95¢ - data shows expensive NO still profitable (+4% ROI)
+        # Contract cap: floor at 200; effectively uncapped since Kelly dollar limit fires first.
+        MAX_CONTRACTS_PER_ORDER = max(200, int(self.max_position_size / 0.10))
+        MIN_PRICE_CENTS = 15   # Don't trade below 15¢ — cheap contracts have low win rate
+        # Cap at 80¢: contracts above 80¢ need >80% accuracy to profit even with small slippage.
+        # e.g., 80¢ YES + 2¢ slippage = 82¢ fill → win $0.18, lose $0.82 → need 82% accuracy.
+        MAX_PRICE_CENTS = 80
         
         # Use the correct price for the side we're trading
         if side.upper() == 'YES':
@@ -3189,9 +3195,12 @@ class KalshiBattleBot:
                     print(f"[Order] Size ${size:.2f} too small for 1 contract at {price_cents}¢")
                     return
 
-                # Use AGGRESSIVE slippage to ensure orders fill quickly
-                # Slippage: 10¢ or 15%, whichever is larger - this ensures fills
-                slippage_cents = max(10, int(price_cents * 0.15))
+                # Slippage: 2¢ minimum or 3% of mid price — must match the fill-price
+                # estimate used in the edge gate (_analyze_market step 4).
+                # Old 15% / 10¢ minimum was destroying edge: a 50¢ contract filled at
+                # 60¢, requiring 60%+ accuracy just to break even. At 3%, a 50¢ contract
+                # fills at ~52¢, requiring only 52%+ accuracy — leaving real profit margin.
+                slippage_cents = max(2, int(price_cents * 0.03))
                 order_price_cents = min(price_cents + slippage_cents, 95)
 
                 # Recompute contracts at the actual order price (not midpoint) so the
