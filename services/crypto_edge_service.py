@@ -1,0 +1,387 @@
+"""CryptoEdgeService: Quantitative edge calculator for crypto range bucket markets.
+
+Instead of asking Claude to guess which $3,000 BTC price bucket wins,
+this service uses actual derivatives market data to compute the true
+log-normal probability that price lands in the Kalshi range.
+
+Data sources (both free, no API key required):
+  - Deribit DVOL index (BTC/ETH implied vol): https://www.deribit.com/api/v2/public
+  - Binance spot price + realized vol fallback: https://api.binance.com/api/v3
+
+Edge formula:
+  edge = lognormal_range_prob(spot, low, high, iv, T) - kalshi_price
+"""
+
+import asyncio
+import math
+import re
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import httpx
+from loguru import logger
+
+
+# ---------------------------------------------------------------------------
+# Result model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CryptoEdgeResult:
+    """Quantitative analysis result for a crypto range market."""
+    asset: str             # 'BTC', 'ETH', 'SOL', 'DOGE'
+    spot_price: float      # Current spot price
+    range_low: float       # Range lower bound
+    range_high: float      # Range upper bound
+    implied_vol: float     # Annualized implied vol (e.g. 0.65 = 65%)
+    hours_to_expiry: float # Time to resolution in hours
+    quant_prob: float      # Log-normal P(price lands in range)
+    kalshi_price: float    # Current Kalshi market price for this side
+    edge: float            # quant_prob - kalshi_price
+    context_summary: str   # Human-readable block for Claude prompt injection
+    vol_source: str        # 'deribit_dvol', 'realized_7d', or 'historical_default'
+
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+
+class CryptoEdgeService:
+    """Quantitative probability engine for crypto range bucket markets.
+
+    Usage:
+        service = CryptoEdgeService()
+        result = await service.evaluate_range_market(ticker, question, price, hours)
+        if result and result.edge >= MIN_EDGE:
+            # pass result.context_summary to Claude
+    """
+
+    DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
+    BINANCE_BASE = "https://api.binance.com/api/v3"
+
+    # Default annualized vol by asset when all APIs fail
+    _VOL_DEFAULTS = {
+        'BTC':    0.70,
+        'ETH':    0.90,
+        'SOL':    1.20,
+        'DOGE':   1.60,
+    }
+
+    def __init__(self) -> None:
+        self._client: Optional[httpx.AsyncClient] = None
+        # {asset: (fetched_at_ts, vol, vol_source)}
+        self._vol_cache: dict[str, tuple[float, float, str]] = {}
+        # {asset: (fetched_at_ts, price)}
+        self._price_cache: dict[str, tuple[float, float]] = {}
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=8.0)
+        return self._client
+
+    async def close(self) -> None:
+        """Shut down the underlying HTTP client."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+
+    # ------------------------------------------------------------------
+    # Spot price
+    # ------------------------------------------------------------------
+
+    async def get_spot_price(self, asset: str) -> Optional[float]:
+        """Fetch current spot price from Binance (30-second cache)."""
+        now = time.time()
+        cached = self._price_cache.get(asset)
+        if cached and now - cached[0] < 30:
+            return cached[1]
+
+        symbol = f"{asset}USDT"
+        try:
+            client = await self._get_client()
+            r = await client.get(
+                f"{self.BINANCE_BASE}/ticker/price",
+                params={"symbol": symbol},
+            )
+            r.raise_for_status()
+            price = float(r.json()["price"])
+            self._price_cache[asset] = (now, price)
+            return price
+        except Exception as exc:
+            logger.warning(f"[CryptoEdge] Binance price fetch failed for {asset}: {exc}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Implied volatility
+    # ------------------------------------------------------------------
+
+    async def get_implied_vol(self, asset: str) -> tuple[float, str]:
+        """Get annualized implied vol (5-minute cache).
+
+        Priority: Deribit DVOL → 7-day realized vol from Binance → hard default.
+        Returns (vol, source_label).
+        """
+        now = time.time()
+        cached = self._vol_cache.get(asset)
+        if cached and now - cached[0] < 300:
+            return cached[1], cached[2]
+
+        # 1. Deribit DVOL (only available for BTC and ETH)
+        if asset in ('BTC', 'ETH'):
+            try:
+                vol, src = await self._fetch_deribit_dvol(asset)
+                if vol:
+                    self._vol_cache[asset] = (now, vol, src)
+                    return vol, src
+            except Exception as exc:
+                logger.warning(f"[CryptoEdge] Deribit DVOL failed for {asset}: {exc}")
+
+        # 2. Realized vol from Binance hourly klines
+        try:
+            vol, src = await self._fetch_realized_vol(asset)
+            if vol:
+                self._vol_cache[asset] = (now, vol, src)
+                return vol, src
+        except Exception as exc:
+            logger.warning(f"[CryptoEdge] Realized vol fallback failed for {asset}: {exc}")
+
+        # 3. Hard default
+        vol = self._VOL_DEFAULTS.get(asset, 0.80)
+        src = 'historical_default'
+        self._vol_cache[asset] = (now, vol, src)
+        return vol, src
+
+    async def _fetch_deribit_dvol(self, asset: str) -> tuple[Optional[float], str]:
+        """Fetch the Deribit DVOL implied-vol index (annualized %)."""
+        end_ts = int(time.time() * 1000)
+        start_ts = end_ts - 3_600_000  # 1 hour back
+
+        client = await self._get_client()
+        r = await client.get(
+            f"{self.DERIBIT_BASE}/get_volatility_index_data",
+            params={
+                "currency": asset,
+                "resolution": 3600,
+                "start_timestamp": start_ts,
+                "end_timestamp": end_ts,
+            },
+        )
+        r.raise_for_status()
+        ticks = r.json().get("result", {}).get("data", [])
+        if not ticks:
+            return None, ""
+
+        # Each tick: [timestamp_ms, open, high, low, close]
+        # DVOL is in percentage points (e.g. 65.3 = 65.3%), convert to decimal
+        dvol_close = ticks[-1][4]
+        vol = dvol_close / 100.0
+        return vol, "deribit_dvol"
+
+    async def _fetch_realized_vol(self, asset: str) -> tuple[Optional[float], str]:
+        """Compute 7-day realized vol from Binance hourly klines (annualized)."""
+        symbol = f"{asset}USDT"
+        client = await self._get_client()
+        r = await client.get(
+            f"{self.BINANCE_BASE}/klines",
+            params={"symbol": symbol, "interval": "1h", "limit": 168},  # 7d × 24h
+        )
+        r.raise_for_status()
+        klines = r.json()
+        if len(klines) < 24:
+            return None, ""
+
+        closes = [float(k[4]) for k in klines]
+        log_returns = [
+            math.log(closes[i + 1] / closes[i])
+            for i in range(len(closes) - 1)
+        ]
+        hourly_std = math.sqrt(sum(r ** 2 for r in log_returns) / len(log_returns))
+        annualized_vol = hourly_std * math.sqrt(8760)
+        return annualized_vol, "realized_7d"
+
+    # ------------------------------------------------------------------
+    # Range parsing
+    # ------------------------------------------------------------------
+
+    def parse_range_from_ticker(self, ticker: str) -> Optional[tuple[float, float]]:
+        """Extract (low, high) from Kalshi ticker like KXBTC-26MAR06-B95000T96000."""
+        up = ticker.upper()
+        m = re.search(r"-B(\d+)T(\d+)", up)
+        if m:
+            return float(m.group(1)), float(m.group(2))
+        # Reverse order guard (shouldn't happen but be safe)
+        m = re.search(r"-T(\d+)B(\d+)", up)
+        if m:
+            lo, hi = float(m.group(2)), float(m.group(1))
+            return (min(lo, hi), max(lo, hi))
+        return None
+
+    def parse_range_from_question(self, question: str) -> Optional[tuple[float, float]]:
+        """Extract (low, high) from text like 'between $95,000 and $96,000'."""
+        nums_raw = re.findall(r"\$[\d,]+(?:\.\d+)?", question)
+        parsed: list[float] = []
+        for n in nums_raw:
+            try:
+                parsed.append(float(n.replace("$", "").replace(",", "")))
+            except ValueError:
+                pass
+        if len(parsed) >= 2:
+            a, b = parsed[0], parsed[1]
+            return min(a, b), max(a, b)
+        return None
+
+    def detect_asset(self, ticker: str, question: str) -> Optional[str]:
+        """Detect the underlying crypto asset. Returns None for NASDAQ (different model)."""
+        up = ticker.upper()
+        ql = question.lower()
+        if up.startswith("KXNASDAQ") or "nasdaq" in ql:
+            return None  # NASDAQ range: equity index, skip quant model for now
+        if up.startswith("KXBTC") or "bitcoin" in ql or " btc " in ql:
+            return "BTC"
+        if up.startswith("KXETH") or "ethereum" in ql or " eth " in ql:
+            return "ETH"
+        if up.startswith("KXSOL") or "solana" in ql or " sol " in ql:
+            return "SOL"
+        if up.startswith("KXDOGE") or "dogecoin" in ql or " doge " in ql:
+            return "DOGE"
+        if up.startswith("KXXRP") or "ripple" in ql or " xrp " in ql:
+            return "ETH"  # XRP: use ETH vol as proxy (similar risk profile)
+        return "BTC"  # safe default for unknown crypto range
+
+    # ------------------------------------------------------------------
+    # Core math: log-normal range probability
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ncdf(x: float) -> float:
+        """Standard normal CDF via math.erf (no scipy required)."""
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    def lognormal_range_prob(
+        self,
+        spot: float,
+        low: float,
+        high: float,
+        vol: float,
+        hours_to_expiry: float,
+    ) -> float:
+        """P(low ≤ S_T ≤ high) under log-normal price model.
+
+        Uses the Black-Scholes digital range formula:
+            P = N(d_high) - N(d_low)
+        where d = [ln(K/S0) - (σ²/2)*T] / (σ*√T)
+        and N is the standard normal CDF.
+        """
+        if hours_to_expiry <= 0 or vol <= 0 or spot <= 0 or low >= high:
+            return 0.5
+
+        T = max(hours_to_expiry, 0.5) / 8760.0  # annualize; floor at 30min
+        sigma_sqrt_T = vol * math.sqrt(T)
+        drift = -0.5 * vol ** 2 * T  # risk-neutral log drift
+
+        def d(K: float) -> float:
+            return (math.log(K / spot) - drift) / sigma_sqrt_T
+
+        prob = self._ncdf(-d(high)) - self._ncdf(-d(low))
+        return max(0.0, min(1.0, prob))
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    async def evaluate_range_market(
+        self,
+        ticker: str,
+        question: str,
+        kalshi_price: float,
+        hours_to_expiry: float,
+    ) -> Optional[CryptoEdgeResult]:
+        """Full pipeline: parse range → fetch spot + vol → compute edge.
+
+        Returns None if the market cannot be evaluated (unknown asset,
+        unparseable range, or data fetch failure).
+        """
+        # 1. Detect asset
+        asset = self.detect_asset(ticker, question)
+        if asset is None:
+            return None  # NASDAQ: skip quant model
+
+        # 2. Parse price range
+        bounds = self.parse_range_from_ticker(ticker) or self.parse_range_from_question(question)
+        if not bounds:
+            logger.warning(
+                f"[CryptoEdge] Cannot parse range from ticker={ticker!r} "
+                f"question={question[:50]!r}"
+            )
+            return None
+        range_low, range_high = bounds
+
+        # 3. Fetch spot price and implied vol concurrently
+        spot_task = asyncio.create_task(self.get_spot_price(asset))
+        vol_task  = asyncio.create_task(self.get_implied_vol(asset))
+        spot = await spot_task
+        vol, vol_src = await vol_task
+
+        if spot is None:
+            logger.warning(f"[CryptoEdge] Could not fetch {asset} spot price — skipping")
+            return None
+
+        # 4. Compute log-normal probability and edge
+        prob = self.lognormal_range_prob(spot, range_low, range_high, vol, hours_to_expiry)
+        edge = prob - kalshi_price
+
+        # 5. Build human-readable context block for Claude
+        range_width_pct = (range_high - range_low) / spot * 100
+        spot_in_range   = range_low <= spot <= range_high
+        if range_high > range_low:
+            pct_from_low = (spot - range_low) / (range_high - range_low) * 100
+        else:
+            pct_from_low = 50.0
+
+        lines = [
+            f"QUANTITATIVE RANGE ANALYSIS ({asset}):",
+            f"  Current {asset} spot price : ${spot:,.0f}",
+            f"  Kalshi range               : ${range_low:,.0f} – ${range_high:,.0f}  "
+            f"(width {range_width_pct:.1f}% of spot)",
+        ]
+        if spot_in_range:
+            lines.append(
+                f"  Spot position              : INSIDE range "
+                f"({pct_from_low:.0f}% from lower bound)"
+            )
+        else:
+            dist = min(abs(spot - range_low), abs(spot - range_high))
+            lines.append(
+                f"  Spot position              : OUTSIDE range "
+                f"(${dist:,.0f} from nearest boundary)"
+            )
+        lines += [
+            f"  Implied vol (annualized)   : {vol * 100:.0f}%  [{vol_src}]",
+            f"  Hours to expiry            : {hours_to_expiry:.1f}h",
+            f"  Log-normal P(in range)     : {prob:.1%}",
+            f"  Kalshi market price        : {kalshi_price:.1%}",
+            f"  Quant edge                 : {edge:+.1%}",
+        ]
+
+        if edge >= 0.10:
+            lines.append("  Signal: QUANT CONFIRMS EDGE — log-normal probability exceeds market price.")
+        elif edge >= 0:
+            lines.append("  Signal: SLIGHT QUANT EDGE — proceed with caution.")
+        else:
+            lines.append("  Signal: QUANT SEES NO EDGE — market price exceeds log-normal probability.")
+
+        context_summary = "\n".join(lines)
+
+        return CryptoEdgeResult(
+            asset=asset,
+            spot_price=spot,
+            range_low=range_low,
+            range_high=range_high,
+            implied_vol=vol,
+            hours_to_expiry=hours_to_expiry,
+            quant_prob=prob,
+            kalshi_price=kalshi_price,
+            edge=edge,
+            context_summary=context_summary,
+            vol_source=vol_src,
+        )

@@ -25,6 +25,7 @@ from logic.risk_engine import RiskEngine, RiskLimits
 from data.database import TelemetryDB
 from services.kalshi_client import KalshiClient, parse_kalshi_market
 from services.market_intelligence import get_intelligence_service, MarketIntelligence
+from services.crypto_edge_service import CryptoEdgeService, CryptoEdgeResult
 
 load_dotenv()
 
@@ -57,6 +58,9 @@ class KalshiBattleBot:
         # Kalshi client
         use_demo = os.getenv('KALSHI_USE_DEMO', 'false').lower() == 'true'
         self._kalshi = KalshiClient(use_demo=use_demo)
+
+        # Quantitative edge engine for crypto range markets
+        self._crypto_edge = CryptoEdgeService()
         
         # Market data
         self._markets: dict[str, dict] = {}
@@ -2311,7 +2315,52 @@ class KalshiBattleBot:
                 f"This could be an overreaction - consider if the move is justified."
             )
         
-        # Step 2: Get historical performance for learning
+        # Step 2a: Quantitative edge check for crypto range markets
+        # For KXBTC-/KXETH- etc., compute log-normal probability from Deribit IV + Binance spot
+        # before spending a Claude API call. If quant model sees no edge, skip immediately.
+        _ticker_upper_q = market_id.upper()
+        _RANGE_PREFIXES_Q = ('KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-')
+        _is_crypto_range_q = any(_ticker_upper_q.startswith(p) for p in _RANGE_PREFIXES_Q)
+        _quant_result: CryptoEdgeResult = None
+        _quant_override_prob: float = None
+
+        if _is_crypto_range_q:
+            try:
+                hours_to_res = market.get('hours_to_resolution') or 24.0
+                _quant_result = await self._crypto_edge.evaluate_range_market(
+                    ticker=market_id,
+                    question=market.get('question', ''),
+                    kalshi_price=current_price,
+                    hours_to_expiry=float(hours_to_res),
+                )
+                if _quant_result:
+                    print(
+                        f"[QuantEdge] {market_id[:30]} | "
+                        f"spot=${_quant_result.spot_price:,.0f} "
+                        f"range=[{_quant_result.range_low:,.0f},{_quant_result.range_high:,.0f}] "
+                        f"iv={_quant_result.implied_vol*100:.0f}% "
+                        f"prob={_quant_result.quant_prob:.1%} "
+                        f"kalshi={_quant_result.kalshi_price:.1%} "
+                        f"edge={_quant_result.edge:+.1%} "
+                        f"[{_quant_result.vol_source}]"
+                    )
+                    # Gate: if quant model sees no edge, skip Claude call entirely
+                    QUANT_MIN_EDGE = float(os.getenv('CRYPTO_QUANT_MIN_EDGE', str(self.min_edge)))
+                    if _quant_result.edge < QUANT_MIN_EDGE:
+                        reason = f"QUANT_NO_EDGE_{_quant_result.edge*100:+.0f}pct"
+                        self._log_filter(market_id, market.get('question', ''), reason, current_price)
+                        print(
+                            f"[QuantEdge] SKIP — quant edge {_quant_result.edge:+.1%} < "
+                            f"threshold {QUANT_MIN_EDGE:.1%}"
+                        )
+                        return
+                    # Pass quant probability to Claude as the ground-truth anchor
+                    _quant_override_prob = _quant_result.quant_prob
+            except Exception as _qe:
+                print(f"[QuantEdge] Evaluation error (non-fatal): {_qe}")
+                _quant_result = None
+
+        # Step 2b: Get historical performance for learning
         historical = self._get_historical_performance()
 
         # Step 3: Get AI signal — use probability cache if price is stable (saves API credits)
@@ -2361,6 +2410,16 @@ class KalshiBattleBot:
                     except Exception:
                         pass
 
+                # Merge quant context with news intel for Claude prompt
+                _news_summary_for_claude = intel.news_summary if intel else None
+                if _quant_result:
+                    quant_block = _quant_result.context_summary
+                    _news_summary_for_claude = (
+                        quant_block + "\n\n" + _news_summary_for_claude
+                        if _news_summary_for_claude
+                        else quant_block
+                    )
+
                 result = await self._ai_generator.generate_signal(
                     market_question=market.get('question', ''),
                     current_price=current_price,
@@ -2369,8 +2428,8 @@ class KalshiBattleBot:
                     resolution_date=_res_date,
                     volume_24h=market.get('volume_24h', 0),
                     category=market.get('category'),
-                    # Intelligence data
-                    news_summary=intel.news_summary if intel else None,
+                    # Intelligence data (includes quant context for range markets)
+                    news_summary=_news_summary_for_claude,
                     domain_summary=intel.domain_summary if intel else None,
                     recent_price_change=intel.recent_price_change if intel else 0.0,
                     overreaction_info=overreaction_info,
@@ -2401,6 +2460,29 @@ class KalshiBattleBot:
                 # Extract signal data from result
                 signal = result.signal
                 self._ai_successes += 1
+
+                # For crypto range markets: anchor Claude's raw_prob to quant model
+                # The quant probability is grounded in actual vol/spot data.
+                # We blend: 70% quant + 30% Claude to incorporate any news signal
+                # Claude picked up, while keeping the math-based estimate dominant.
+                if _quant_result and _quant_override_prob is not None:
+                    blended_prob = 0.70 * _quant_override_prob + 0.30 * signal.raw_prob
+                    print(
+                        f"[QuantEdge] Blending prob: quant={_quant_override_prob:.1%} "
+                        f"claude={signal.raw_prob:.1%} → blended={blended_prob:.1%}"
+                    )
+                    signal = signal.__class__(
+                        raw_prob=blended_prob,
+                        confidence=signal.confidence,
+                        key_reasons=signal.key_reasons,
+                        disconfirming_evidence=signal.disconfirming_evidence,
+                        what_would_change_mind=signal.what_would_change_mind,
+                        timeline_sensitivity=signal.timeline_sensitivity,
+                        failure_modes=signal.failure_modes,
+                        base_rate_considered=signal.base_rate_considered,
+                        information_quality=signal.information_quality,
+                    )
+
                 # Store in probability cache for reuse when price is stable
                 self._prob_cache[market_id] = (datetime.utcnow(), current_price, signal.raw_prob, signal.confidence)
                 # Record prediction for future calibration learning
