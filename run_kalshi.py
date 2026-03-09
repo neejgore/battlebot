@@ -3158,7 +3158,8 @@ class KalshiBattleBot:
         # STRICT LIMITS - prevent runaway orders
         # Contract cap: floor at 200; effectively uncapped since Kelly dollar limit fires first.
         MAX_CONTRACTS_PER_ORDER = max(200, int(self.max_position_size / 0.10))
-        MIN_PRICE_CENTS = 15   # Don't trade below 15¢ — cheap contracts have low win rate
+        MIN_PRICE_CENTS = 10   # Floor at 10¢ — quant-validated range bets at 10-14¢ have excellent
+                               # win/loss math (25:1 ratio) and the $8 crypto range cap limits downside
         # Cap at 50¢: at 51% historical hit rate, break-even requires entry < 51¢.
         # At 50¢: win=$0.50, lose=$0.50 → break-even at 50%. At 40¢: win=$0.60, lose=$0.40 → 
         # break-even at 40% — the lower the entry price, the better the win/loss ratio.
