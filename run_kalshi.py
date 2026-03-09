@@ -3122,8 +3122,10 @@ class KalshiBattleBot:
                     position_size = max_size_by_liquidity
 
             # CRYPTO RANGE CAP: BTC/ETH/SOL/XRP range bucket markets are high-variance.
-            # Cap is set at 2.5% of bankroll (e.g. $25 at $1000) so one bad bet can't
-            # erase a full day of wins. Overridable via CRYPTO_RANGE_MAX_SIZE env var.
+            # Historical data: a single bad range bet ($14.88) wiped out 6 consecutive
+            # wins (+$10.25). Cap is kept at $8 regardless of bankroll size — range bets
+            # are inherently uncertain (the quant model can be wrong) and should never
+            # be large enough to wipe a full day of wins. Overridable via env var.
             _market_id_upper = market_id.upper()
             _RANGE_PREFIXES = ('KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXBCH-')
             _is_range_market = any(_market_id_upper.startswith(p) for p in _RANGE_PREFIXES)
@@ -3131,8 +3133,7 @@ class KalshiBattleBot:
             _is_range_question = any(x in _q_lower_range for x in
                                      ['bitcoin price range', 'ethereum price range', 'btc price range',
                                       'eth price range', 'solana price range', 'nasdaq price range'])
-            _default_range_max = max(8.0, self.initial_bankroll * 0.025)  # 2.5% of bankroll, min $8
-            CRYPTO_RANGE_MAX = float(os.getenv('CRYPTO_RANGE_MAX_SIZE', str(_default_range_max)))
+            CRYPTO_RANGE_MAX = float(os.getenv('CRYPTO_RANGE_MAX_SIZE', '8.0'))
             if (_is_range_market or _is_range_question) and position_size > CRYPTO_RANGE_MAX:
                 print(f"[Crypto Range Cap] ${position_size:.2f} → ${CRYPTO_RANGE_MAX:.2f} (range market size limit)")
                 position_size = CRYPTO_RANGE_MAX
