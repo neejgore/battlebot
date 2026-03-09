@@ -94,7 +94,7 @@ class KalshiBattleBot:
         # Actual Kalshi values from API (synced every 5 min)
         self._kalshi_cash = None       # Available cash
         self._kalshi_portfolio = None  # Current positions value
-        self._kalshi_total = None      # Total portfolio value
+        self._kalshi_total = None      # Total portfolio value (market value: cash + positions at current prices)
         self._kalshi_positions_raw: list = []   # Raw positions from last sync (used by performance endpoint)
         self._settlements_cache: dict | None = None      # Cached settlements response
         self._settlements_cache_time: datetime | None = None  # When cache was populated
@@ -960,15 +960,9 @@ class KalshiBattleBot:
                     if kp.get('position', 0) != 0
                 )
                 self._kalshi_portfolio = _portfolio_exposure_cents / 100
-                self._kalshi_total = self._kalshi_cash + self._kalshi_portfolio
-                print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, "
-                      f"Positions(cost)=${self._kalshi_portfolio:.2f}, "
-                      f"Total=${self._kalshi_total:.2f}")
-                # For daily P&L tracking, compute market value (not cost basis) using the
-                # bot's price cache — the same formula used by _handle_performance. This
-                # ensures start_of_day_value and current account_value are always on the
-                # same footing, so "today's P&L" reflects real daily movement, not just
-                # unrealized entry gains.
+                # Compute market value of positions at current cached prices — this is the
+                # canonical account value used by all dashboard sections and the graph.
+                # _kalshi_portfolio is cost basis (for "capital at risk" context only).
                 _market_value = 0.0
                 for kp in kalshi_positions:
                     _contracts = kp.get('position', 0)
@@ -987,7 +981,14 @@ class KalshiBattleBot:
                         _exposure = abs(kp.get('market_exposure', 0)) / 100
                         _price = (_exposure / _contracts) if _contracts > 0 else 0.5
                     _market_value += _contracts * _price
-                _account_for_snapshot = self._kalshi_cash + _market_value
+                # _kalshi_total = market value (cash + what positions are worth NOW)
+                # This is the single source of truth for all 3 dashboard displays.
+                self._kalshi_total = self._kalshi_cash + _market_value
+                _account_for_snapshot = self._kalshi_total
+                print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, "
+                      f"Positions(cost)=${self._kalshi_portfolio:.2f}, "
+                      f"Positions(mkt)=${_market_value:.2f}, "
+                      f"Total(mkt)=${self._kalshi_total:.2f}")
                 await self._save_daily_snapshot(_account_for_snapshot, self._kalshi_cash, _market_value)
 
                 # Sync the risk engine with current market value (not cost basis) so the
