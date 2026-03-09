@@ -176,8 +176,6 @@ class KalshiWebSocketClient:
 
     def remove_ticker_callback(self, cb: TickerCallback) -> None:
         """Remove a previously registered ticker callback."""
-        self._ticker_callbacks.discard(cb) if hasattr(
-            self._ticker_callbacks, 'discard') else None
         try:
             self._ticker_callbacks.remove(cb)
         except ValueError:

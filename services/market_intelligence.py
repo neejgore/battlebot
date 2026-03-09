@@ -378,6 +378,16 @@ class NewsService:
                     
                     self._brave_searches += 1
                     logger.info(f"[Brave] Fetched {len(news_items)} items for '{query[:40]}' (total: {self._brave_searches})")
+                elif response.status_code == 402:
+                    # 402 = monthly usage limit exhausted.  Disable Brave for the rest
+                    # of this process lifetime so we stop hammering a dead endpoint on
+                    # every news fetch.  fetch_news() checks self._brave_api_key before
+                    # calling _fetch_brave, so setting it to None is sufficient.
+                    logger.critical(
+                        "[Brave] 402 Usage limit exceeded — disabling Brave for this session. "
+                        "Top up your plan at https://brave.com/search/api/ to re-enable."
+                    )
+                    self._brave_api_key = None
                 elif response.status_code == 429:
                     logger.warning("[Brave] Rate limited - falling back to Google News")
                 elif response.status_code == 401:

@@ -8,8 +8,10 @@ Tests cover:
 - Exit conditions
 """
 
-import pytest
 import asyncio
+from functools import wraps
+
+import pytest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,6 +19,14 @@ from data.models import Market, MarketOutcome, Position
 from logic.strategy_v2 import StrategyConfig, MarketState, StrategyV2
 from logic.risk_engine import RiskEngine, RiskLimits, calculate_kelly_size
 from logic.calibration import CalibrationEngine
+
+
+def async_test(coro):
+    """Run an async test synchronously."""
+    @wraps(coro)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(coro(*args, **kwargs))
+    return wrapper
 
 
 # ============================================================================
@@ -213,15 +223,20 @@ class TestEdgeGating:
     def test_edge_throttle_calculation(self, risk_limits):
         """Edge throttle should scale position size."""
         engine = RiskEngine(initial_bankroll=1000.0, limits=risk_limits)
-        
-        # At minimum edge, throttle should be low
+
+        # At exactly min_edge, throttle is 0 (edge <= min_edge guard)
         min_edge_throttle = engine._compute_edge_throttle(risk_limits.min_edge)
-        assert min_edge_throttle == risk_limits.min_edge / risk_limits.edge_scale
-        
+        assert min_edge_throttle == 0.0
+
+        # Just above min_edge, throttle is linear
+        just_above = risk_limits.min_edge + 0.001
+        throttle_above = engine._compute_edge_throttle(just_above)
+        assert throttle_above == pytest.approx(just_above / risk_limits.edge_scale, rel=0.01)
+
         # At edge_scale, throttle should be 1.0
         full_throttle = engine._compute_edge_throttle(risk_limits.edge_scale)
         assert full_throttle == 1.0
-        
+
         # Above edge_scale, throttle should still be 1.0 (capped)
         high_edge_throttle = engine._compute_edge_throttle(0.20)
         assert high_edge_throttle == 1.0
@@ -325,7 +340,7 @@ class TestKellySizing:
 class TestPositionCaps:
     """Tests for position size caps in risk engine."""
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_max_position_size_cap(self, risk_engine):
         """Position size should be capped at max_position_size."""
         size = await risk_engine.calculate_position_size(
@@ -338,7 +353,7 @@ class TestPositionCaps:
         
         assert size <= risk_engine.limits.max_position_size
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_per_market_cap(self, risk_engine):
         """Position size should respect per-market cap."""
         max_per_market = risk_engine.bankroll * risk_engine.limits.max_percent_bankroll_per_market
@@ -353,7 +368,7 @@ class TestPositionCaps:
         
         assert size <= max_per_market
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_global_exposure_cap(self, risk_engine):
         """Global exposure limit should be respected."""
         # Add some existing positions
@@ -384,22 +399,16 @@ class TestPositionCaps:
         
         assert size <= max_additional or size == 0
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_max_positions_limit(self, risk_engine):
         """Should reject when max positions reached."""
-        # Add max positions
-        for i in range(risk_engine.limits.max_positions):
-            pos = Position(
-                token_id=f"TOKEN{i}",
-                condition_id=f"COND{i}",
-                outcome=MarketOutcome.YES,
-                size=1.0,
-                avg_entry_price=0.50,
-                current_price=0.50,
-            )
-            await risk_engine.add_position(pos, entry_edge=0.05, entry_confidence=0.7)
-        
-        # Try to add one more
+        # Simulate max positions via sync_open_exposure (how the bot tracks positions)
+        risk_engine.sync_open_exposure(
+            total_open_cost=0.0,
+            position_count=risk_engine.limits.max_positions,
+        )
+
+        # Try to size a new position — should return 0
         size = await risk_engine.calculate_position_size(
             adjusted_prob=0.60,
             market_price=0.50,
@@ -407,7 +416,7 @@ class TestPositionCaps:
             confidence=0.8,
             market_id="NEW",
         )
-        
+
         assert size == 0.0
 
 
@@ -418,7 +427,7 @@ class TestPositionCaps:
 class TestExitConditions:
     """Tests for position exit conditions."""
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_profit_take_trigger(self, risk_engine):
         """Profit take should trigger at threshold."""
         pos = Position(
@@ -443,7 +452,7 @@ class TestExitConditions:
         assert should_exit
         assert reason == "PROFIT_TAKE"
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_stop_loss_trigger(self, risk_engine):
         """Stop loss should trigger at threshold."""
         pos = Position(
@@ -468,7 +477,7 @@ class TestExitConditions:
         assert should_exit
         assert reason == "STOP_LOSS"
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_no_exit_within_bounds(self, risk_engine):
         """Position within bounds should not trigger exit."""
         pos = Position(
@@ -499,7 +508,7 @@ class TestExitConditions:
 class TestKillSwitch:
     """Tests for 15% daily drawdown kill switch."""
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_kill_switch_triggers_at_threshold(self, risk_engine):
         """Kill switch should trigger at 15% drawdown."""
         # Record loss that exceeds 15%
@@ -510,7 +519,7 @@ class TestKillSwitch:
         assert risk_engine.daily_stats.kill_switch_triggered
         assert not risk_engine.is_trading_allowed
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_trading_halted_after_kill_switch(self, risk_engine):
         """No trading should be allowed after kill switch."""
         # Trigger kill switch
@@ -528,7 +537,7 @@ class TestKillSwitch:
         
         assert size == 0.0
     
-    @pytest.mark.asyncio
+    @async_test
     async def test_no_trigger_below_threshold(self, risk_engine):
         """Kill switch should not trigger below threshold."""
         # Record loss just under 15%

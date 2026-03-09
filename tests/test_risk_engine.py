@@ -1,8 +1,19 @@
 """Tests for the Risk Engine and Kelly Criterion calculations."""
 
+import asyncio
+from functools import wraps
+
 import pytest
-from logic.risk_engine import calculate_kelly_size, RiskEngine
+from logic.risk_engine import calculate_kelly_size, RiskEngine, RiskLimits
 from data.models import TradeSignal, OrderSide
+
+
+def async_test(coro):
+    """Run an async test synchronously."""
+    @wraps(coro)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(coro(*args, **kwargs))
+    return wrapper
 
 
 class TestKellyCriterion:
@@ -116,71 +127,79 @@ class TestRiskEngine:
         return RiskEngine(
             initial_bankroll=1000.0,
             fractional_kelly=0.1,
-            max_position_size=50.0,
+            limits=RiskLimits(
+                max_position_size=50.0,
+                max_daily_drawdown=0.15,
+            ),
         )
 
     def test_initialization(self, risk_engine):
         """RiskEngine should initialize with correct values."""
         assert risk_engine.bankroll == 1000.0
         assert risk_engine.fractional_kelly == 0.1
-        assert risk_engine.max_position_size == 50.0
+        assert risk_engine.limits.max_position_size == 50.0
         assert risk_engine.is_trading_allowed is True
 
     def test_kill_switch_not_triggered_initially(self, risk_engine):
         """Kill switch should not be triggered on init."""
         assert risk_engine.daily_stats.kill_switch_triggered is False
 
-    @pytest.mark.asyncio
+    @async_test
     async def test_record_trade_updates_stats(self, risk_engine):
         """Recording a trade should update daily stats."""
         await risk_engine.record_trade_result(pnl=50.0)
-        
+
         assert risk_engine.daily_stats.realized_pnl == 50.0
         assert risk_engine.daily_stats.trades_count == 1
         assert risk_engine.daily_stats.winning_trades == 1
         assert risk_engine.bankroll == 1050.0
 
-    @pytest.mark.asyncio
+    @async_test
     async def test_kill_switch_triggers_on_large_loss(self, risk_engine):
         """Kill switch should trigger when drawdown exceeds 15%."""
-        # Lose more than 15% of starting bankroll
         await risk_engine.record_trade_result(pnl=-160.0)  # 16% loss
-        
+
         assert risk_engine.daily_stats.kill_switch_triggered is True
         assert risk_engine.is_trading_allowed is False
 
-    @pytest.mark.asyncio
+    @async_test
     async def test_validate_trade_passes_for_valid_trade(self, risk_engine):
         """Valid trades should pass validation."""
-        is_valid, reason = await risk_engine.validate_trade(size=25.0, price=0.50)
-        
-        assert is_valid is True
-        assert reason == "Trade validated"
+        is_valid, reasons = await risk_engine.validate_trade(
+            size=25.0, price=0.50, token_id='test-market'
+        )
 
-    @pytest.mark.asyncio
+        assert is_valid is True
+        assert reasons == []
+
+    @async_test
     async def test_validate_trade_fails_when_size_exceeds_max(self, risk_engine):
         """Trades exceeding max position should fail validation."""
-        is_valid, reason = await risk_engine.validate_trade(size=100.0, price=0.50)
-        
-        assert is_valid is False
-        assert "exceeds max" in reason
+        is_valid, reasons = await risk_engine.validate_trade(
+            size=100.0, price=0.50, token_id='test-market'
+        )
 
-    @pytest.mark.asyncio
+        assert is_valid is False
+        assert any('MAX_POSITION' in r or 'EXCEEDS' in r for r in reasons)
+
+    @async_test
     async def test_validate_trade_fails_when_kill_switch_triggered(self, risk_engine):
         """Trades should fail when kill switch is triggered."""
         risk_engine.daily_stats.kill_switch_triggered = True
-        
-        is_valid, reason = await risk_engine.validate_trade(size=25.0, price=0.50)
-        
-        assert is_valid is False
-        assert "Kill switch" in reason
 
-    @pytest.mark.asyncio
+        is_valid, reasons = await risk_engine.validate_trade(
+            size=25.0, price=0.50, token_id='test-market'
+        )
+
+        assert is_valid is False
+        assert any('KILL_SWITCH' in r for r in reasons)
+
+    @async_test
     async def test_daily_stats_reset(self, risk_engine):
         """Daily stats should reset correctly."""
         await risk_engine.record_trade_result(pnl=-50.0)
         await risk_engine.reset_daily_stats()
-        
+
         assert risk_engine.daily_stats.realized_pnl == 0.0
         assert risk_engine.daily_stats.trades_count == 0
         assert risk_engine.daily_stats.kill_switch_triggered is False

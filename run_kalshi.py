@@ -1316,9 +1316,9 @@ class KalshiBattleBot:
             return_pct_actual = None
             using_kalshi = False
         
-        # Debug: Log which values are being used (every 10th call to avoid spam)
+        # Log which values are being used (every 200th call — ~once per 10 min at dashboard poll rate)
         self._stats_debug_counter += 1
-        if self._stats_debug_counter % 10 == 1:
+        if self._stats_debug_counter % 200 == 1:
             print(f"[Stats] Source: {'KALSHI API' if using_kalshi else 'INTERNAL'}")
             print(f"[Stats] Cash=${available:.2f}, Positions=${positions_at_risk:.2f}, Total=${total_value:.2f}")
             if using_kalshi:
@@ -1593,6 +1593,18 @@ class KalshiBattleBot:
             try:
                 await self._fetch_markets()
                 await self._select_markets()
+                # Immediately sync WS subscriptions after markets are updated so the bot
+                # starts receiving real-time ticker prices without waiting for the 5-minute
+                # price_refresh_loop sleep cycle.  Include open-position markets too so they
+                # keep getting WS price updates even if dropped from _monitored.
+                _ws_tickers = set(self._monitored.keys())
+                for _pos in self._positions.values():
+                    _mid = _pos.get('market_id')
+                    if _mid:
+                        _ws_tickers.add(_mid)
+                if _ws_tickers:
+                    await self._ws_client.sync_subscriptions(list(_ws_tickers))
+                    print(f"[WS] Subscribed to {len(_ws_tickers)} market tickers after market scan")
             except Exception as e:
                 import traceback as _tb; print(f"[Market Error] {e}"); _tb.print_exc()
             await asyncio.sleep(900)  # Refresh every 15 minutes (markets don't change rapidly)
@@ -3651,9 +3663,16 @@ class KalshiBattleBot:
             try:
                 monitored_tickers = list(self._monitored.keys())
 
-                # Always keep WS subscriptions aligned with monitored markets
-                if monitored_tickers:
-                    await self._ws_client.sync_subscriptions(monitored_tickers)
+                # Keep WS subscriptions aligned with monitored markets AND open positions.
+                # Open-position markets can be dropped from _monitored (e.g. expired from
+                # the scan filter) but still need real-time prices for the monitor loop.
+                _ws_needed = set(monitored_tickers)
+                for _p in self._positions.values():
+                    _pm = _p.get('market_id')
+                    if _pm:
+                        _ws_needed.add(_pm)
+                if _ws_needed:
+                    await self._ws_client.sync_subscriptions(list(_ws_needed))
 
                 ws_live = self._ws_client.is_connected
 
