@@ -35,6 +35,10 @@ class PositionWithExitRules:
     # State
     trade_id: Optional[int] = None
     calibration_sample_id: Optional[int] = None
+    # The side we used to ENTER (BUY or SELL).  Needed so _execute_exit can
+    # reverse it correctly: a SELL entry (buying NO) must be exited by SELL NO,
+    # not another SELL YES which would incorrectly extend the short position.
+    entry_side: str = 'BUY'
     
     @property
     def is_time_stopped(self) -> bool:
@@ -90,7 +94,9 @@ def calculate_kelly_size(
     # Validate inputs
     if market_price <= 0 or market_price >= 1:
         return 0.0
-    
+    if true_prob <= 0 or true_prob >= 1:
+        return 0.0
+
     # Calculate edge (expected advantage)
     edge = true_prob - market_price
     if edge <= 0:
@@ -433,6 +439,7 @@ class RiskEngine:
         entry_confidence: float,
         trade_id: Optional[int] = None,
         calibration_sample_id: Optional[int] = None,
+        entry_side: str = 'BUY',
     ) -> PositionWithExitRules:
         """Add a new position with exit rules.
         
@@ -466,6 +473,7 @@ class RiskEngine:
                 time_stop_hours=self.limits.time_stop_hours,
                 trade_id=trade_id,
                 calibration_sample_id=calibration_sample_id,
+                entry_side=entry_side,
             )
             
             self._positions[position.token_id] = pos_with_rules

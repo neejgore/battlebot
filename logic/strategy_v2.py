@@ -352,6 +352,13 @@ class StrategyV2:
             if not self.risk_engine.is_trading_allowed:
                 logger.warning("Trading halted - skipping analysis")
                 return
+
+            # Stamp last_analysis_time NOW, inside the lock, before releasing it.
+            # If we set it inside _analyze_and_trade (which runs as a new task after
+            # the lock is released), two rapid price updates can both pass the cooldown
+            # check against the same stale timestamp and spawn duplicate analysis tasks
+            # that each independently place an order, doubling the position.
+            state.last_analysis_time = now
         
         # Trigger analysis (outside lock)
         logger.info(
@@ -536,9 +543,14 @@ class StrategyV2:
             # Step 5: Position Sizing
             # ================================================================
             
+            # For SELL signals (buying NO), Kelly must see the NO-side probability
+            # and price.  If we pass YES-side values, edge = adjusted_prob - market_price
+            # is negative (that's why we chose SELL), so Kelly returns 0 every time.
+            _kelly_prob = adjusted_prob if side == OrderSide.BUY else (1.0 - adjusted_prob)
+            _kelly_price = update.price if side == OrderSide.BUY else (1.0 - update.price)
             position_size = await self.risk_engine.calculate_position_size(
-                adjusted_prob=adjusted_prob,
-                market_price=update.price,
+                adjusted_prob=_kelly_prob,
+                market_price=_kelly_price,
                 edge=edge,
                 confidence=signal.confidence,
                 market_id=market.condition_id,
@@ -572,8 +584,10 @@ class StrategyV2:
             
             self._stats["signals_generated"] += 1
             
-            # Calculate shares from USDC size
-            shares = position_size / update.price
+            # Calculate shares from USDC size.
+            # For SELL (NO contracts): the contract price is 1 - yes_price, not yes_price.
+            _contract_price = update.price if side == OrderSide.BUY else (1.0 - update.price)
+            shares = position_size / _contract_price if _contract_price > 0 else 0
             
             logger.info(
                 f"Executing trade | {side.value} {shares:.2f} shares @ {update.price:.4f} | "
@@ -648,6 +662,7 @@ class StrategyV2:
                 entry_confidence=signal.confidence,
                 trade_id=trade_id,
                 calibration_sample_id=calib_sample_id,
+                entry_side=side.value,
             )
             
             logger.info(
@@ -732,8 +747,16 @@ class StrategyV2:
         )
         
         try:
-            # Create exit order (opposite side)
-            exit_side = OrderSide.SELL  # Assuming we were long
+            # Exit side is the SAME as entry side: to close a position, you sell
+            # back the same contract type you bought.  A BUY-YES entry exits by
+            # SELL-YES; a SELL-YES entry (which bought NO contracts) exits by
+            # SELL-NO.  Both are represented as OrderSide.SELL to the execution
+            # engine with the same token_id.
+            # NOTE: if entry was a SELL and the execution engine represents NO
+            # contracts via a separate token_id, this logic would need adjustment.
+            # For now we mirror the entry side.
+            _entry_side_str = getattr(pos_with_rules, 'entry_side', 'BUY')
+            exit_side = OrderSide.SELL if _entry_side_str == 'BUY' else OrderSide.BUY
             
             order = await self.execution_engine.create_order(
                 token_id=token_id,

@@ -353,8 +353,10 @@ class DailyStats(BaseModel):
     max_drawdown_pct: float = Field(default=0.0, ge=0.0, description="Max drawdown %")
     kill_switch_triggered: bool = Field(default=False, description="Kill-switch status")
 
-    # Maximum allowed daily drawdown — can be overridden by RiskLimits; default 10%
-    MAX_DAILY_DRAWDOWN: float = 0.10
+    # Maximum allowed daily drawdown — can be overridden by RiskLimits; default 15%.
+    # Must match RiskLimits.max_daily_drawdown default so DailyStats used standalone
+    # (e.g. in tests) enforces the same threshold as when constructed via RiskEngine.
+    MAX_DAILY_DRAWDOWN: float = 0.15
 
     @computed_field
     @property

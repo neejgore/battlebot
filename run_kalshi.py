@@ -206,6 +206,17 @@ class KalshiBattleBot:
                     if state.get('kill_switch_triggered') and _ks_date == _today:
                         self._risk_engine.daily_stats.kill_switch_triggered = True
                         print(f"[State] Kill switch restored from state (triggered today {_ks_date})")
+                    # Restore today's starting bankroll so kill-switch drawdown is measured
+                    # from the correct baseline.  Without this, if the bankroll has grown
+                    # (e.g. $100 → $120), starting_bankroll resets to the env-var $100 on
+                    # restart, and drawdown = (100-120)/100 = -20% → 0%, so the kill-switch
+                    # never fires until current_bankroll drops below $100 (i.e. a full 20%
+                    # real loss instead of 15%).
+                    _today_snap = self._daily_snapshots.get(_today, {})
+                    _today_start = _today_snap.get('start_of_day_value')
+                    if _today_start and _today_start > 0:
+                        self._risk_engine.daily_stats.starting_bankroll = _today_start
+                        print(f"[State] Restored today's starting bankroll: ${_today_start:.2f}")
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals, {len(self._recently_exited)} exit cooldowns")
                     
                     # Clear ALL reconciled trades - they have corrupted P&L data
@@ -240,6 +251,11 @@ class KalshiBattleBot:
                     if state.get('kill_switch_triggered') and _ks_date_bak == _today_bak:
                         self._risk_engine.daily_stats.kill_switch_triggered = True
                         print(f"[State] Kill-switch restored from backup (triggered today)")
+                    _today_snap_bak = self._daily_snapshots.get(_today_bak, {})
+                    _today_start_bak = _today_snap_bak.get('start_of_day_value')
+                    if _today_start_bak and _today_start_bak > 0:
+                        self._risk_engine.daily_stats.starting_bankroll = _today_start_bak
+                        print(f"[State] Restored today's starting bankroll from backup: ${_today_start_bak:.2f}")
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades from backup")
         except json.JSONDecodeError as e:
             print(f"[State] WARNING: Corrupted state file, starting fresh: {e}")
@@ -274,7 +290,16 @@ class KalshiBattleBot:
                 'recently_exited': recently_exited_serial,
                 'recently_exited_reason': self._recently_exited_reason,
                 'kill_switch_triggered': self._risk_engine.daily_stats.kill_switch_triggered,
-                'kill_switch_date': datetime.utcnow().strftime('%Y-%m-%d'),
+                # Only record the date at the moment the kill-switch fires (False→True).
+                # Writing today's date on EVERY save causes a UTC-midnight race: if the
+                # bot saves at 00:01 UTC with kill_switch_triggered=True from yesterday,
+                # the date becomes today, and the restore check ("_ks_date == _today")
+                # incorrectly keeps the kill-switch active into the new trading day.
+                'kill_switch_date': (
+                    datetime.utcnow().strftime('%Y-%m-%d')
+                    if self._risk_engine.daily_stats.kill_switch_triggered
+                    else ''
+                ),
                 'saved_at': datetime.utcnow().isoformat(),
             }
             
@@ -811,6 +836,27 @@ class KalshiBattleBot:
 
     async def _nightly_strategy_loop(self) -> None:
         """Fire _run_nightly_report every day at midnight UTC."""
+        # On startup, check whether the nightly reset was missed (e.g. the bot
+        # crashed after midnight but before the reset ran).  If the daily_stats
+        # are still keyed to a prior day, force an immediate reset so today's
+        # kill-switch and drawdown counter start from today's baseline.
+        try:
+            _now_utc = datetime.now(timezone.utc)
+            _today_str = _now_utc.strftime('%Y-%m-%d')
+            _stats_date = getattr(self._risk_engine.daily_stats, 'date', None)
+            if _stats_date is not None:
+                _stats_date_str = (
+                    _stats_date.strftime('%Y-%m-%d')
+                    if hasattr(_stats_date, 'strftime')
+                    else str(_stats_date)
+                )
+                if _stats_date_str < _today_str:
+                    print(f"[Nightly] Missed reset detected (stats from {_stats_date_str}, today={_today_str}) — resetting now")
+                    await self._risk_engine.reset_daily_stats()
+                    self._save_state()
+        except Exception as _e:
+            print(f"[Nightly] Startup reset check failed (non-fatal): {_e}")
+
         while self._running:
             try:
                 now = datetime.now(timezone.utc)
@@ -879,9 +925,12 @@ class KalshiBattleBot:
                 print(f"[Sync] Could not fetch balance: {e}")
                 import traceback
                 traceback.print_exc()
-                self._kalshi_cash = None
-                self._kalshi_portfolio = None
-                self._kalshi_total = None
+                # Preserve last-known Kalshi values on transient failure.
+                # Resetting to None triggers the stats fallback which adds corrupted
+                # realized_pnl to the calculation, producing wildly inflated dashboard
+                # numbers (e.g. $824 when account is actually $578).
+                # Stale values are far less harmful than fabricated ones.
+                # Values reset to None only if they were never set (first startup).
             
             result = await self._kalshi.get_positions()
             kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
@@ -928,30 +977,36 @@ class KalshiBattleBot:
             _local_count = len(self._positions)
             _safe_to_charge_pnl = _kalshi_count >= _local_count or _local_count == 0
             removed = 0
-            for pos_id in list(self._positions.keys()):
-                pos = self._positions[pos_id]
-                market_id = pos.get('market_id', '')
-                if market_id not in kalshi_by_ticker:
-                    entry_price = pos.get('entry_price', 0)
-                    contracts = pos.get('contracts', 0)
-                    # Don't assume total loss. The position is gone from Kalshi because
-                    # it settled (WIN or LOSS) or was externally closed. We don't know
-                    # the outcome here, and sync_bankroll() (called just above at line 859)
-                    # already reflects the real account value. Charging a fake negative
-                    # pnl_estimate would push risk engine bankroll below Kalshi actuals,
-                    # potentially triggering a false kill-switch for ~5 minutes.
-                    # Rely solely on sync_bankroll for accuracy; skip record_trade_result.
-                    pnl_estimate = 0.0  # Neutral — sync_bankroll already captured real outcome
-                    print(f"[Sync] Position no longer on Kalshi — removing "
-                          f"(charge skipped, sync_bankroll handles real P&L): "
-                          f"{pos.get('question', '')[:40]}...")
-                    self._positions.pop(pos_id)
-                    self._recently_exited[market_id] = datetime.utcnow()
-                    self._recently_exited_reason[market_id] = 'SYNC_REMOVED'
-                    # Save state after EACH removal so a crash mid-loop doesn't
-                    # cause double-removal (and double-pnl) on the next restart.
-                    removed += 1
-                    self._save_state()
+            if not _safe_to_charge_pnl:
+                # Kalshi returned fewer positions than we track — almost certainly a
+                # partial/paginated API response, not genuine settlement.  Removing
+                # positions here would orphan real open positions (blacklisting them
+                # for 48 h) and could falsely fire the kill-switch.  Skip the removal
+                # pass; the next full sync will reconcile when it gets a complete response.
+                print(f"[Sync] WARNING: Kalshi returned {_kalshi_count} positions vs "
+                      f"{_local_count} local — skipping phantom-removal (partial response)")
+            else:
+                for pos_id in list(self._positions.keys()):
+                    pos = self._positions[pos_id]
+                    market_id = pos.get('market_id', '')
+                    if market_id not in kalshi_by_ticker:
+                        # Don't assume total loss. The position is gone from Kalshi because
+                        # it settled (WIN or LOSS) or was externally closed. We don't know
+                        # the outcome here, and sync_bankroll() (called just above) already
+                        # reflects the real account value. Charging a fake negative
+                        # pnl_estimate would push risk engine bankroll below Kalshi actuals,
+                        # potentially triggering a false kill-switch for ~5 minutes.
+                        # Rely solely on sync_bankroll for accuracy; skip record_trade_result.
+                        print(f"[Sync] Position no longer on Kalshi — removing "
+                              f"(charge skipped, sync_bankroll handles real P&L): "
+                              f"{pos.get('question', '')[:40]}...")
+                        self._positions.pop(pos_id)
+                        self._recently_exited[market_id] = datetime.utcnow()
+                        self._recently_exited_reason[market_id] = 'SYNC_REMOVED'
+                        # Save state after EACH removal so a crash mid-loop doesn't
+                        # cause double-removal on the next restart.
+                        removed += 1
+                        self._save_state()
             if removed:
                 await self._broadcast_update()
             
@@ -1229,11 +1284,15 @@ class KalshiBattleBot:
             return_pct_actual = ((self._kalshi_total - self.initial_bankroll) / self.initial_bankroll) * 100 if self.initial_bankroll else 0.0
             using_kalshi = True
         else:
-            # Fallback to internal calculations (less accurate)
+            # Kalshi hasn't synced yet (first startup, or transient API error).
+            # DO NOT use realized_pnl from the trade log — it has been historically
+            # corrupted by wrong fill-price bugs and would produce values like $824
+            # when the real account is $578.  Show $0 for monetary fields until
+            # Kalshi returns a real answer; the dashboard shows "--" for unknown fields.
             positions_at_risk = internal_positions
             at_risk = positions_at_risk + pending_at_risk
-            available = self.initial_bankroll - at_risk + realized_pnl
-            total_value = available + positions_at_risk + unrealized_pnl
+            available = 0.0
+            total_value = 0.0
             return_pct_actual = None
             using_kalshi = False
         
@@ -2911,6 +2970,12 @@ class KalshiBattleBot:
             for p in self._positions.values():
                 mid = p.get('market_id', '')
                 market_exposures[mid] = market_exposures.get(mid, 0.0) + p.get('size', 0.0)
+            # Include pending orders so the per-market cap fires for unfilled buys too.
+            # Without this, a pending $50 buy on KXBTC-25MAR shows $0 exposure for that
+            # market, allowing a second overlapping position on a correlated contract.
+            for o in self._pending_orders.values():
+                mid = o.get('market_id', '')
+                market_exposures[mid] = market_exposures.get(mid, 0.0) + o.get('size', 0.0)
             self._risk_engine.sync_market_exposure(market_exposures)
 
             # Calculate position size (async with proper params)
@@ -3251,7 +3316,7 @@ class KalshiBattleBot:
                     
                     # Calculate P&L: (current_price - entry_price) × contracts
                     # Same formula for both YES and NO since we're using the actual price for each side
-                    contracts = pos.get('contracts', int(pos['size'] / entry_price) if entry_price > 0 else 0)
+                    contracts = pos.get('contracts', round(pos['size'] / entry_price) if entry_price > 0 else 0)
                     price_change = current_price - entry_price
                     
                     unrealized_pnl = price_change * contracts
@@ -3617,6 +3682,28 @@ class KalshiBattleBot:
                                     await self._kalshi.cancel_order(exit_order_id)
                                 except Exception:
                                     pass
+                                # Check for partial fill before treating as clean cancel.
+                                # If some contracts already sold, reduce the position's
+                                # contract count so the retry doesn't oversell.
+                                try:
+                                    _stale_result = await self._kalshi.get_order(exit_order_id)
+                                    _stale_data = _stale_result.get('order', {})
+                                    _stale_partial = (
+                                        _stale_data.get('fill_count')
+                                        or _stale_data.get('filled_count')
+                                        or 0
+                                    )
+                                    if _stale_partial and _stale_partial > 0:
+                                        _remaining = position.get('contracts', 0) - _stale_partial
+                                        if _remaining > 0:
+                                            position['contracts'] = _remaining
+                                            print(f"[EXIT STALE] Partial fill detected: "
+                                                  f"{_stale_partial} sold, {_remaining} remain")
+                                        else:
+                                            # Fully filled by the time we checked — don't retry
+                                            print(f"[EXIT STALE] Order fully filled during cancel check")
+                                except Exception:
+                                    pass
                                 position.pop('pending_exit', None)
                                 self._save_state()
                         except Exception:
@@ -3674,13 +3761,17 @@ class KalshiBattleBot:
                         signal['actual_result'] = actual_result
                         signal['predicted_correct'] = (predicted_side == actual_result)
                         
-                        # Calculate what P&L would have been
-                        entry_price = signal.get('market_price', 0)
+                        # Calculate what P&L would have been.
+                        # market_price is the YES midpoint; adjust for NO bets so we
+                        # use the actual entry cost (1 - yes_price = no_price).
+                        _yes_price = signal.get('market_price', 0)
+                        _side = signal.get('side', '').lower()
+                        entry_price = _yes_price if _side != 'no' else (1.0 - _yes_price)
                         if signal['predicted_correct']:
-                            # Won: paid entry_price, received $1
+                            # Won: paid entry_price per contract, received $1
                             signal['theoretical_pnl'] = 1.0 - entry_price
                         else:
-                            # Lost: paid entry_price, received $0
+                            # Lost: paid entry_price per contract, received $0
                             signal['theoretical_pnl'] = -entry_price
                         
                         signal['outcome'] = 'WIN' if signal['predicted_correct'] else 'LOSS'
@@ -3783,6 +3874,14 @@ class KalshiBattleBot:
             try:
                 sync_counter += 1
                 
+                # First, check pending EXIT orders (sells on existing positions).
+                # IMPORTANT: this must run BEFORE _sync_positions_with_kalshi.
+                # If a sell exit fills between cycles, the full sync sees the position
+                # absent on Kalshi and removes it with SYNC_REMOVED — no P&L is recorded
+                # and the trade record is lost.  Running exits first means filled sells
+                # are processed (and the position removed cleanly) before the sync runs.
+                await self._check_pending_exits()
+
                 # Periodically do a full position sync to detect resolved markets
                 if sync_counter >= FULL_SYNC_INTERVAL:
                     sync_counter = 0
@@ -3794,9 +3893,6 @@ class KalshiBattleBot:
                     # by the 10-minute timeout below.
                     # Check signal outcomes for backtesting
                     await self._check_signal_outcomes()
-                
-                # First, check pending EXIT orders (sells on existing positions)
-                await self._check_pending_exits()
                 
                 # Then check pending BUY orders
                 if not self._pending_orders:
@@ -4917,8 +5013,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         }
         
         function updateStats(s) {
-            // Legacy stats (At Risk section)
-            document.getElementById('available').textContent = '$' + s.available.toFixed(2);
+            // Legacy stats (At Risk section).
+            // available and total_value are 0 when Kalshi hasn't synced yet — show '--'
+            // instead of '$0.00' so the user knows data is loading, not that they have $0.
+            document.getElementById('available').textContent = s.kalshi_synced ? '$' + s.available.toFixed(2) : '--';
             document.getElementById('atRisk').textContent = '$' + s.at_risk.toFixed(2);
             document.getElementById('posCount').textContent = s.open_positions + ' positions + ' + (s.pending_orders || 0) + ' resting';
             document.getElementById('positionsAtRisk').textContent = '$' + (s.positions_at_risk || 0).toFixed(2);
@@ -4928,7 +5026,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             document.getElementById('atRiskUltra').textContent = '$' + (s.at_risk_ultra_short || 0).toFixed(2);
             document.getElementById('atRiskShort').textContent = '$' + (s.at_risk_short || 0).toFixed(2);
             document.getElementById('atRiskMedium').textContent = '$' + (s.at_risk_medium || 0).toFixed(2);
-            document.getElementById('totalValue').textContent = '$' + s.total_value.toFixed(2);
+            document.getElementById('totalValue').textContent = s.kalshi_synced ? '$' + s.total_value.toFixed(2) : '--';
             
             // Header badges
             document.getElementById('runtime').textContent = s.runtime;
