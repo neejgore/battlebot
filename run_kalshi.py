@@ -4616,27 +4616,23 @@ class KalshiBattleBot:
         snapshot['timestamp'] = now.isoformat()
         
         # Track intraday high watermark — shows "was up X, now at Y" pattern
-        # Guard: don't update the high within the first 5 minutes of startup.
-        # The cold-start sync captures an instantaneous Kalshi price that may not
-        # reflect a real tradeable high (bid/ask midpoints shift immediately on connect).
         bot_uptime_secs = (now - self._start_time).total_seconds() if self._start_time else 999
-        if bot_uptime_secs >= 300:  # Only track high after 5 min of operation
-            current_high = snapshot.get('intraday_high')
-            # Floor: peak can never be lower than start_of_day_value.
-            # If the account dropped during the 5-min guard window, the first
-            # recorded peak is floored at the day's starting value so the dashboard
-            # never shows a peak below where the day began.
-            start_val = snapshot.get('start_of_day_value', val)
-            if current_high is None:
-                # First peak of the day — floor at start_of_day so peak >= start
+        current_high = snapshot.get('intraday_high')
+        start_val = snapshot.get('start_of_day_value', val)
+        if current_high is None:
+            # Guard: only initialise the peak after 60s of uptime.
+            # The first few syncs can capture transient bid/ask midpoints that don't
+            # reflect real tradeable prices. After 60s prices have stabilised.
+            if bot_uptime_secs >= 60:
+                # Floor at start_of_day so the peak is never below where the day started.
                 current_high = max(val, start_val)
                 snapshot['intraday_high'] = current_high
                 snapshot['intraday_high_time'] = now.isoformat()
-            elif val > current_high:
-                snapshot['intraday_high'] = val
-                snapshot['intraday_high_time'] = now.isoformat()
-            else:
-                snapshot['intraday_high'] = current_high
+        elif val > current_high:
+            snapshot['intraday_high'] = val
+            snapshot['intraday_high_time'] = now.isoformat()
+        else:
+            snapshot['intraday_high'] = current_high
         
         # Track intraday low watermark
         current_low = snapshot.get('intraday_low', val)
