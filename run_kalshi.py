@@ -874,8 +874,21 @@ class KalshiBattleBot:
                 pos = self._positions[pos_id]
                 market_id = pos.get('market_id', '')
                 if market_id not in kalshi_by_ticker:
-                    print(f"[Sync] Position no longer on Kalshi, removing (use Settlements for P&L): {pos.get('question', '')[:40]}...")
+                    # Position no longer on Kalshi — either settled or filled via a cancel-race
+                    # in _check_pending_exits. Record the loss/gain properly so risk engine
+                    # and dashboard statistics are accurate, and block re-entry via _recently_exited.
+                    entry_price = pos.get('entry_price', 0)
+                    contracts = pos.get('contracts', 0)
+                    # Use 0 as exit price (worst case). Reconcile loop will correct it later.
+                    pnl_estimate = -entry_price * contracts
+                    print(f"[Sync] Position no longer on Kalshi — recording estimated exit (${pnl_estimate:+.2f}): {pos.get('question', '')[:40]}...")
                     self._positions.pop(pos_id)
+                    self._recently_exited[market_id] = datetime.utcnow()
+                    self._recently_exited_reason[market_id] = 'SYNC_REMOVED'
+                    if contracts > 0 and not pos.get('pending_exit'):
+                        # Only charge P&L if this wasn't a pending normal sell
+                        # (those are handled by _check_pending_exits with real fill prices)
+                        await self._risk_engine.record_trade_result(pnl_estimate)
                     removed += 1
             if removed:
                 self._save_state()
@@ -1429,7 +1442,7 @@ class KalshiBattleBot:
                 await self._fetch_markets()
                 await self._select_markets()
             except Exception as e:
-                print(f"[Market Error] {e}")
+                import traceback as _tb; print(f"[Market Error] {e}"); _tb.print_exc()
             await asyncio.sleep(900)  # Refresh every 15 minutes (markets don't change rapidly)
     
     async def _fetch_markets(self):
@@ -2240,7 +2253,15 @@ class KalshiBattleBot:
                     if hours_to_res <= 168 or news_relevance > 0.6:
                         print(f"[{time_label}] {hours_to_res:.1f}h | News relevance: {news_relevance:.2f}")
 
-                    await self._analyze_market(market)
+                    try:
+                        await self._analyze_market(market)
+                    except Exception as _ae:
+                        # Catch any unhandled exception that escapes _analyze_market.
+                        # We still update _last_analysis so the market is rate-limited
+                        # and not re-analyzed every 30 seconds, burning Claude API budget.
+                        import traceback as _tb
+                        print(f"[Analyze Error] {market_id[:30]}: {_ae}")
+                        _tb.print_exc()
                     self._last_analysis[market_id] = datetime.utcnow()
                     self._last_analysis_price[market_id] = current_price
                     await asyncio.sleep(2)
@@ -2259,7 +2280,7 @@ class KalshiBattleBot:
                         print(f"[INTEL STATUS] Error: {e}")
                     
             except Exception as e:
-                print(f"[Trading Error] {e}")
+                import traceback as _tb; print(f"[Trading Error] {e}"); _tb.print_exc()
             await asyncio.sleep(30)
     
     def _get_cluster_key(self, question: str) -> str:
@@ -3243,7 +3264,7 @@ class KalshiBattleBot:
                         await self._exit_position(pos_id, current_price, unrealized_pnl, exit_reason_mon)
                 
             except Exception as e:
-                print(f"[Monitor Error] {e}")
+                import traceback as _tb; print(f"[Monitor Error] {e}"); _tb.print_exc()
             await asyncio.sleep(10)
     
     async def _exit_position(self, pos_id: str, exit_price: float, pnl: float, reason: str):
@@ -3380,8 +3401,8 @@ class KalshiBattleBot:
                                     self._monitored.setdefault(market_id, {})
                                     self._monitored[market_id][_f] = updated[_f]
                             self._price_update_count += 1
-                    except:
-                        pass
+                    except Exception as _pref:
+                        print(f"[Price Refresh] {market_id[:25]}: {_pref}")
                     await asyncio.sleep(1)  # Rate limit
             except Exception as e:
                 print(f"[Price Refresh Error] {e}")
@@ -3500,9 +3521,13 @@ class KalshiBattleBot:
                 
             except Exception as e:
                 if '404' in str(e).lower():
-                    # Order not found - might have been filled, check positions
+                    # Order no longer exists — it was either filled or cancelled externally.
+                    # Clear pending_exit so the monitor can retry. _recently_exited is NOT
+                    # set here because we don't know the outcome; _sync_positions_with_kalshi
+                    # will reconcile the position on its next cycle and record it properly.
                     position.pop('pending_exit', None)
-                    print(f"[EXIT ORDER] {exit_order_id} not found - checking actual positions...")
+                    self._save_state()
+                    print(f"[EXIT ORDER] {exit_order_id} not found — clearing pending_exit, sync will reconcile")
                 else:
                     print(f"[Exit Check Error] {pos_id}: {e}")
     
@@ -3857,8 +3882,8 @@ class KalshiBattleBot:
                     print(f"[Sync] {len(self._pending_orders)} orders pending, {len(self._positions)} positions active")
                 
             except Exception as e:
-                print(f"[Position Sync Error] {e}")
-            
+                import traceback as _tb; print(f"[Position Sync Error] {e}"); _tb.print_exc()
+
             await asyncio.sleep(10)  # Check every 10 seconds
     
     async def _broadcast_update(self):
