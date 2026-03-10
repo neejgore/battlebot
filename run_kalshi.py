@@ -1133,6 +1133,13 @@ class KalshiBattleBot:
                             print(f"[Sync] Skipping re-add of recently exited position: {ticker[:30]} ({hours_since:.1f}h ago)")
                             continue
 
+                    # Race condition guard: the trading loop may have entered this market
+                    # between the last sync and now (startup race). Don't create a duplicate.
+                    _already_held_mids = {p.get('market_id') for p in self._positions.values()}
+                    if ticker in _already_held_mids:
+                        print(f"[Sync] Skipping duplicate sync — already holding {ticker[:30]} via analysis")
+                        continue
+
                     # Add missing position
                     pos_id = f"pos_kalshi_{ticker[:20]}_{int(datetime.utcnow().timestamp())}"
                     cached_market = self._markets.get(ticker, {})
