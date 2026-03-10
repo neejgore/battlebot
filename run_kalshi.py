@@ -2627,6 +2627,66 @@ class KalshiBattleBot:
             return 'geopolitics'
         return 'other'
 
+    # Real-world tradeable assets whose threshold markets require live price context.
+    # Maps lowercase keyword found in the market question → Brave search query for current price.
+    _COMMODITY_PRICE_QUERIES: dict[str, str] = {
+        'gold':        'gold futures price today site:reuters.com OR site:bloomberg.com OR site:cnbc.com',
+        'silver':      'silver futures price today',
+        'crude oil':   'WTI crude oil price today',
+        'wti':         'WTI crude oil price today',
+        'brent':       'Brent crude oil price today',
+        'natural gas': 'natural gas futures price today',
+        'wheat':       'wheat futures price today',
+        'corn':        'corn futures price today',
+        'copper':      'copper futures price today',
+        's&p 500':     'S&P 500 index current price today',
+        'sp500':       'S&P 500 index current price today',
+        'dow jones':   'Dow Jones index current price today',
+        'russell 2000':'Russell 2000 index current price today',
+        'nasdaq':      'NASDAQ 100 index current price today',
+        'nikkei':      'Nikkei 225 index current price today',
+        'ftse':        'FTSE 100 index current price today',
+    }
+    # Regex for "above/below/over/under $NUMBER" patterns in market questions
+    _PRICE_THRESHOLD_RE = re.compile(
+        r'\b(above|below|over|under|exceed|at least|at most|higher than|lower than)\s+\$[\d,]+',
+        re.IGNORECASE,
+    )
+
+    async def _fetch_commodity_price_context(self, question_full: str) -> str | None:
+        """For real-world asset threshold markets, fetch a targeted Brave search for the
+        current spot/futures price so Claude isn't flying blind with stale training data.
+        Returns a short context string to prepend to Claude's news summary, or None."""
+        if not self._PRICE_THRESHOLD_RE.search(question_full):
+            return None
+        q_lower = question_full.lower()
+        search_query = None
+        matched_asset = None
+        for keyword, brave_q in self._COMMODITY_PRICE_QUERIES.items():
+            if keyword in q_lower:
+                search_query = brave_q
+                matched_asset = keyword
+                break
+        if not search_query:
+            return None
+        try:
+            items = await self._intelligence.news_service._fetch_brave(search_query, max_results=3)
+            if not items:
+                return None
+            snippets = '\n'.join(
+                f'• [{it.source}] {it.title}: {it.snippet[:200]}'
+                for it in items[:3]
+            )
+            ctx = (
+                f"⚠️  LIVE PRICE DATA for '{matched_asset}' (fetched right now — use this, "
+                f"NOT your training-data price which may be years out of date):\n{snippets}"
+            )
+            print(f"[PriceGuard] Fetched live price context for '{matched_asset}': {len(items)} results")
+            return ctx
+        except Exception as e:
+            print(f"[PriceGuard] Price context fetch failed (non-fatal): {e}")
+            return None
+
     async def _analyze_market(self, market: dict):
         """Analyze market with AI and decide whether to trade.
         
@@ -2715,7 +2775,16 @@ class KalshiBattleBot:
             except Exception as e:
                 print(f"[Intel] Failed to gather: {e}")
                 intel = None
-        
+
+        # Step 2c: For real-world asset price-threshold markets (gold, oil, NASDAQ, etc.),
+        # fetch live spot/futures price via Brave so Claude doesn't use stale training data.
+        # Example: gold was ~$2,700 in Claude's training data but trades at $5,200 today.
+        # Without this, Claude bets NO on "above $5,159" because it thinks $5,159 is impossible.
+        _commodity_price_ctx: str | None = None
+        _full_question = market.get('question', '')
+        if not _is_crypto_range_q:  # crypto already has the quant model for live prices
+            _commodity_price_ctx = await self._fetch_commodity_price_context(_full_question)
+
         # Build overreaction info string for AI
         overreaction_info = None
         if intel and intel.overreaction_detected:
@@ -2790,7 +2859,7 @@ class KalshiBattleBot:
                     except Exception:
                         pass
 
-                # Merge quant context with news intel for Claude prompt
+                # Merge quant context + commodity live price + news intel for Claude prompt
                 _news_summary_for_claude = intel.news_summary if intel else None
                 if _quant_result:
                     quant_block = _quant_result.context_summary
@@ -2798,6 +2867,13 @@ class KalshiBattleBot:
                         quant_block + "\n\n" + _news_summary_for_claude
                         if _news_summary_for_claude
                         else quant_block
+                    )
+                # Prepend live commodity price data so Claude doesn't use stale training prices
+                if _commodity_price_ctx:
+                    _news_summary_for_claude = (
+                        _commodity_price_ctx + "\n\n" + _news_summary_for_claude
+                        if _news_summary_for_claude
+                        else _commodity_price_ctx
                     )
 
                 result = await self._ai_generator.generate_signal(
@@ -3037,6 +3113,29 @@ class KalshiBattleBot:
         if signal.confidence < self.min_confidence:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
+
+        # PRICE SANITY GUARD: For real-world asset price-threshold markets (gold, oil,
+        # indices, etc.), if the MARKET prices YES at >55% but our AI says <15% YES,
+        # the AI almost certainly has stale training-data prices — not genuine edge.
+        # Example that triggered this guard: gold at $5,200, market at 65% YES on
+        # "above $5,159.99", Claude said 2% because its training data shows gold at ~$2,700.
+        # We don't trust AI vs. real-time market consensus on commodity price levels.
+        _full_q_lower = market.get('question', '').lower()
+        _is_real_asset_thresh = (
+            self._PRICE_THRESHOLD_RE.search(market.get('question', ''))
+            and any(kw in _full_q_lower for kw in self._COMMODITY_PRICE_QUERIES)
+        )
+        if _is_real_asset_thresh and not _is_crypto_range_q:
+            _yes_market_price = 1.0 - current_price if side == 'NO' else current_price
+            if signal.raw_prob < 0.15 and _yes_market_price > 0.55:
+                should_trade = False
+                reasons.append(
+                    f'PRICE_SANITY_FAIL_AI{signal.raw_prob:.0%}_MKT{_yes_market_price:.0%}'
+                )
+                print(
+                    f"[PriceGuard] BLOCKED {market_id[:35]} — AI={signal.raw_prob:.0%} YES "
+                    f"but market={_yes_market_price:.0%} YES. Likely stale AI price data."
+                )
 
         # Require meaningful intelligence for non-crypto-range markets.
         # Crypto range markets use the quant model (vol/spot math) as their signal — they
