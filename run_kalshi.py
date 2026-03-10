@@ -2069,16 +2069,20 @@ class KalshiBattleBot:
                     break
         _range_markets = []
         for p in _RANGE_PREFIXES:
-            _top3 = sorted(_range_by_series[p],
-                           key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:3]
-            _range_markets.extend(_top3)
+            # Top 5 per series (was 3): gives the quant model more price levels to find edge.
+            # BTC at $67,500 might have best edge in the 4th or 5th bucket — not just the
+            # top-OI ones. Quality unchanged: same quant edge + confidence filters apply.
+            _top5 = sorted(_range_by_series[p],
+                           key=lambda x: x.get('open_interest', 0) or 0, reverse=True)[:5]
+            _range_markets.extend(_top5)
         _range_ids = {m['id'] for m in _range_markets}
         # Exclude range markets from the other buckets to avoid analysing the same market twice
         _short_non_range = [m for m in short_term if m['id'] not in _range_ids]
         _ultra_non_range  = [m for m in ultra_short  if m['id'] not in _range_ids]
         # Ultra-short markets resolve within 24h — widest coverage here for maximum trade frequency.
-        # Short-term gives diversity; medium-term is low-churn so a small cap is fine.
-        selected = _range_markets + _short_non_range[:100] + _ultra_non_range[:60] + medium_term[:25]
+        # Medium-term cap raised 25 → 50: political/economic markets (15-45d) often have
+        # strong news coverage and qualify at 80%+ conf; more candidates = more qualifying trades.
+        selected = _range_markets + _short_non_range[:100] + _ultra_non_range[:60] + medium_term[:50]
         
         # Log what we found
         print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
