@@ -2295,6 +2295,12 @@ class KalshiBattleBot:
                         # Generic game/match tickers not caught above
                         'KXNBLGAME', 'KXWOMHOCKEY', 'KXLALIGA2GAME', 'KXSERIEAGAME',
                         'KXLIGAMXGAME', 'KXBUNDESGAME', 'KXLIGUE1GAME',
+                        # Esports (were leaking through — no edge, waste AI credits)
+                        'KXVALORANT', 'KXDOTA', 'KXCSGO', 'KXLOLGAME', 'KXROCKETLEAGUE',
+                        'KXOVERWATCH', 'KXAPEXLEGENDS', 'KXFORTNITEGAME', 'KXESPORT',
+                        # International basketball (FIBA, EuroLeague — were leaking)
+                        'KXFIBA', 'KXEUROLEAGUE', 'KXEUROCUP', 'KXACBGAME', 'KXLNBGAME',
+                        'KXBBLGAME', 'KXEKOGAME', 'KXBSGAME', 'KXLBAGAME',
                     ]
                     if any(pattern in ticker_upper for pattern in sports_ticker_patterns):
                         self._log_filter(market_id, question_raw, 'SPORTS_TICKER', market.get('price', 0))
