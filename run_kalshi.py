@@ -2087,9 +2087,9 @@ class KalshiBattleBot:
         _short_non_range = [m for m in short_term if m['id'] not in _range_ids]
         _ultra_non_range  = [m for m in ultra_short  if m['id'] not in _range_ids]
         # Ultra-short markets resolve within 24h — widest coverage here for maximum trade frequency.
-        # Medium-term cap raised 25 → 50: political/economic markets (15-45d) often have
-        # strong news coverage and qualify at 80%+ conf; more candidates = more qualifying trades.
-        selected = _range_markets + _short_non_range[:100] + _ultra_non_range[:60] + medium_term[:50]
+        # Short-term raised 100 → 150: more political/economic 1-7d markets in the analysis pool.
+        # Medium-term raised 50 → 75: more 8-45d markets; same strict quality filters apply.
+        selected = _range_markets + _short_non_range[:150] + _ultra_non_range[:60] + medium_term[:75]
         
         # Log what we found
         print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
@@ -2506,6 +2506,17 @@ class KalshiBattleBot:
                     else:
                         cooldown = 7200         # 2 hours — medium-term (7-45 days)
 
+                    # Near-miss fast re-analysis: if last analysis scored high but just
+                    # missed a threshold, re-check in 20 min instead of waiting the full
+                    # cooldown. Edge can shift as prices move without triggering price_moved.
+                    _last_a = next((a for a in self._analyses if a.get('market_id') == market_id), None)
+                    if _last_a:
+                        _la_edge = _last_a.get('edge', 0)
+                        _la_conf = _last_a.get('confidence', 0)
+                        _is_near_miss = (_la_edge >= 0.08 and _la_conf >= 0.65)
+                        if _is_near_miss:
+                            cooldown = min(cooldown, 1200)  # 20 min for near-misses
+
                     if last and not price_moved:
                         if (datetime.utcnow() - last).total_seconds() < cooldown:
                             continue
@@ -2530,7 +2541,7 @@ class KalshiBattleBot:
                         _tb.print_exc()
                     self._last_analysis[market_id] = datetime.utcnow()
                     self._last_analysis_price[market_id] = current_price
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)  # 1s (was 2s) — halves cycle time, still safe for Brave/Claude rate limits
                     
                 # Periodic intel status logging
                 loop_counter += 1
