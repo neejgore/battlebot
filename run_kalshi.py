@@ -2707,6 +2707,77 @@ class KalshiBattleBot:
             )
         return False, ''
 
+    # Regex to find "Month YYYY" references in economic data market questions
+    # e.g. "for the year ending in March 2026", "February 2026 CPI"
+    _MONTH_REF_RE = re.compile(
+        r'\b(january|february|march|april|may|june|july|august|september|'
+        r'october|november|december)\s+(\d{4})\b',
+        re.IGNORECASE,
+    )
+    _MONTH_NAMES: dict[str, int] = {
+        'january': 1, 'february': 2, 'march': 3, 'april': 4,
+        'may': 5, 'june': 6, 'july': 7, 'august': 8,
+        'september': 9, 'october': 10, 'november': 11, 'december': 12,
+    }
+
+    def _check_temporal_data_availability(
+        self, question_full: str, close_time_str: str | None
+    ) -> tuple[bool, str]:
+        """Detect when an economic data market is asking about UNRELEASED data.
+
+        Problem this solves: the CPI NO bet placed on Mar 11 2026 for
+        "CPI above 2.8% for year ending March 2026".  The bot fetched news
+        showing February 2026 CPI = 2.4% and inferred the answer — but March
+        2026 CPI doesn't release until mid-April 2026.  Meanwhile oil surged to
+        $110+ from the US-Iran war, making the March print likely 3%+.  The
+        MARKET was already pricing YES at 69% when the bot bet NO at 31%.
+
+        For these forward-looking economic data markets:
+        - Economic data for month M is released around the 10th of month M+1.
+        - If the referenced data period hasn't published yet, the fetched news
+          only describes the PREVIOUS release — not what this market resolves on.
+        - The market price in this case reflects live Bloomberg/Reuters consensus
+          plus futures market signals.  We must trust it over the AI.
+
+        Returns (is_forward_looking: bool, reason_tag: str).
+        """
+        q_lower = question_full.lower()
+        if not any(kw in q_lower for kw in self._ECON_DATA_KEYWORDS):
+            return False, ''
+
+        now = datetime.utcnow()
+
+        # Check 1: question explicitly mentions a specific Month YYYY
+        month_match = self._MONTH_REF_RE.search(question_full)
+        if month_match:
+            month_num = self._MONTH_NAMES[month_match.group(1).lower()]
+            year = int(month_match.group(2))
+            # Economic data for month M releases around the 10th of month M+1
+            release_month = month_num % 12 + 1
+            release_year = year if month_num < 12 else year + 1
+            try:
+                estimated_release = datetime(release_year, release_month, 10)
+                if estimated_release > now:
+                    tag = (
+                        f'FORWARD_ECON_{month_match.group(1).upper()}_{year}'
+                        f'_RELEASES_{release_month:02d}/{release_year}'
+                    )
+                    return True, tag
+            except ValueError:
+                pass
+
+        # Check 2: settlement date is >10 days away — data likely unreleased
+        if close_time_str:
+            try:
+                close_dt = datetime.fromisoformat(close_time_str.replace('Z', ''))
+                days_to_close = (close_dt - now).days
+                if days_to_close > 10:
+                    return True, f'FORWARD_ECON_CLOSES_IN_{days_to_close}D'
+            except Exception:
+                pass
+
+        return False, ''
+
     # Real-world tradeable assets whose threshold markets require live price context.
     # Maps lowercase keyword found in the market question → Brave search query for current price.
     _COMMODITY_PRICE_QUERIES: dict[str, str] = {
@@ -3271,6 +3342,39 @@ class KalshiBattleBot:
                     f"but AI={_our_side_ai_prob:.0%}. Market has Bloomberg consensus, AI doesn't."
                 )
 
+        # TEMPORAL DATA GUARD: For economic data markets where the RELEVANT DATA
+        # HAS NOT BEEN RELEASED YET, the news we fetched only describes the PRIOR
+        # month's release — not what this market will settle on.
+        #
+        # Example that triggered this: "CPI above 2.8% for year ending March 2026"
+        # settled April 10 2026. Bot fetched news showing Feb CPI = 2.4% and bet NO.
+        # But March CPI (released April) will be impacted by oil surging to $110+
+        # from the US-Iran war — market correctly priced YES at 69%.  Bot entered
+        # NO at 31¢ because it confused Feb data with the March question.
+        #
+        # Rule: if this is a forward-looking econ market AND the market prices
+        # our side at <35% (market "strongly disagrees"), block the trade.
+        # The 35% threshold (vs. 20% above) is tighter because for UNRELEASED
+        # data the market is the only reliable forward-looking signal we have.
+        if _is_econ_market and not _is_crypto_range_q:
+            _is_fwd_econ, _fwd_econ_tag = self._check_temporal_data_availability(
+                market.get('question', ''), market.get('close_time')
+            )
+            if _is_fwd_econ:
+                _fwd_our_side_mkt = current_price if side == 'YES' else (1.0 - current_price)
+                _fwd_our_side_ai = signal.raw_prob if side == 'YES' else (1.0 - signal.raw_prob)
+                if _fwd_our_side_mkt < 0.35 and _fwd_our_side_ai > 0.50:
+                    should_trade = False
+                    reasons.append(
+                        f'TEMPORAL_DATA_GUARD_{_fwd_econ_tag}'
+                        f'_MKT{_fwd_our_side_mkt:.0%}_AI{_fwd_our_side_ai:.0%}'
+                    )
+                    print(
+                        f"[TemporalGuard] BLOCKED {market_id[:35]} — {_fwd_econ_tag} "
+                        f"(unreleased data): market={_fwd_our_side_mkt:.0%} our side, "
+                        f"AI={_fwd_our_side_ai:.0%}. News reflects PRIOR release only."
+                    )
+
         # Require meaningful intelligence for non-crypto-range markets.
         # Crypto range markets use the quant model (vol/spot math) as their signal — they
         # intentionally skip the Brave news fetch for efficiency, so has_intel=False is
@@ -3352,6 +3456,13 @@ class KalshiBattleBot:
         decision = 'TRADE' if should_trade else 'NO_TRADE'
         self._analyses[0]['decision'] = decision
         self._analyses[0]['reason'] = ', '.join(reasons) if reasons else 'CRITERIA_MET'
+
+        # Mark the signal log entry with the trade decision so backtest analysis
+        # can distinguish "analyzed + skipped" from "analyzed + actually bet on".
+        # Uses market_id match as a safety check in case of concurrent edits.
+        if self._signal_log and self._signal_log[-1].get('market_id') == market_id:
+            self._signal_log[-1]['traded'] = should_trade
+            self._signal_log[-1]['skip_reason'] = ', '.join(reasons) if not should_trade else None
         
         if should_trade:
             # Sync total + per-market exposure so both global and per-market limits fire.
