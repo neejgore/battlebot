@@ -4875,14 +4875,16 @@ class KalshiBattleBot:
         return web.Response(text='ok', content_type='text/plain')
 
     async def _handle_reset_killswitch(self, request):
-        """Manually clear the kill switch so trading resumes immediately."""
+        """Manually clear the kill switch and re-baseline drawdown from current value."""
+        live = self._kalshi_total or self._risk_engine.daily_stats.current_bankroll
         self._risk_engine.daily_stats.kill_switch_triggered = False
-        # current_drawdown_pct is a computed property; reset it by syncing current to starting
-        self._risk_engine.daily_stats.current_bankroll = self._risk_engine.daily_stats.starting_bankroll
+        # Re-baseline: measure future drawdown from NOW, not from original start of day
+        self._risk_engine.daily_stats.starting_bankroll = live
+        self._risk_engine.daily_stats.current_bankroll = live
         self._kill_switch_fire_date = ''
         self._save_state()
-        print("[KILL SWITCH] Manually reset via /api/reset-killswitch")
-        return web.json_response({'ok': True, 'message': 'Kill switch cleared — trading resumed.'})
+        print(f"[KILL SWITCH] Manually reset via /api/reset-killswitch — new baseline ${live:.2f}")
+        return web.json_response({'ok': True, 'message': f'Kill switch cleared — drawdown re-baselined from ${live:.2f}.'})
 
     async def _handle_state(self, request):
         """API endpoint for current state."""
