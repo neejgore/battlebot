@@ -2485,6 +2485,8 @@ class KalshiBattleBot:
                         'weather_philadelphia': 1,
                         'weather_generic':     1,
                         'intl_central_banks':  1,  # No news edge on foreign CB markets
+                        'macro_economics':     1,  # CPI/GDP/jobs/unemployment — all correlated;
+                                                   # lost on CPI+unemployment same day, cap at 1
                     }
                     _cluster_cap = _CLUSTER_CAPS.get(_pre_cluster_key, MAX_POSITIONS_PER_CLUSTER)
                     if _pre_cluster_count >= _cluster_cap:
@@ -3446,6 +3448,7 @@ class KalshiBattleBot:
             'weather_philadelphia': 1,
             'weather_generic':     1,
             'intl_central_banks':  1,
+            'macro_economics':     1,  # CPI/GDP/jobs/unemployment — all correlated data releases
         }
         _exec_cluster_cap = _EXEC_CLUSTER_CAPS.get(cluster_key, MAX_POSITIONS_PER_CLUSTER)
         if cluster_count >= _exec_cluster_cap:
