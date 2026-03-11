@@ -2643,7 +2643,8 @@ class KalshiBattleBot:
     _PCT_RE = re.compile(r'(\d+\.?\d*)\s*%')
     # Regex to extract the threshold value from the market question
     _THRESHOLD_RE = re.compile(
-        r'\b(above|below|over|under|higher than|lower than|exceed|at least|at most)\s+'
+        r'\b(above|below|over|under|higher than|lower than|more than|less than|'
+        r'exceed|at least|at most)\s+'
         r'(\d+\.?\d*)\s*%',
         re.IGNORECASE,
     )
@@ -2685,19 +2686,24 @@ class KalshiBattleBot:
         forecast_numbers.sort()
         median_forecast = forecast_numbers[len(forecast_numbers) // 2]
 
-        # Check if consensus contradicts the bet direction
+        # Determine what consensus implies for resolution
         consensus_above_threshold = median_forecast > threshold
-        if bet_above and not consensus_above_threshold:
-            # Betting YES (above threshold) but consensus is below — BLOCK
+        # YES resolves if: question asks "above X" and consensus is above X,
+        #                  OR question asks "below X" and consensus is below X
+        question_resolves_yes = consensus_above_threshold if bet_above else not consensus_above_threshold
+
+        # Block when consensus says our bet will LOSE:
+        # - We bet YES but consensus says NO will win
+        # - We bet NO but consensus says YES will win
+        if side == 'YES' and not question_resolves_yes:
             return True, (
-                f'CONSENSUS_CONTRADICTION_BET_ABOVE_{threshold}%_'
-                f'CONSENSUS_{median_forecast:.1f}%'
+                f'CONSENSUS_CONTRADICTION_YES_ON_{"ABOVE" if bet_above else "BELOW"}'
+                f'_{threshold}%_CONSENSUS_{median_forecast:.1f}%'
             )
-        if not bet_above and consensus_above_threshold:
-            # Betting YES (below threshold) but consensus is above — BLOCK
+        if side == 'NO' and question_resolves_yes:
             return True, (
-                f'CONSENSUS_CONTRADICTION_BET_BELOW_{threshold}%_'
-                f'CONSENSUS_{median_forecast:.1f}%'
+                f'CONSENSUS_CONTRADICTION_NO_ON_{"ABOVE" if bet_above else "BELOW"}'
+                f'_{threshold}%_CONSENSUS_{median_forecast:.1f}%'
             )
         return False, ''
 
@@ -3230,18 +3236,21 @@ class KalshiBattleBot:
         # traders have Bloomberg/Reuters consensus terminals. When the market prices a
         # side at <20% but AI says >55%, trust the market — it has better information.
         # CPI at 13¢ YES with AI saying 79% YES is a clear sign AI is wrong, not edge.
+        # current_price is the YES price; signal.raw_prob is the AI's YES probability.
+        # Must adjust both for the bet side before comparing.
         _full_q_lower_econ = market.get('question', '').lower()
         _is_econ_market = any(kw in _full_q_lower_econ for kw in self._ECON_DATA_KEYWORDS)
         if _is_econ_market and not _is_crypto_range_q:
-            _our_side_mkt_price = current_price  # current_price is already the price of 'side'
-            if _our_side_mkt_price < 0.20 and signal.raw_prob > 0.55:
+            _our_side_mkt_price = current_price if side == 'YES' else (1.0 - current_price)
+            _our_side_ai_prob = signal.raw_prob if side == 'YES' else (1.0 - signal.raw_prob)
+            if _our_side_mkt_price < 0.20 and _our_side_ai_prob > 0.55:
                 should_trade = False
                 reasons.append(
-                    f'ECON_MARKET_SANITY_MKT{_our_side_mkt_price:.0%}_AI{signal.raw_prob:.0%}'
+                    f'ECON_MARKET_SANITY_MKT{_our_side_mkt_price:.0%}_AI{_our_side_ai_prob:.0%}'
                 )
                 print(
-                    f"[EconGuard] BLOCKED {market_id[:35]} — market={_our_side_mkt_price:.0%} "
-                    f"but AI={signal.raw_prob:.0%}. Market has Bloomberg consensus, AI doesn't."
+                    f"[EconGuard] BLOCKED {market_id[:35]} — our side: market={_our_side_mkt_price:.0%} "
+                    f"but AI={_our_side_ai_prob:.0%}. Market has Bloomberg consensus, AI doesn't."
                 )
 
         # Require meaningful intelligence for non-crypto-range markets.
