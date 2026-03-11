@@ -4298,43 +4298,54 @@ class KalshiBattleBot:
 
                 status = market.get('status', '')
 
-                if status == 'settled':
-                    # Market has settled - record outcome
-                    result = market.get('result', '')  # 'yes' or 'no'
+                # Kalshi uses both 'settled' and 'finalized' for resolved markets
+                if status in ('settled', 'finalized'):
+                    result = (market.get('result') or '').lower().strip()
                     signal['outcome_checked'] = True
-                    
-                    if result:
-                        predicted_side = signal.get('side', '').lower()
-                        actual_result = result.lower()
-                        
-                        # Did our prediction win?
-                        signal['actual_result'] = actual_result
-                        signal['predicted_correct'] = (predicted_side == actual_result)
-                        
-                        # Calculate what P&L would have been.
-                        # market_price is the YES midpoint; adjust for NO bets so we
-                        # use the actual entry cost (1 - yes_price = no_price).
-                        _yes_price = signal.get('market_price', 0)
-                        _side = signal.get('side', '').lower()
-                        entry_price = _yes_price if _side != 'no' else (1.0 - _yes_price)
+
+                    if result in ('yes', 'no'):
+                        predicted_side = signal.get('side', '').lower().strip()
+
+                        signal['actual_result'] = result
+                        signal['predicted_correct'] = (predicted_side == result)
+
+                        # Theoretical P&L per contract at the signal's market price.
+                        # market_price is always the YES price; for a NO bet our
+                        # entry cost is (1 - yes_price).
+                        _yes_price = float(signal.get('market_price', 0.5))
+                        _side = signal.get('side', '').lower().strip()
+                        entry_price = _yes_price if _side == 'yes' else (1.0 - _yes_price)
+                        entry_price = max(0.01, min(0.99, entry_price))  # clamp to valid range
+
                         if signal['predicted_correct']:
-                            # Won: paid entry_price per contract, received $1
-                            signal['theoretical_pnl'] = 1.0 - entry_price
+                            signal['theoretical_pnl'] = round(1.0 - entry_price, 4)
                         else:
-                            # Lost: paid entry_price per contract, received $0
-                            signal['theoretical_pnl'] = -entry_price
-                        
+                            signal['theoretical_pnl'] = round(-entry_price, 4)
+
                         signal['outcome'] = 'WIN' if signal['predicted_correct'] else 'LOSS'
                         checked_count += 1
-                    
-                elif status == 'closed':
-                    # Market closed but not yet settled
+                    else:
+                        # Settled but result field empty/unexpected — mark checked so
+                        # we don't hammer the API on this market forever
+                        signal['outcome'] = 'UNKNOWN'
+
+                elif status in ('closed', 'open', 'active'):
+                    # Not settled yet — will check again next cycle
                     pass
+                else:
+                    # Unknown status — mark checked to avoid infinite retries
+                    signal['outcome_checked'] = True
+                    signal['outcome'] = f'UNKNOWN_STATUS_{status}'
                     
                 await asyncio.sleep(0.3)  # Rate limit
                 
             except Exception as e:
-                if '404' not in str(e).lower():
+                err_str = str(e).lower()
+                if '404' in err_str:
+                    # Market no longer exists on Kalshi — stop retrying
+                    signal['outcome_checked'] = True
+                    signal['outcome'] = 'MARKET_NOT_FOUND'
+                else:
                     print(f"[Signal Check] Error for {market_id}: {e}")
         
         if checked_count > 0:
