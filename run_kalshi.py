@@ -2461,7 +2461,12 @@ class KalshiBattleBot:
                         elif 'TERMINAL_WRITEOFF' in exit_reason_stored:
                             cooldown_hours = 24.0  # Dead markets must not be re-entered until settled
                         else:
-                            cooldown_hours = 2.0
+                            # STOP_LOSS / SYNC_REMOVED / other forced exits:
+                            # 24h cooldown prevents the bot from flipping sides on the same
+                            # market the same day (e.g. exit gold NO at 2am, re-enter gold YES
+                            # at noon).  The original 2h was too short — gold re-entry today
+                            # deployed $211 on a coin-flip after a stop-loss exit.
+                            cooldown_hours = 24.0
                         if (datetime.utcnow() - recent_exit).total_seconds() / 3600 < cooldown_hours:
                             continue
 
@@ -3408,16 +3413,17 @@ class KalshiBattleBot:
         # Cooldown varies by exit reason:
         #  - PROFIT_LOCK / NEAR_SETTLEMENT: 6h (won, don't re-buy)
         #  - TERMINAL_WRITEOFF: 24h (position is terminal/dead — stay away until resolution)
-        #  - Other exits: 2h (prevent chasing)
+        #  - STOP_LOSS / other forced exits: 24h — prevents same-day side-flip
+        #    (gold NO stop-lossed at 2am → gold YES entered at noon = $211 coin-flip).
+        #    The original 2h was too short for this protection to be meaningful.
         recent_exit = self._recently_exited.get(market_id)
         if recent_exit:
             exit_reason_stored = self._recently_exited_reason.get(market_id, '')
             if 'PROFIT_LOCK' in exit_reason_stored or 'NEAR_SETTLEMENT' in exit_reason_stored:
                 cooldown_hours = 6.0
-            elif 'TERMINAL_WRITEOFF' in exit_reason_stored:
-                cooldown_hours = 24.0
             else:
-                cooldown_hours = 2.0
+                # TERMINAL_WRITEOFF, STOP_LOSS, SYNC_REMOVED, SETTLED — all 24h
+                cooldown_hours = 24.0
             hours_since_exit = (datetime.utcnow() - recent_exit).total_seconds() / 3600
             if hours_since_exit < cooldown_hours:
                 should_trade = False
@@ -3516,6 +3522,22 @@ class KalshiBattleBot:
                 if position_size > max_size_by_liquidity:
                     print(f"[Liquidity Cap] ${position_size:.2f} → ${max_size_by_liquidity:.2f} (OI={open_interest}, max {self.max_oi_pct*100:.0f}%)")
                     position_size = max_size_by_liquidity
+
+            # BANKROLL % CAP: No single bet can exceed MAX_BET_PCT of the current live
+            # account value.  Default 15%.  Uses _kalshi_total (synced from Kalshi API
+            # every ~5 minutes) so it tracks real drawdowns, not just the initial bankroll.
+            # Fallback to max_position_size if live value not yet synced.
+            # Root cause: gold YES entered at $211 (26% of $797 portfolio) on a coin-flip
+            # after the gold NO stop-lossed — one bad move could have wiped the account.
+            MAX_BET_PCT = float(os.getenv('MAX_BET_PCT', '0.15'))  # 15% default
+            _live_bankroll = self._kalshi_total if self._kalshi_total and self._kalshi_total > 10 else self.max_position_size / MAX_BET_PCT
+            _bankroll_cap = _live_bankroll * MAX_BET_PCT
+            if position_size > _bankroll_cap:
+                print(
+                    f"[Bankroll Cap] ${position_size:.2f} → ${_bankroll_cap:.2f} "
+                    f"({MAX_BET_PCT*100:.0f}% of ${_live_bankroll:.0f} live bankroll)"
+                )
+                position_size = _bankroll_cap
 
             # CRYPTO RANGE CAP: BTC/ETH/SOL/XRP range bucket markets are high-variance.
             # Historical data: a single bad range bet ($14.88) wiped out 6 consecutive
