@@ -3192,10 +3192,16 @@ class KalshiBattleBot:
         _q_lower_cat = market.get('question', '').lower()
         _ticker_cat = market_id.upper()
 
-        # DOGE: 0/2 trades, -$22.19 net — block entirely regardless of edge
+        # DOGE non-range bets: 0/2, -$22.19 net — block.
+        # DOGE *range* markets (KXDOGE- series) go through the quant model and are
+        # evaluated on vol/spot math — don't block those here.
         _is_doge_market = (
-            _ticker_cat.startswith('KXDOGE-') or
-            ('dogecoin' in _q_lower_cat and 'price' in _q_lower_cat and 'range' not in _q_lower_cat)
+            not _is_crypto_range_q and  # allow DOGE range markets through quant gate
+            (
+                _ticker_cat.startswith('KXDOGE-') or
+                'dogecoin' in _q_lower_cat or
+                'doge price' in _q_lower_cat
+            )
         )
         if _is_doge_market:
             should_trade = False
