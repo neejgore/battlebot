@@ -3551,7 +3551,7 @@ class KalshiBattleBot:
             _is_range_question = any(x in _q_lower_range for x in
                                      ['bitcoin price range', 'ethereum price range', 'btc price range',
                                       'eth price range', 'solana price range', 'nasdaq price range'])
-            CRYPTO_RANGE_MAX = float(os.getenv('CRYPTO_RANGE_MAX_SIZE', '8.0'))
+            CRYPTO_RANGE_MAX = float(os.getenv('CRYPTO_RANGE_MAX_SIZE', '16.0'))
             if (_is_range_market or _is_range_question) and position_size > CRYPTO_RANGE_MAX:
                 print(f"[Crypto Range Cap] ${position_size:.2f} → ${CRYPTO_RANGE_MAX:.2f} (range market size limit)")
                 position_size = CRYPTO_RANGE_MAX
