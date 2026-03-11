@@ -3186,10 +3186,62 @@ class KalshiBattleBot:
                 reasons.append(f'DAILY_LOSS_LIMIT_{daily_loss_pct*100:.1f}pct')
                 print(f"[Risk] Daily loss circuit breaker: {daily_loss_pct*100:.1f}% today — pausing new bets")
 
-        if edge < self.min_edge:
-            should_trade = False
-            reasons.append('LOW_EDGE')
+        # CATEGORY-SPECIFIC EDGE THRESHOLDS
+        # Historical win rates per category drive these overrides.
+        # The MIN_EDGE env var is the global floor; these rules can raise OR lower it.
+        _q_lower_cat = market.get('question', '').lower()
+        _ticker_cat = market_id.upper()
 
+        # DOGE: 0/2 trades, -$22.19 net — block entirely regardless of edge
+        _is_doge_market = (
+            _ticker_cat.startswith('KXDOGE-') or
+            ('dogecoin' in _q_lower_cat and 'price' in _q_lower_cat and 'range' not in _q_lower_cat)
+        )
+        if _is_doge_market:
+            should_trade = False
+            reasons.append('DOGE_BLOCKED_0PCT_WIN_RATE')
+
+        # Political "will X meet Y" markets: 2/7, -$18.84 — require 25% edge (up from 12%)
+        _is_political_meeting = (
+            any(phrase in _q_lower_cat for phrase in [
+                ' meet ', ' meets ', 'will trump meet', 'meet before', 'meet with',
+                'have a meeting', 'hold a meeting', 'sit down with',
+            ])
+        )
+        _political_meeting_min_edge = 0.25
+        if _is_political_meeting and edge < _political_meeting_min_edge:
+            should_trade = False
+            reasons.append(f'POLITICAL_MEETING_LOW_EDGE_{edge:.0%}_need_{_political_meeting_min_edge:.0%}')
+
+        # "OTHER" high-performing markets: specific elections, intl politics, yields, weather bets
+        # Historical: 6/6, +$28.09, 100% WR — lower edge floor to 8% to capture more
+        _is_high_perf_other = (
+            not _is_doge_market and
+            not _is_political_meeting and
+            not _is_crypto_range_q and
+            not any(kw in _q_lower_cat for kw in self._ECON_DATA_KEYWORDS) and
+            not any(kw in _q_lower_cat for kw in ['bitcoin', 'btc ', 'ethereum', ' eth ',
+                                                    'solana', 'xrp', 'ripple']) and
+            any(kw in _q_lower_cat for kw in [
+                'election', 'mayor', 'win the', 'nominee', 'treasury', 'yield',
+                'interest rate', 'chancellor', 'prime minister', 'parliament',
+                'referendum', 'vote', 'polling', 'approval rating',
+            ])
+        )
+        _other_min_edge = 0.08
+        _effective_min_edge = _other_min_edge if _is_high_perf_other else self.min_edge
+        if edge < _effective_min_edge and not _is_doge_market and not _is_political_meeting:
+            should_trade = False
+            reasons.append(f'LOW_EDGE_{edge:.0%}_need_{_effective_min_edge:.0%}')
+        elif edge >= _effective_min_edge and edge < self.min_edge:
+            # Passed the lower category threshold — log it so we can track
+            print(f"[CatEdge] {market_id[:35]} qualifies on OTHER edge {edge:.0%} >= {_other_min_edge:.0%}")
+        elif edge < self.min_edge:
+            pass  # already blocked above by category-specific rules
+        else:
+            pass  # passes global min_edge normally
+
+        # Confidence check — global minimum, no category override
         if signal.confidence < self.min_confidence:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
