@@ -4877,9 +4877,9 @@ class KalshiBattleBot:
     async def _handle_reset_killswitch(self, request):
         """Manually clear the kill switch so trading resumes immediately."""
         self._risk_engine.daily_stats.kill_switch_triggered = False
-        self._risk_engine.daily_stats.current_drawdown = 0.0
+        self._risk_engine.daily_stats.current_drawdown_pct = 0.0
         self._kill_switch_fire_date = ''
-        await self._save_state()
+        self._save_state()
         print("[KILL SWITCH] Manually reset via /api/reset-killswitch")
         return web.json_response({'ok': True, 'message': 'Kill switch cleared — trading resumed.'})
 
