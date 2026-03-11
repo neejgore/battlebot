@@ -2627,6 +2627,80 @@ class KalshiBattleBot:
             return 'geopolitics'
         return 'other'
 
+    # Economic data release market keywords — these markets are priced by professionals
+    # with Bloomberg/Reuters consensus forecasts. Claude's priors are unreliable here.
+    _ECON_DATA_KEYWORDS = [
+        'cpi', 'consumer price index', 'core cpi', 'inflation',
+        'pce', 'personal consumption', 'core pce',
+        'ppi', 'producer price',
+        'gdp', 'gross domestic product',
+        'nfp', 'non-farm payroll', 'nonfarm payroll', 'jobs report', 'unemployment',
+        'retail sales', 'durable goods', 'industrial production',
+        'fomc', 'fed funds rate', 'federal reserve', 'interest rate decision',
+        'jobs added', 'payrolls',
+    ]
+    # Regex to extract percentage numbers from news snippets (e.g. "2.5%", "0.3%")
+    _PCT_RE = re.compile(r'(\d+\.?\d*)\s*%')
+    # Regex to extract the threshold value from the market question
+    _THRESHOLD_RE = re.compile(
+        r'\b(above|below|over|under|higher than|lower than|exceed|at least|at most)\s+'
+        r'(\d+\.?\d*)\s*%',
+        re.IGNORECASE,
+    )
+
+    def _extract_economic_consensus(
+        self, question_full: str, news_items: list, side: str
+    ) -> tuple[bool, str]:
+        """For economic data release markets, extract consensus forecasts from news
+        and check whether they contradict the bet.
+
+        Returns (should_block: bool, reason: str).
+        The bet is blocked when the news consensus lands on the OPPOSITE side of the
+        threshold — meaning we're betting against what every published forecast says.
+        """
+        q_lower = question_full.lower()
+        if not any(kw in q_lower for kw in self._ECON_DATA_KEYWORDS):
+            return False, ''
+
+        # Extract the threshold from the question
+        m = self._THRESHOLD_RE.search(question_full)
+        if not m:
+            return False, ''
+        direction = m.group(1).lower()   # "above", "below", etc.
+        threshold = float(m.group(2))
+        bet_above = direction in ('above', 'over', 'higher than', 'exceed', 'at least')
+
+        # Collect all percentage numbers from news snippets
+        forecast_numbers = []
+        for item in (news_items or []):
+            text = f"{getattr(item, 'title', '')} {getattr(item, 'snippet', '')}"
+            nums = [float(n) for n in self._PCT_RE.findall(text)
+                    if 0.0 < float(n) < 20.0]  # plausible econ data range
+            forecast_numbers.extend(nums)
+
+        if not forecast_numbers:
+            return False, ''
+
+        # Use median of extracted numbers as the consensus estimate
+        forecast_numbers.sort()
+        median_forecast = forecast_numbers[len(forecast_numbers) // 2]
+
+        # Check if consensus contradicts the bet direction
+        consensus_above_threshold = median_forecast > threshold
+        if bet_above and not consensus_above_threshold:
+            # Betting YES (above threshold) but consensus is below — BLOCK
+            return True, (
+                f'CONSENSUS_CONTRADICTION_BET_ABOVE_{threshold}%_'
+                f'CONSENSUS_{median_forecast:.1f}%'
+            )
+        if not bet_above and consensus_above_threshold:
+            # Betting YES (below threshold) but consensus is above — BLOCK
+            return True, (
+                f'CONSENSUS_CONTRADICTION_BET_BELOW_{threshold}%_'
+                f'CONSENSUS_{median_forecast:.1f}%'
+            )
+        return False, ''
+
     # Real-world tradeable assets whose threshold markets require live price context.
     # Maps lowercase keyword found in the market question → Brave search query for current price.
     _COMMODITY_PRICE_QUERIES: dict[str, str] = {
@@ -3137,6 +3211,39 @@ class KalshiBattleBot:
                     f"but market={_yes_market_price:.0%} YES. Likely stale AI price data."
                 )
 
+        # ECONOMIC DATA CONSENSUS CHECK: For CPI/GDP/jobs/PCE/PPI/FOMC markets,
+        # extract the consensus forecast from news and block if it contradicts the bet.
+        # Example that triggered this: news said "core CPI forecast 2.5%" but bot bet
+        # YES on "above 2.6%" — that is betting directly against every published forecast.
+        # Professional traders price these markets using Bloomberg consensus; Claude's
+        # priors about inflation/growth are unreliable against hard published forecasts.
+        if not _is_crypto_range_q and intel and intel.news_items:
+            _econ_block, _econ_reason = self._extract_economic_consensus(
+                market.get('question', ''), intel.news_items, side
+            )
+            if _econ_block:
+                should_trade = False
+                reasons.append(_econ_reason)
+                print(f"[ConsensusGuard] BLOCKED {market_id[:35]} — {_econ_reason}")
+
+        # ECONOMIC DATA MARKET PRICE SANITY: For economic data markets, professional
+        # traders have Bloomberg/Reuters consensus terminals. When the market prices a
+        # side at <20% but AI says >55%, trust the market — it has better information.
+        # CPI at 13¢ YES with AI saying 79% YES is a clear sign AI is wrong, not edge.
+        _full_q_lower_econ = market.get('question', '').lower()
+        _is_econ_market = any(kw in _full_q_lower_econ for kw in self._ECON_DATA_KEYWORDS)
+        if _is_econ_market and not _is_crypto_range_q:
+            _our_side_mkt_price = current_price  # current_price is already the price of 'side'
+            if _our_side_mkt_price < 0.20 and signal.raw_prob > 0.55:
+                should_trade = False
+                reasons.append(
+                    f'ECON_MARKET_SANITY_MKT{_our_side_mkt_price:.0%}_AI{signal.raw_prob:.0%}'
+                )
+                print(
+                    f"[EconGuard] BLOCKED {market_id[:35]} — market={_our_side_mkt_price:.0%} "
+                    f"but AI={signal.raw_prob:.0%}. Market has Bloomberg consensus, AI doesn't."
+                )
+
         # Require meaningful intelligence for non-crypto-range markets.
         # Crypto range markets use the quant model (vol/spot math) as their signal — they
         # intentionally skip the Brave news fetch for efficiency, so has_intel=False is
@@ -3155,7 +3262,12 @@ class KalshiBattleBot:
 
         _held_market_ids = {p.get('market_id') for p in self._positions.values()}
         _pending_market_ids = {o.get('market_id') for o in self._pending_orders.values()}
-        if market_id in _held_market_ids or market_id in _pending_market_ids:
+        # Also deduplicate by question text — two different Kalshi market IDs can have
+        # identical question text (e.g. multiple CPI series). Don't hold both.
+        _held_questions = {p.get('question', '').strip().lower() for p in self._positions.values()}
+        _this_question = market.get('question', '').strip().lower()
+        if (market_id in _held_market_ids or market_id in _pending_market_ids
+                or _this_question in _held_questions):
             should_trade = False
             reasons.append('ALREADY_IN_POSITION')
         
