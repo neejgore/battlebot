@@ -2868,8 +2868,21 @@ class KalshiBattleBot:
         _ticker_upper_q = market_id.upper()
         _RANGE_PREFIXES_Q = ('KXBTC-', 'KXETH-', 'KXBCH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXNASDAQ100-')
         _is_crypto_range_q = any(_ticker_upper_q.startswith(p) for p in _RANGE_PREFIXES_Q)
+        # BTC/ETH: invert signal (log-normal is inversely correlated — 13.7% win rate → bet opposite)
+        _BTC_ETH_RANGE_PREFIXES = ('KXBTC-', 'KXETH-')
+        _is_btc_eth_range = _is_crypto_range_q and any(_ticker_upper_q.startswith(p) for p in _BTC_ETH_RANGE_PREFIXES)
+        # DOGE/XRP/SOL/BCH: block entirely — historical defaults only, no validated model
+        _ALT_RANGE_PREFIXES = ('KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXBCH-')
+        _is_alt_range = _is_crypto_range_q and any(_ticker_upper_q.startswith(p) for p in _ALT_RANGE_PREFIXES)
         _quant_result: CryptoEdgeResult = None
         _quant_override_prob: float = None
+        _invert_crypto_range: bool = False  # True when we flip BTC/ETH signal to opposite side
+
+        # Block DOGE/XRP/SOL/BCH range bets — no live vol model, historical defaults only
+        if _is_alt_range:
+            self._log_filter(market_id, market.get('question', ''), 'ALT_RANGE_NO_VALIDATED_MODEL', current_price)
+            print(f"[QuantEdge] BLOCK {market_id[:30]} — alt range (DOGE/XRP/SOL/BCH): no validated quant model")
+            return
 
         if _is_crypto_range_q:
             try:
@@ -2900,7 +2913,18 @@ class KalshiBattleBot:
                             f"threshold {QUANT_MIN_EDGE:.1%}"
                         )
                         return
-                    _quant_override_prob = _quant_result.quant_prob
+                    if _is_btc_eth_range:
+                        # Invert: empirical data shows log-normal picks the wrong side (13.7% WR).
+                        # When quant sees edge for YES (in-range), we bet NO (out-of-range).
+                        # Use 1 - quant_prob so the blended signal points toward NO.
+                        _quant_override_prob = 1.0 - _quant_result.quant_prob
+                        _invert_crypto_range = True
+                        print(
+                            f"[QuantEdge] INVERTED (BTC/ETH): "
+                            f"quant_yes={_quant_result.quant_prob:.1%} → using NO prob={_quant_override_prob:.1%}"
+                        )
+                    else:
+                        _quant_override_prob = _quant_result.quant_prob
                 else:
                     # evaluate_range_market returned None (NASDAQ or unparseable) — fall through to normal flow
                     pass
@@ -3186,6 +3210,28 @@ class KalshiBattleBot:
             trade_prob = adjusted_prob if side == 'YES' else 1 - adjusted_prob
             trade_price = yes_fill if side == 'YES' else no_fill
         
+        # BTC/ETH range inversion: force NO side with empirical win rate as trade prob.
+        # The blended prob (inverted quant + Claude) may still land above 0.5 in some cases,
+        # so we override explicitly here to guarantee the correct contrarian direction.
+        # Empirical NO win rate from signal log: ~86% (29 samples). We use 0.80 conservatively.
+        if _invert_crypto_range and _quant_result:
+            _orig_side = side
+            side = 'NO'
+            trade_prob = 0.80   # conservative empirical estimate for NO win rate
+            trade_price = no_fill
+            edge = trade_prob - no_fill  # edge vs actual fill cost
+            if edge < 0:
+                # NO is too expensive at current price — skip this bet
+                print(
+                    f"[QuantEdge] INVERTED NO — no edge after fill cost "
+                    f"(prob=0.80 < no_fill={no_fill:.2f}), skipping"
+                )
+                return
+            print(
+                f"[QuantEdge] INVERTED {_orig_side}→NO | "
+                f"empirical_prob=80% no_fill={no_fill:.2f} edge={edge:+.1%}"
+            )
+
         # Step 5: Apply contrarian edge adjustment
         contrarian_multiplier = 1.0
         if self._use_contrarian and intel and intel.overreaction_detected:
