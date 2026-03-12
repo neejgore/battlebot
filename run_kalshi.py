@@ -253,10 +253,15 @@ class KalshiBattleBot:
                     # never fires until current_bankroll drops below $100 (i.e. a full 20%
                     # real loss instead of 15%).
                     _today_snap = self._daily_snapshots.get(_today, {})
-                    _today_start = _today_snap.get('start_of_day_value')
+                    # If the kill switch was manually reset today, use the reset baseline
+                    # (stored as _ks_reset_baseline) instead of the original start_of_day.
+                    # This survives redeploys so the reset isn't wiped every time Railway restarts.
+                    _ks_reset_baseline = _today_snap.get('_ks_reset_baseline')
+                    _today_start = _ks_reset_baseline or _today_snap.get('start_of_day_value')
                     if _today_start and _today_start > 0:
                         self._risk_engine.daily_stats.starting_bankroll = _today_start
-                        print(f"[State] Restored today's starting bankroll: ${_today_start:.2f}")
+                        _label = 'reset baseline' if _ks_reset_baseline else 'start_of_day'
+                        print(f"[State] Restored today's starting bankroll ({_label}): ${_today_start:.2f}")
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals, {len(self._recently_exited)} exit cooldowns")
                     
                     # Clear ALL reconciled trades - they have corrupted P&L data
@@ -1054,14 +1059,26 @@ class KalshiBattleBot:
 
                 # Sync the risk engine with current market value (not cost basis) so the
                 # kill-switch sees real unrealized losses, not just settled cash changes.
-                _ks_was_triggered = self._risk_engine.daily_stats.kill_switch_triggered
-                self._risk_engine.sync_bankroll(_account_for_snapshot)
-                # Stamp kill-switch fire date exactly once on False→True transition.
-                if (not _ks_was_triggered
-                        and self._risk_engine.daily_stats.kill_switch_triggered
-                        and not self._kill_switch_fire_date):
-                    self._kill_switch_fire_date = datetime.utcnow().strftime('%Y-%m-%d')
-                    print(f"[KILL SWITCH] Triggered — fire date stamped: {self._kill_switch_fire_date}")
+                #
+                # Spike guard: same logic as _save_daily_snapshot — if the new total is
+                # >35% below the previous sync value in a single cycle, it's almost certainly
+                # a bad Kalshi API reading. Don't pass it to sync_bankroll or the kill switch
+                # fires on garbage data. Log a warning and skip this sync's bankroll update.
+                _prev_bankroll = self._risk_engine.daily_stats.current_bankroll or _account_for_snapshot
+                _bankroll_ratio = _account_for_snapshot / _prev_bankroll if _prev_bankroll > 0 else 1.0
+                if _bankroll_ratio < 0.65 and _prev_bankroll > 50:
+                    print(f"[SyncGuard] SPIKE: skipping sync_bankroll — "
+                          f"total=${_account_for_snapshot:.2f} vs prev=${_prev_bankroll:.2f} "
+                          f"({_bankroll_ratio:.2f}x). Kalshi API bad reading, kill switch protected.")
+                else:
+                    _ks_was_triggered = self._risk_engine.daily_stats.kill_switch_triggered
+                    self._risk_engine.sync_bankroll(_account_for_snapshot)
+                    # Stamp kill-switch fire date exactly once on False→True transition.
+                    if (not _ks_was_triggered
+                            and self._risk_engine.daily_stats.kill_switch_triggered
+                            and not self._kill_switch_fire_date):
+                        self._kill_switch_fire_date = datetime.utcnow().strftime('%Y-%m-%d')
+                        print(f"[KILL SWITCH] Triggered — fire date stamped: {self._kill_switch_fire_date}")
 
             if not kalshi_positions:
                 # An empty response means either we genuinely have no open positions,
@@ -5197,6 +5214,18 @@ class KalshiBattleBot:
         self._risk_engine.daily_stats.starting_bankroll = live
         self._risk_engine.daily_stats.current_bankroll = live
         self._kill_switch_fire_date = ''
+
+        # Also update start_of_day_value in the snapshot so that after a redeploy
+        # _load_state restores starting_bankroll = live (not the stale $726 value).
+        # Without this, every new deploy re-reads the old baseline and re-triggers.
+        today_str = datetime.utcnow().strftime('%Y-%m-%d')
+        snap = self._daily_snapshots.get(today_str, {})
+        snap['start_of_day_value'] = round(live, 2)
+        snap['_ks_reset'] = True   # flag so migration guard doesn't overwrite it
+        self._daily_snapshots[today_str] = snap
+        # Store kill-switch-reset baseline separately so _load_state restores it correctly
+        snap['_ks_reset_baseline'] = round(live, 2)
+
         self._save_state()
         print(f"[KILL SWITCH] Manually reset via /api/reset-killswitch — new baseline ${live:.2f}")
         return web.json_response({'ok': True, 'message': f'Kill switch cleared — drawdown re-baselined from ${live:.2f}.'})
