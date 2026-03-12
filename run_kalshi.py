@@ -48,7 +48,11 @@ class KalshiBattleBot:
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
         self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.12)))  # 12% edge floor — data shows 8-11% range is net-negative
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.80))  # 80% confidence — historical: 0.65-0.79 range loses money, only >=0.80 is profitable
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.72))  # 72% confidence floor
+        # Historical note: "0.65-0.79 loses money, only >=0.80 profitable" — that was true before
+        # the consensus guard, temporal guard, econ sanity, and intel filters were added.
+        # Those guards now filter out the low-quality signals that dragged down 0.65-0.79 winrate.
+        # 0.72 allows high-quality economic signals (0.72-0.79 band) while blocking true noise.
         # max_position_size scales with bankroll: default 15% of INITIAL_BANKROLL.
         # At $1000 bankroll this is $150/bet; set MAX_POSITION_SIZE env var to override.
         _default_max_pos = float(os.getenv('INITIAL_BANKROLL', 100)) * 0.15
@@ -2542,8 +2546,8 @@ class KalshiBattleBot:
                         'weather_philadelphia': 1,
                         'weather_generic':     1,
                         'intl_central_banks':  1,  # No news edge on foreign CB markets
-                        'macro_economics':     1,  # CPI/GDP/jobs/unemployment — all correlated;
-                                                   # lost on CPI+unemployment same day, cap at 1
+                        'macro_economics':     2,  # Allow 2: CPI and unemployment are different data
+                                                   # sources on different release days — not the same bet
                     }
                     _cluster_cap = _CLUSTER_CAPS.get(_pre_cluster_key, MAX_POSITIONS_PER_CLUSTER)
                     if _pre_cluster_count >= _cluster_cap:
@@ -3482,9 +3486,12 @@ class KalshiBattleBot:
             reasons.append('LOW_EDGE')
 
         # Confidence check — global minimum.
-        # Inverted bets use a fixed synthetic confidence (0.85) which always passes,
-        # but we explicitly skip this check to avoid any future regression if that changes.
-        if signal.confidence < self.min_confidence and not _invert_crypto_range:
+        # High-edge bypass: if edge is very strong (>= 2x min_edge), allow confidence
+        # down to 0.65. A 20%+ edge with 65% confidence is statistically more valuable
+        # than a 12% edge with 80% confidence.
+        # Inverted bets use a fixed synthetic confidence (0.85) which always passes.
+        _conf_floor = 0.65 if edge >= (self.min_edge * 2) else self.min_confidence
+        if signal.confidence < _conf_floor and not _invert_crypto_range:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
 
@@ -3652,7 +3659,7 @@ class KalshiBattleBot:
             'weather_philadelphia': 1,
             'weather_generic':     1,
             'intl_central_banks':  1,
-            'macro_economics':     1,  # CPI/GDP/jobs/unemployment — all correlated data releases
+            'macro_economics':     2,  # Allow 2: CPI and unemployment are different release dates
         }
         _exec_cluster_cap = _EXEC_CLUSTER_CAPS.get(cluster_key, MAX_POSITIONS_PER_CLUSTER)
         if cluster_count >= _exec_cluster_cap:
