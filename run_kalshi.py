@@ -5089,45 +5089,70 @@ class KalshiBattleBot:
 
     async def _handle_positions(self, request):
         """Dedicated positions endpoint — full question text, all positions, live P&L.
-        Uses internal _positions dict as source of truth (always complete) and enriches
-        with live prices from _markets cache + _kalshi_positions_raw fallback."""
+        Uses the UNION of _positions (internal, has entry prices) and _kalshi_positions_raw
+        (Kalshi API, authoritative for what actually exists) so nothing is ever missed."""
         try:
             if self._kalshi_cash is None or self._kalshi_total is None:
                 return web.json_response({'error': 'syncing', 'positions': []})
 
-            # Build a quick ticker→kalshi_pos lookup for market_exposure fallback
-            kalshi_by_ticker = {p.get('ticker', ''): p for p in self._kalshi_positions_raw}
+            # Index both sources by ticker for merging
+            internal_by_ticker: dict = {}
+            for pos in self._positions.values():
+                t = pos.get('market_id', '')
+                if t:
+                    internal_by_ticker[t] = pos
+
+            kalshi_by_ticker: dict = {}
+            for kp in self._kalshi_positions_raw:
+                t = kp.get('ticker', '')
+                if t and kp.get('position', 0) != 0:
+                    kalshi_by_ticker[t] = kp
+
+            # Union: start with all tickers that appear in either source
+            all_tickers = set(internal_by_ticker) | set(kalshi_by_ticker)
 
             positions_detail = []
 
-            for pos in self._positions.values():
-                ticker = pos.get('market_id', '')
-                if not ticker:
+            for ticker in all_tickers:
+                internal = internal_by_ticker.get(ticker, {})
+                kpos     = kalshi_by_ticker.get(ticker, {})
+
+                # Side / contracts — prefer internal (has bot context), fall back to Kalshi
+                if internal:
+                    side      = internal.get('side', 'YES').upper()
+                    contracts = internal.get('contracts', 0)
+                    entry_price = internal.get('entry_price', 0.5)
+                    question  = internal.get('question', ticker)
+                    entry_time = internal.get('entry_time')
+                elif kpos:
+                    raw_c = kpos.get('position', 0)
+                    side  = 'YES' if raw_c > 0 else 'NO'
+                    contracts = abs(raw_c)
+                    entry_price = None  # unknown — will default to current
+                    cached_market = self._markets.get(ticker, {})
+                    question = cached_market.get('question', kpos.get('title', ticker))
+                    entry_time = None
+                else:
                     continue
 
-                side = pos.get('side', 'YES').upper()
-                contracts = pos.get('contracts', 0)
-                entry_price = pos.get('entry_price', 0.5)
-                question = pos.get('question', ticker)
-                entry_time = pos.get('entry_time')
-
-                # Current price: prefer live _markets cache, fall back to kalshi market_exposure
+                # Current price: prefer live _markets cache, fall back to market_exposure
                 cached_market = self._markets.get(ticker, {})
                 yes_price = cached_market.get('yes_price')
-                no_price = cached_market.get('no_price')
+                no_price  = cached_market.get('no_price')
 
-                if yes_price is None:
-                    kpos = kalshi_by_ticker.get(ticker, {})
+                if yes_price is None and kpos:
                     _exp = abs(kpos.get('market_exposure', 0)) / 100
-                    _c = abs(kpos.get('position', contracts))
+                    _c   = abs(kpos.get('position', contracts))
                     if _exp > 0 and _c > 0:
                         yes_price = _exp / _c if side == 'YES' else 1 - _exp / _c
-                    else:
-                        yes_price = entry_price  # no movement data yet — show flat
+                if yes_price is None:
+                    yes_price = entry_price or 0.5
                 if no_price is None:
                     no_price = 1 - yes_price
 
                 current_price = yes_price if side == 'YES' else no_price
+                if entry_price is None:
+                    entry_price = current_price  # unknown entry — show flat
 
                 cost = contracts * entry_price
                 value = contracts * current_price
