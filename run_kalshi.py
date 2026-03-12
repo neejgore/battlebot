@@ -2998,7 +2998,33 @@ class KalshiBattleBot:
                 use_cache = True
 
         signal = None  # ensure signal is always defined before use
-        if use_cache:
+
+        # For inverted BTC/ETH range bets: skip Claude entirely.
+        # We're betting based on an empirical contrarian signal, not AI probability.
+        # Using a synthetic signal avoids wasting API credits and prevents Claude's
+        # confidence score from incorrectly blocking an empirically-backed bet.
+        if _invert_crypto_range and _quant_result:
+            from logic.ai_signal import AISignalOutput
+            signal = AISignalOutput(
+                raw_prob=_quant_override_prob,  # 1 - quant_prob (inverted)
+                confidence=0.85,               # fixed: empirical signal, not model-derived
+                key_reasons=[f"INVERTED: log-normal shows {_quant_result.quant_prob:.0%} YES → bet NO (empirical 86% WR)"],
+                disconfirming_evidence=["small sample (29 obs)", "market could re-price"],
+                what_would_change_mind=["win rate drops below 60% over 50+ settled bets"],
+                timeline_sensitivity="no: quant model only",
+                failure_modes=["fat-tail move puts price in range despite model signal"],
+                base_rate_considered=True,
+                information_quality="medium",
+            )
+            class _InvertedResult:
+                success = True
+                error = None
+                latency_ms = 0
+            result = _InvertedResult()
+            self._ai_successes += 1
+            print(f"[QuantEdge] INVERTED synthetic signal — skipping Claude call")
+
+        elif use_cache:
             # Reconstruct a minimal signal result from cache — no API call needed
             from logic.ai_signal import AISignalOutput
             _cached_raw_prob = cache_prob
@@ -3327,13 +3353,18 @@ class KalshiBattleBot:
             should_trade = False
             reasons.append('DOGE_BLOCKED_0PCT_WIN_RATE')
 
-        # Global edge floor — applies to all markets not already blocked above
-        if edge < self.min_edge and not _is_doge_market:
+        # Global edge floor — applies to all markets not already blocked above.
+        # Inverted BTC/ETH range bets use an empirical 80% win rate, not a model probability.
+        # Their edge guard is the `edge < 0` check in the inversion block above — we don't
+        # apply the standard 12% min_edge here because the formula measures different things.
+        if edge < self.min_edge and not _is_doge_market and not _invert_crypto_range:
             should_trade = False
             reasons.append('LOW_EDGE')
 
-        # Confidence check — global minimum
-        if signal.confidence < self.min_confidence:
+        # Confidence check — global minimum.
+        # Inverted bets use a fixed synthetic confidence (0.85) which always passes,
+        # but we explicitly skip this check to avoid any future regression if that changes.
+        if signal.confidence < self.min_confidence and not _invert_crypto_range:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
 
