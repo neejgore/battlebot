@@ -988,6 +988,23 @@ class KalshiBattleBot:
             # Always update (including to []) so the performance tab doesn't show stale
             # positions after they all close. The "no positions" early-return below only
             # fires when our own _positions dict is also empty — i.e. genuinely nothing open.
+            # Normalize field names: Kalshi changed position → position_fp (string),
+            # market_exposure → market_exposure_dollars (string, already in dollars not cents).
+            # We normalize once here so all downstream code continues to use the old names.
+            def _normalize_pos(kp: dict) -> dict:
+                # Contracts: positive = long YES, negative = long NO
+                if 'position_fp' in kp and 'position' not in kp:
+                    kp = dict(kp)
+                    kp['position'] = int(round(float(kp.get('position_fp') or 0)))
+                # Market exposure: convert dollars → cents to match old field convention
+                if 'market_exposure_dollars' in kp and 'market_exposure' not in kp:
+                    kp = dict(kp) if isinstance(kp, dict) else kp
+                    kp['market_exposure'] = round(float(kp.get('market_exposure_dollars') or 0) * 100)
+                # Realized PnL: convert dollars → cents for consistency
+                if 'realized_pnl_dollars' in kp and 'realized_pnl' not in kp:
+                    kp['realized_pnl'] = round(float(kp.get('realized_pnl_dollars') or 0) * 100)
+                return kp
+            kalshi_positions = [_normalize_pos(kp) for kp in kalshi_positions]
             self._kalshi_positions_raw = kalshi_positions
             
             # Step 3: Compute portfolio value from positions data.
