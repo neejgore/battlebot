@@ -2115,7 +2115,7 @@ class KalshiBattleBot:
         # Ultra-short markets resolve within 24h — widest coverage here for maximum trade frequency.
         # Short-term raised 100 → 150: more political/economic 1-7d markets in the analysis pool.
         # Medium-term raised 50 → 75: more 8-45d markets; same strict quality filters apply.
-        selected = _range_markets + _short_non_range[:150] + _ultra_non_range[:60] + medium_term[:75]
+        selected = _range_markets + _short_non_range[:300] + _ultra_non_range[:150] + medium_term[:150]
         
         # Log what we found
         print(f"[Time Horizon] Ultra-short (≤24h): {len(ultra_short)} | Short (1-7d): {len(short_term)} | Medium (8-365d): {len(medium_term)}")
