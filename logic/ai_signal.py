@@ -151,7 +151,8 @@ class AISignalGenerator:
     - Graceful degradation on failure
     """
     
-    DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Keep Sonnet — news synthesis quality drives the +17pp edge
+    DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Used when live news/data context is present
+    HAIKU_MODEL   = "claude-haiku-4-20250514"   # Used when no context — ~10x cheaper, quality parity without news
     MAX_RETRIES = 1
     TIMEOUT_SECONDS = 30.0
     MAX_TOKENS = 1500  # Raised from 800 — full 9-field JSON schema with list fields can exceed 800 tokens and truncate silently
@@ -214,6 +215,8 @@ class AISignalGenerator:
         overreaction_info: Optional[str] = None,
         # Historical performance for learning
         historical_performance: Optional[str] = None,
+        # Model selection: caller sets True when no live news/data context was fetched
+        use_haiku: bool = False,
     ) -> AISignalResult:
         """Generate a probability signal for a market.
         
@@ -273,6 +276,13 @@ class AISignalGenerator:
             historical_performance=historical_performance,
         )
         
+        # Select model: Haiku when no live context was fetched (no news, no live data).
+        # Sonnet's advantage is news synthesis — without context it's no better than Haiku
+        # but ~10x more expensive. Haiku still produces valid JSON and calibrated probabilities.
+        active_model = self.HAIKU_MODEL if use_haiku else self.model
+        if use_haiku:
+            logger.debug(f"[AI] No context → Haiku ({self.HAIKU_MODEL})")
+
         # Try to get a valid response
         last_error = None
         raw_response = None
@@ -281,7 +291,7 @@ class AISignalGenerator:
             try:
                 # Call the API with timeout
                 response = await asyncio.wait_for(
-                    self._call_api(prompt),
+                    self._call_api(prompt, model=active_model),
                     timeout=self.timeout_seconds
                 )
                 
@@ -460,18 +470,19 @@ Respond with ONLY a valid JSON object. No other text."""
 
         return prompt
     
-    async def _call_api(self, prompt: str) -> str:
+    async def _call_api(self, prompt: str, model: Optional[str] = None) -> str:
         """Call the Anthropic API.
         
         Args:
             prompt: User prompt
+            model: Model override (defaults to self.model)
             
         Returns:
             Raw response text
         """
         response = await asyncio.to_thread(
             self._client.messages.create,
-            model=self.model,
+            model=model or self.model,
             max_tokens=self.MAX_TOKENS,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],

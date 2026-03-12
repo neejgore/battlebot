@@ -3052,7 +3052,7 @@ class KalshiBattleBot:
             price_drift = abs(current_price - cache_price)
             cache_age = (datetime.utcnow() - cache_time).total_seconds()
             hours_to_res = market.get('hours_to_resolution') or 9999
-            max_cache_age = 300 if hours_to_res <= 24 else 3600  # 5 min for ultra-short, 1 hr otherwise
+            max_cache_age = 1200 if hours_to_res <= 24 else 3600  # 20 min for ultra-short (was 5min), 1hr otherwise
             if price_drift < 0.015 and cache_age < max_cache_age:
                 use_cache = True
 
@@ -3149,6 +3149,10 @@ class KalshiBattleBot:
                         else _commodity_price_ctx
                     )
 
+                # Use Haiku when there is no live context to synthesise.
+                # Sonnet's edge comes entirely from news/data synthesis — without
+                # context it produces equivalent probabilities at ~10x the cost.
+                _has_live_context = bool(_news_summary_for_claude or (intel and intel.domain_summary))
                 result = await self._ai_generator.generate_signal(
                     market_question=market.get('question', ''),
                     current_price=current_price,
@@ -3164,6 +3168,8 @@ class KalshiBattleBot:
                     overreaction_info=overreaction_info,
                     # Historical performance for learning
                     historical_performance=historical.get('summary') if historical.get('total_trades', 0) > 0 else None,
+                    # Route to Haiku when no live context — same quality, 10x cheaper
+                    use_haiku=not _has_live_context,
                 )
             
                 # Check if AI call succeeded
