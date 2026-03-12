@@ -1244,10 +1244,13 @@ class KalshiBattleBot:
                     # Add missing position
                     pos_id = f"pos_kalshi_{ticker[:20]}_{int(datetime.utcnow().timestamp())}"
                     cached_market = self._markets.get(ticker, {})
+                    # Store empty string rather than the ticker as last resort.
+                    # _enrich_position_questions() (called at end of this sync) will
+                    # back-fill proper text via the Kalshi API / decoder.
                     question = (
                         kp.get('title') or kp.get('market_title')
                         or cached_market.get('question') or cached_market.get('title')
-                        or ticker
+                        or ''
                     )
                     
                     self._positions[pos_id] = {
@@ -4261,7 +4264,9 @@ class KalshiBattleBot:
         BTC range positions are skipped — the live price monitor already covers them.
         """
         question = pos.get('question', '')
-        if not question:
+        _pticker = pos.get('market_id', '')
+        # Skip if no question or question is the raw ticker (news search with ticker = useless)
+        if not question or question == _pticker:
             return
 
         # BTC range already tracked by the live BTC price monitor — skip news for those only
@@ -4331,9 +4336,14 @@ class KalshiBattleBot:
                                 market = parse_kalshi_market(raw['market'])
                                 # Cache it so the next loop cycle is free
                                 self._markets[pos['market_id']] = market
-                                # Back-fill question if position was stored with empty text
-                                if not pos.get('question'):
-                                    pos['question'] = market.get('question', '')
+                                # Back-fill question if position was stored empty or as the ticker
+                                _ticker_here = pos.get('market_id', '')
+                                _mq = market.get('question', '')
+                                if (not pos.get('question') or pos.get('question') == _ticker_here):
+                                    if _mq and _mq != _ticker_here:
+                                        pos['question'] = _mq
+                                    else:
+                                        pos['question'] = self._decode_kalshi_ticker(_ticker_here)
                                 print(f"[Monitor] Fetched untracked market for {pos_id[:8]}: {pos.get('question','')[:45]}")
                         except Exception as _fetch_err:
                             print(f"[Monitor] Failed to fetch market for {pos_id[:8]} ({pos.get('market_id','')[:25]}): {_fetch_err}")
@@ -5540,17 +5550,14 @@ class KalshiBattleBot:
                     side  = 'YES' if raw_c > 0 else 'NO'
                     contracts = abs(raw_c)
                     entry_price = None  # unknown — will default to current
-                    cached_market = self._markets.get(ticker, {})
-                    # Try every field name Kalshi uses across API versions before falling
-                    # back to the raw ticker so the table shows text, not a code.
-                    question = (
-                        cached_market.get('question')
-                        or kpos.get('title')
-                        or kpos.get('market_title')
-                        or kpos.get('market_question')
-                        or kpos.get('subtitle')
-                        or ticker
+                    _km = self._markets.get(ticker, {})
+                    _kq = (
+                        _km.get('question', '') or _km.get('title', '')
+                        or kpos.get('title', '') or kpos.get('market_title', '')
+                        or kpos.get('market_question', '') or kpos.get('subtitle', '')
                     )
+                    # Treat ticker-as-question as "no real question" and decode instead
+                    question = _kq if (_kq and _kq != ticker) else self._decode_kalshi_ticker(ticker)
                     entry_time = None
                 else:
                     continue
