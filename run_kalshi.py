@@ -2347,6 +2347,8 @@ class KalshiBattleBot:
                         'KXUFC', 'KXBOX', 'KXTEN', 'KXSOC', 'KXWNH', 'KXWOH',
                         'KXDPWORLD', 'KXNBL', 'KXBRASIL', 'KXWCC', 'KXFIGHT',
                         'KXMATCH', 'KXBOUT', 'KXCHAMP',
+                        # MLS soccer (were leaking — no edge without live sports stats)
+                        'KXMLS',
                         # European/international soccer leagues (caught by question " vs " but add tickers too)
                         'KXLALIGA', 'KXSERIEA', 'KXBUNDES', 'KXLIGUE1', 'KXPREMIER',
                         'KXLIGAMX', 'KXCOPPA', 'KXFACUP', 'KXEUROPA', 'KXCHAMPIONSLEAGUE',
@@ -2356,6 +2358,7 @@ class KalshiBattleBot:
                         'KXNBLGAME', 'KXWOMHOCKEY', 'KXLALIGA2GAME', 'KXSERIEAGAME',
                         'KXLIGAMXGAME', 'KXBUNDESGAME', 'KXLIGUE1GAME',
                         # Esports (were leaking through — no edge, waste AI credits)
+                        'KXCOD',        # Call of Duty esports (KXCODGAME etc.)
                         'KXVALORANT', 'KXDOTA', 'KXCSGO', 'KXLOLGAME', 'KXROCKETLEAGUE',
                         'KXOVERWATCH', 'KXAPEXLEGENDS', 'KXFORTNITEGAME', 'KXESPORT',
                         # International basketball (FIBA, EuroLeague — were leaking)
