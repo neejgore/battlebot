@@ -5222,11 +5222,11 @@ class KalshiBattleBot:
         """Send update to all connected WebSocket clients."""
         if not self._websockets:
             return
-        
+
         data = json.dumps({
             'type': 'update',
             'stats': self._get_stats(),
-            'positions': list(self._positions.values()),
+            'positions': self._enrich_positions(),
             'pending_orders': list(self._pending_orders.values()),
             'trades': self._trades[:50],
             'analyses': self._analyses[:20],
@@ -5499,11 +5499,24 @@ class KalshiBattleBot:
             import traceback
             return web.json_response({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
 
+    def _enrich_positions(self) -> list:
+        """Return positions list with question text resolved from _markets cache."""
+        enriched = []
+        for pos in self._positions.values():
+            if not pos.get('question'):
+                ticker = pos.get('market_id', '')
+                cached = self._markets.get(ticker, {})
+                question = cached.get('question') or cached.get('title') or ticker
+                if question != ticker:
+                    pos = {**pos, 'question': question}
+            enriched.append(pos)
+        return enriched
+
     async def _handle_state(self, request):
         """API endpoint for current state."""
         return web.json_response({
             'stats': self._get_stats(),
-            'positions': list(self._positions.values()),
+            'positions': self._enrich_positions(),
             'trades': self._trades[:50],
             'analyses': self._analyses[:20],
             'monitored': list(self._monitored.values()),
@@ -6205,7 +6218,7 @@ class KalshiBattleBot:
             await ws.send_str(json.dumps({
                 'type': 'init',
                 'stats': self._get_stats(),
-                'positions': list(self._positions.values()),
+                'positions': self._enrich_positions(),
                 'trades': self._trades[:50],
                 'analyses': self._analyses[:20],
                 'monitored': list(self._monitored.values()),
