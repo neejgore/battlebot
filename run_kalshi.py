@@ -5932,7 +5932,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         <div class="tab" data-tab="markets">Markets</div>
     </div>
     <div class="content">
-        <div id="positions" class="tab-content hidden">
+        <div id="posTab" class="tab-content hidden">
             <div class="pos-last-refresh">Auto-refreshes every 3s &nbsp;·&nbsp; Last update: <span id="posRefreshTime">—</span></div>
             <div class="pos-summary">
                 <div class="card"><div class="card-label">Open Positions</div><div class="card-value" id="posCount2">—</div></div>
@@ -6078,7 +6078,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 tabs.forEach(t => t.classList.remove('active'));
                 tab.classList.add('active');
                 document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
-                document.getElementById(tab.dataset.tab).classList.remove('hidden');
+                const tabId = tab.dataset.tab === 'positions' ? 'posTab' : tab.dataset.tab;
+                document.getElementById(tabId).classList.remove('hidden');
                 if (tab.dataset.tab === 'txlog') fetchSettlements();
                 if (tab.dataset.tab === 'positions') {
                     fetchPositions();
@@ -6361,15 +6362,6 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                         <div><div class="position-detail-label">SIZE</div><div class="position-detail-value">$${p.size.toFixed(2)}</div></div>
                         <div><div class="position-detail-label">P&L</div><div class="position-detail-value ${p.unrealized_pnl >= 0 ? 'green' : 'red'}">${p.unrealized_pnl >= 0 ? '+' : ''}$${p.unrealized_pnl.toFixed(2)}</div></div>
                     </div>
-                    ${p.latest_news && p.latest_news.length ? `
-                    <div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,0.03);border-radius:6px;border-left:2px solid #30363d;">
-                        <div style="font-size:9px;letter-spacing:1px;color:#8b949e;margin-bottom:5px;">LATEST NEWS</div>
-                        ${p.latest_news.map(n => {
-                            const src = (n.source||'').replace(/[`<>]/g,"'");
-                            const ttl = (n.title||'').replace(/[`<>]/g,"'");
-                            return `<div style="font-size:11px;color:#c9d1d9;margin-bottom:4px;line-height:1.4;"><span style="color:#6e7681;font-size:10px;">[${src}]</span> ${ttl}</div>`;
-                        }).join('')}
-                    </div>` : ''}
                 </div>
             `).join('');
             document.getElementById('positions').innerHTML = html || '<div style="color:#8b949e;font-size:13px;padding:12px;">No open positions</div>';
