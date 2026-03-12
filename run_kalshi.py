@@ -2312,8 +2312,42 @@ class KalshiBattleBot:
                     question_lower = market.get('question', '').lower()
                     question_raw = market.get('question', '')
                     
-                    # FILTER 1: Skip entertainment/noise markets
-                    if any(term in question_lower for term in ['mention', 'announcer', 'say during', 'tweet', 'post about']):
+                    # FILTER 1: Skip entertainment/noise/pop-culture markets.
+                    # These have no reliable public information edge — AI has no predictive
+                    # ability on movie scores, award winners, celebrity events, or social
+                    # media activity.  Block both by question text and by ticker prefix.
+                    _ent_question_patterns = [
+                        # Social-media / speech noise
+                        'mention', 'announcer', 'say during', 'tweet', 'post about',
+                        # Movies / TV / streaming
+                        'rotten tomatoes', 'box office', 'opening weekend', 'domestic gross',
+                        'metacritic', 'imdb', 'certified fresh', 'audience score',
+                        'streaming', 'netflix', 'hulu', 'disney+', 'max series',
+                        'episode', 'season finale', 'series finale', 'pilot episode',
+                        # Awards ceremonies
+                        'oscar', 'academy award', 'golden globe', 'emmy award', 'grammy',
+                        'bafta', 'sag award', 'tony award', 'peoples choice', 'mtv award',
+                        'billboard music', 'american music award', 'bet award',
+                        # Celebrity / pop culture
+                        'celebrity', 'kardashian', 'taylor swift', 'beyonce',
+                        'will smith', 'kanye', 'elon musk tweet',  # specific celeb noise
+                        # Game shows / reality TV
+                        'survivor', 'bachelor', 'bachelorette', 'big brother',
+                        'american idol', 'the voice', 'dancing with the stars',
+                        'drag race', 'love island',
+                        # Video game awards
+                        'game of the year', 'the game awards',
+                    ]
+                    _ent_ticker_prefixes = [
+                        'KXRT-',       # Rotten Tomatoes scores
+                        'KXOSCARS', 'KXGRAMMYS', 'KXEMMYS', 'KXGLOBES',
+                        'KXBOX-',      # Box office
+                        'KXMOVIE', 'KXFILM', 'KXCELEB', 'KXPOP',
+                        'KXREALITY', 'KXAWARD',
+                    ]
+                    _ent_question_hit = any(p in question_lower for p in _ent_question_patterns)
+                    _ent_ticker_hit   = any(market_id.upper().startswith(p) for p in _ent_ticker_prefixes)
+                    if _ent_question_hit or _ent_ticker_hit:
                         self._log_filter(market_id, question_raw, 'ENTERTAINMENT_NOISE', market.get('price', 0))
                         continue
                     
@@ -5407,7 +5441,16 @@ class KalshiBattleBot:
                     side      = internal.get('side', 'YES').upper()
                     contracts = internal.get('contracts', 0)
                     entry_price = internal.get('entry_price', 0.5)
-                    question  = internal.get('question') or ticker
+                    # Always fall back to _markets cache — internal positions created from
+                    # series contracts (e.g. KXCPIYOY-26MAR-T3.1) may have been stored
+                    # with question='' because Kalshi returned title='' at order time.
+                    _icache = self._markets.get(ticker, {})
+                    question  = (
+                        internal.get('question')
+                        or _icache.get('question')
+                        or _icache.get('title')
+                        or ticker
+                    )
                     entry_time = internal.get('entry_time')
                 elif kpos:
                     raw_c = kpos.get('position', 0)
@@ -5500,15 +5543,24 @@ class KalshiBattleBot:
             return web.json_response({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
 
     def _enrich_positions(self) -> list:
-        """Return positions list with question text resolved from _markets cache."""
+        """Return positions list with question text resolved from _markets cache.
+
+        Positions created from Kalshi series contracts (e.g. KXCPIYOY-26MAR-T3.1)
+        are often stored with question='' because Kalshi returns title='' on those
+        contracts.  Always overlay from _markets cache so the UI shows real text.
+        """
         enriched = []
         for pos in self._positions.values():
-            if not pos.get('question'):
-                ticker = pos.get('market_id', '')
-                cached = self._markets.get(ticker, {})
-                question = cached.get('question') or cached.get('title') or ticker
-                if question != ticker:
-                    pos = {**pos, 'question': question}
+            ticker = pos.get('market_id', '')
+            cached = self._markets.get(ticker, {})
+            best_q = (
+                pos.get('question')
+                or cached.get('question')
+                or cached.get('title')
+                or None  # keep None so the display can show the ticker as last resort
+            )
+            if best_q and best_q != pos.get('question'):
+                pos = {**pos, 'question': best_q}
             enriched.append(pos)
         return enriched
 

@@ -548,12 +548,34 @@ def parse_kalshi_market(market: dict) -> dict:
     
     # For sports/event markets without explicit rules, create synthetic rules
     title = market.get('title', '')
+
+    # For series contracts (e.g. KXCPIYOY-26MAR-T3.1), Kalshi often returns title=''
+    # with the actual human-readable text in subtitle, yes_sub_title, or cap_strike.
+    # Build a question string so positions never fall back to showing a raw ticker.
+    if not title:
+        subtitle   = market.get('subtitle', '')
+        yes_sub    = market.get('yes_sub_title', '') or market.get('yes_title', '')
+        no_sub     = market.get('no_sub_title', '')  or market.get('no_title', '')
+        cap_strike = market.get('cap_strike', '')
+        ticker_raw = market.get('ticker', '')
+        if subtitle:
+            title = subtitle
+        elif yes_sub and no_sub:
+            title = f"{yes_sub} / {no_sub}"
+        elif yes_sub:
+            title = yes_sub
+        elif cap_strike:
+            # e.g. "3.1" for KXCPIYOY-26MAR-T3.1 — build readable string
+            title = f"{market.get('series_ticker', ticker_raw)} threshold {cap_strike}"
+        else:
+            title = ticker_raw  # last resort
+
     if not rules and title:
         # Generate rules from the market structure
         rules = f"Market resolves YES if '{title}' occurs. Market resolves NO otherwise. Settlement based on official results."
-    
+
     description = market.get('subtitle', '') or market.get('rules_primary', '') or title
-    
+
     return {
         'id': market.get('ticker', ''),
         'token_id': market.get('ticker', ''),
