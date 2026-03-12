@@ -970,6 +970,12 @@ class KalshiBattleBot:
 
             # Step 2: Fetch open positions from Kalshi.
             result = await self._kalshi.get_positions()
+            print(f"[Sync] get_positions raw keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
+            print(f"[Sync] market_positions count: {len(result.get('market_positions', []))}, positions count: {len(result.get('positions', []))}")
+            if isinstance(result, dict):
+                for k, v in result.items():
+                    if isinstance(v, list) and len(v) > 0:
+                        print(f"[Sync] field '{k}' has {len(v)} items, sample keys: {list(v[0].keys()) if isinstance(v[0], dict) else v[0]}")
             kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
             # Cache for performance endpoint so it doesn't need its own live API calls.
             # Always update (including to []) so the performance tab doesn't show stale
