@@ -3465,15 +3465,17 @@ class KalshiBattleBot:
         should_trade = True
         reasons = []
 
-        # DAILY LOSS CIRCUIT BREAKER: Stop opening new positions if down >10% today
-        # Uses Kalshi's authoritative total value vs start-of-day snapshot
+        # DAILY LOSS CIRCUIT BREAKER: Stop opening new positions if down >15% today.
+        # Prefer _ks_reset_baseline (set when kill switch is manually reset) over
+        # start_of_day_value — after a kill switch reset the original start_of_day is
+        # stale/inflated and incorrectly shows a large loss that blocks all new bets.
         today_str = datetime.utcnow().strftime('%Y-%m-%d')
         today_snap = self._daily_snapshots.get(today_str, {})
-        start_val = today_snap.get('start_of_day_value')
+        start_val = today_snap.get('_ks_reset_baseline') or today_snap.get('start_of_day_value')
         current_val = self._kalshi_total
         if start_val and current_val and start_val > 0:
             daily_loss_pct = (current_val - start_val) / start_val
-            if daily_loss_pct < -0.10:
+            if daily_loss_pct < -0.15:
                 should_trade = False
                 reasons.append(f'DAILY_LOSS_LIMIT_{daily_loss_pct*100:.1f}pct')
                 print(f"[Risk] Daily loss circuit breaker: {daily_loss_pct*100:.1f}% today — pausing new bets")
