@@ -2748,9 +2748,11 @@ class KalshiBattleBot:
         m = self._THRESHOLD_RE.search(question_full)
         if not m:
             return False, ''
-        direction = m.group(1).lower()   # "above", "below", etc.
+        direction = m.group(1).lower()   # "above", "below", "more than", etc.
         threshold = float(m.group(2))
-        bet_above = direction in ('above', 'over', 'higher than', 'exceed', 'at least')
+        # "more than" / "exceed" / "over" all mean the threshold is a lower bound (bet_above=True)
+        # "less than" / "under" / "below" mean the threshold is an upper bound (bet_above=False)
+        bet_above = direction in ('above', 'over', 'higher than', 'exceed', 'at least', 'more than')
 
         # Collect percentage numbers from news snippets.
         # Critically: filter to the SAME order-of-magnitude as the threshold to avoid
