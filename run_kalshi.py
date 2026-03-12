@@ -5416,6 +5416,7 @@ class KalshiBattleBot:
             'trades': self._trades[:50],
             'analyses': self._analyses[:20],
             'monitored': list(self._monitored.values()),
+            'kalshi_positions_raw': self._kalshi_positions_raw[:30],
         })
     
     async def _handle_signals(self, request):
