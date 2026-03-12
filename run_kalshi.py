@@ -139,12 +139,18 @@ class KalshiBattleBot:
         )
 
         self._load_state()
-        # After loading, wipe today's stale intraday_high from the previous session so the
-        # dashboard never shows a leftover peak from a prior run as today's high.
+        # Only wipe intraday_high if the saved timestamp is from a *previous* session that
+        # ran on a different UTC day — i.e. the snapshot's intraday_high_time date doesn't
+        # match today.  Wiping unconditionally was destroying a legitimate same-day peak on
+        # every Railway restart, leaving "Today's Peak" blank until the next sync cycle.
         _today_str = datetime.utcnow().strftime('%Y-%m-%d')
         if _today_str in self._daily_snapshots:
-            self._daily_snapshots[_today_str].pop('intraday_high', None)
-            self._daily_snapshots[_today_str].pop('intraday_high_time', None)
+            _snap = self._daily_snapshots[_today_str]
+            _high_time = _snap.get('intraday_high_time', '')
+            # Only clear if the high was recorded on a different date (genuinely stale).
+            if _high_time and not _high_time.startswith(_today_str):
+                _snap.pop('intraday_high', None)
+                _snap.pop('intraday_high_time', None)
         
         self._running = False
         self._last_analysis: dict[str, datetime] = {}
@@ -2359,21 +2365,41 @@ class KalshiBattleBot:
                     _sports_abbrevs = [
                         'nba', 'ncaa', 'wnba', 'nbl', 'nfl', 'mlb', 'nhl',
                         'mls', 'pga', 'lpga', 'atp', 'wta', 'ufc', 'mma',
+                        'cfb', 'cfl', 'ipl', 'bbl',  # college football, CFL, cricket, Aus baseball
                     ]
                     # Longer patterns are safe as plain substrings
                     sports_patterns = [
                         'basketball', 'football', 'touchdown', 'quarterback',
                         'baseball', 'hockey',
                         'soccer', 'premier league', 'champions league',
-                        'golf', 'genesis invitational',
+                        'golf', 'genesis invitational', 'the masters', 'ryder cup',
+                        'us open', 'wimbledon', 'french open', 'australian open',
                         'tennis',
+                        # Rugby — was completely unblocked (Six Nations, World Cup, etc.)
+                        'rugby', 'six nations', 'six-nations', 'rugby league', 'rugby union',
+                        'rugby world cup', 'super rugby', 'premiership rugby',
+                        'pro14', 'pro12', 'top 14', 'top14',
+                        'six nations championship', 'tri nations', 'the rugby championship',
+                        'bledisloe', 'calcutta cup', 'grand slam',
                         'boxing', 'fight night', 'knockout', 'k.o.',
                         'heavyweight', 'lightweight', 'middleweight', 'welterweight',
                         'nascar', 'olympics', 'world cup', 'world series',
                         'super bowl', 'championship game', 'playoff game',
+                        'march madness', 'ncaa tournament', 'final four',
+                        'stanley cup', 'nba finals', 'nba championship', 'nba title',
+                        'wins the series', 'take the series', 'win the series',
                         'wins the match', 'win the game', 'beat the spread', 'defeats ',
+                        'wins the game', 'wins the championship', 'wins the title',
                         'rebounds', 'assists', 'three-pointers', '3-pointers',
-                        'pitcher', 'batter', 'innings', 'overtime period', 'penalty kick',
+                        'pitcher', 'batter', 'innings', 'home run', 'strikeout',
+                        'overtime period', 'penalty kick', 'penalty shootout',
+                        'field goal', 'slam dunk', 'hat trick',
+                        # Season win-total / over-under markets
+                        'win at least', 'win more than', 'win fewer than',
+                        'regular season wins', 'season record',
+                        # Draft / combine markets
+                        'nfl draft', 'nba draft', 'mlb draft', 'nhl draft',
+                        'first overall pick', 'top pick',
                         # Motorsport / F1
                         'grand prix', 'formula 1', 'formula one', 'fastest lap',
                         'pole position', 'qualifying lap', 'f1 race', 'pitstop',
@@ -2417,6 +2443,28 @@ class KalshiBattleBot:
                         # International basketball (FIBA, EuroLeague — were leaking)
                         'KXFIBA', 'KXEUROLEAGUE', 'KXEUROCUP', 'KXACBGAME', 'KXLNBGAME',
                         'KXBBLGAME', 'KXEKOGAME', 'KXBSGAME', 'KXLBAGAME',
+                        # Season win totals / standings (NBA, NFL, MLB, NHL)
+                        'KXNBAWIN', 'KXNFLWIN', 'KXMLBWIN', 'KXNHLWIN',
+                        'KXNBAEAST', 'KXNBAWEST', 'KXNFCEAST', 'KXNFCWEST',
+                        'KXNFCNORTH', 'KXNFCSOUTH', 'KXAFCEAST', 'KXAFCWEST',
+                        'KXAFCNORTH', 'KXAFCSOUTH',
+                        # Draft markets
+                        'KXNFLDRAFT', 'KXNBADRAFT', 'KXMLBDRAFT', 'KXNHLDRAFT',
+                        # Awards / MVP / Cy Young etc.
+                        'KXNBAMVP', 'KXNFLMVP', 'KXMLBMVP', 'KXNHLMVP',
+                        'KXNBAAWARDS', 'KXNFLAWARDS', 'KXMLBAWARDS', 'KXNHLAWARDS',
+                        # Golf tournaments
+                        'KXMASTERS', 'KXPGACHAMP', 'KXUSOPEN', 'KXTHEOPENGOLF',
+                        'KXRYDERCUP', 'KXPRESIDENTSCUP',
+                        # Tennis grand slams
+                        'KXWIMBLEDON', 'KXUSOPENTEN', 'KXFRENCHOPEN', 'KXAUSTOPEN',
+                        # College football / playoffs
+                        'KXCFP', 'KXCFBGAME', 'KXNCAAFB',
+                        # Combat sports catch-alls
+                        'KXWWE', 'KXBELLATOR', 'KXPFL',
+                        # Rugby (was completely unblocked)
+                        'KXRUGBY', 'KXSIXNATIONS', 'KXRWC', 'KXRUGBYWC',
+                        'KXSUPERRUGBY', 'KXPRUGBY', 'KXTOP14',
                     ]
                     if any(pattern in ticker_upper for pattern in sports_ticker_patterns):
                         self._log_filter(market_id, question_raw, 'SPORTS_TICKER', market.get('price', 0))
@@ -3578,6 +3626,9 @@ class KalshiBattleBot:
         # than a 12% edge with 80% confidence.
         # Inverted bets use a fixed synthetic confidence (0.85) which always passes.
         _conf_floor = 0.65 if edge >= (self.min_edge * 2) else self.min_confidence
+        # Persist effective threshold so the dashboard shows the right "need X%" label.
+        if self._analyses:
+            self._analyses[0]['conf_threshold_effective'] = round(_conf_floor, 4)
         if signal.confidence < _conf_floor and not _invert_crypto_range:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
@@ -5356,7 +5407,7 @@ class KalshiBattleBot:
                     side      = internal.get('side', 'YES').upper()
                     contracts = internal.get('contracts', 0)
                     entry_price = internal.get('entry_price', 0.5)
-                    question  = internal.get('question', ticker)
+                    question  = internal.get('question') or ticker
                     entry_time = internal.get('entry_time')
                 elif kpos:
                     raw_c = kpos.get('position', 0)
@@ -5364,7 +5415,16 @@ class KalshiBattleBot:
                     contracts = abs(raw_c)
                     entry_price = None  # unknown — will default to current
                     cached_market = self._markets.get(ticker, {})
-                    question = cached_market.get('question', kpos.get('title', ticker))
+                    # Try every field name Kalshi uses across API versions before falling
+                    # back to the raw ticker so the table shows text, not a code.
+                    question = (
+                        cached_market.get('question')
+                        or kpos.get('title')
+                        or kpos.get('market_title')
+                        or kpos.get('market_question')
+                        or kpos.get('subtitle')
+                        or ticker
+                    )
                     entry_time = None
                 else:
                     continue
@@ -6747,24 +6807,43 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 const isTrade   = a.decision === 'TRADE';
                 const edge      = a.edge != null ? a.edge : 0;
                 const conf      = a.confidence != null ? a.confidence : null;
+                // Use server-supplied effective threshold when present (high-edge bypass lowers it).
+                // Without this, UI shows "need 72%" but the bot trades at 65% — looks like a bug.
+                const effConf   = a.conf_threshold_effective != null ? a.conf_threshold_effective : threshConf;
                 const edgePass  = edge >= threshEdge;
-                const confPass  = conf == null || conf >= threshConf;
+                const confPass  = conf == null || conf >= effConf;
                 const edgeCol   = edgePass ? '#3fb950' : '#f85149';
                 const confCol   = confPass ? '#3fb950' : '#f85149';
+                // Show "65%" when bypass active, "72%" otherwise
+                const confNeedPct = (effConf * 100).toFixed(0);
+                // Label the bypass so the user knows why threshold is lower
+                const bypassLabel = (effConf < threshConf) ? ` <span style="color:#e3b341;font-size:10px;">(high-edge bypass)</span>` : '';
 
-                // Rejection reason — humanised
+                // Rejection reason — humanised.
+                // Note: edge ✓ + conf ✓ + SKIP means the trade qualified on signals but was
+                // blocked by a risk/portfolio rule (cluster cap, daily loss, position limit…).
                 const rawReason = a.reason || '';
                 let rejLabel = '';
                 if (!isTrade && rawReason) {
                     const parts = [];
-                    if (rawReason.includes('LOW_EDGE'))        parts.push(`Edge ${(edge*100).toFixed(1)}% < ${(threshEdge*100).toFixed(0)}% min`);
-                    if (rawReason.includes('LOW_CONFIDENCE'))  parts.push(`Conf ${conf != null ? (conf*100).toFixed(0)+'%' : '?'} < ${(threshConf*100).toFixed(0)}% min`);
-                    if (rawReason.includes('YES_BETS_DISABLED')) parts.push('YES side disabled');
-                    if (rawReason.includes('MAX_POSITIONS'))   parts.push('Position limit reached');
-                    if (rawReason.includes('CLUSTER_CAP'))     parts.push('Cluster cap hit');
-                    if (rawReason.includes('RECENTLY_EXITED')) parts.push('Cooldown after exit');
-                    if (rawReason.includes('ALREADY_IN'))      parts.push('Already in this market');
-                    if (parts.length === 0)                    parts.push(rawReason.slice(0, 60));
+                    if (rawReason.includes('LOW_EDGE'))           parts.push(`Edge ${(edge*100).toFixed(1)}% < ${(threshEdge*100).toFixed(0)}% min`);
+                    if (rawReason.includes('LOW_CONFIDENCE'))     parts.push(`Conf ${conf != null ? (conf*100).toFixed(0)+'%' : '?'} < ${confNeedPct}% min`);
+                    if (rawReason.includes('YES_BETS_DISABLED'))  parts.push('YES side disabled');
+                    if (rawReason.includes('NO_BETS_DISABLED'))   parts.push('NO side disabled');
+                    if (rawReason.includes('MAX_POSITIONS'))      parts.push('Position limit reached');
+                    if (rawReason.includes('CLUSTER_CAP'))        parts.push('Cluster cap hit (too many correlated bets)');
+                    if (rawReason.includes('RECENTLY_EXITED'))    parts.push('Cooldown after recent exit');
+                    if (rawReason.includes('ALREADY_IN'))         parts.push('Already holding this market');
+                    if (rawReason.includes('DAILY_LOSS_LIMIT'))   {
+                        const m = rawReason.match(/DAILY_LOSS_LIMIT_([\-\d.]+)pct/);
+                        parts.push('Daily loss limit hit' + (m ? ` (${m[1]}% today)` : ''));
+                    }
+                    if (rawReason.includes('DOGE_BLOCKED'))       parts.push('DOGE blocked (0% win rate historically)');
+                    if (rawReason.includes('INVERTED_BET_BLOCKED')) parts.push('Inverted range bet blocked');
+                    if (rawReason.includes('EXPOSURE_LIMIT'))     parts.push('Exposure limit reached');
+                    if (rawReason.includes('KILL_SWITCH'))        parts.push('Kill-switch active — trading halted');
+                    if (rawReason === 'CRITERIA_MET')             { /* should_trade=true, handled by isTrade */ }
+                    if (parts.length === 0)                       parts.push(rawReason.slice(0, 80));
                     rejLabel = parts.join(' · ');
                 }
 
@@ -6778,7 +6857,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                         <span>AI: <strong>${a.ai_probability != null ? (a.ai_probability*100).toFixed(0)+'%' : '—'}</strong></span>
                         <span>Market: <strong>${(a.market_price*100).toFixed(0)}¢</strong></span>
                         <span style="color:${edgeCol};">Edge: <strong>${edge >= 0 ? '+' : ''}${(edge*100).toFixed(1)}%</strong> ${edgePass ? '✓' : '✗ need '+((threshEdge)*100).toFixed(0)+'%'}</span>
-                        ${conf != null ? `<span style="color:${confCol};">Conf: <strong>${(conf*100).toFixed(0)}%</strong> ${confPass ? '✓' : '✗ need '+(threshConf*100).toFixed(0)+'%'}</span>` : ''}
+                        ${conf != null ? `<span style="color:${confCol};">Conf: <strong>${(conf*100).toFixed(0)}%</strong> ${confPass ? '✓' : `✗ need ${confNeedPct}%`}${bypassLabel}</span>` : ''}
                         <span style="color:#8b949e;">${a.side || ''} · ${a.latency_ms != null ? a.latency_ms+'ms' : ''}</span>
                     </div>
                     ${rejLabel ? `<div style="font-size:11px;color:#f85149;margin-bottom:4px;">↳ Skipped: ${rejLabel}</div>` : ''}
