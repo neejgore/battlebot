@@ -5075,30 +5075,74 @@ class KalshiBattleBot:
         if not market_id:
             return web.json_response({'ok': False, 'error': 'market_id param required'}, status=400)
 
-        # Find the position
+        # Find the position — search internal dict first, then Kalshi raw positions (fix: exit
+        # button was returning 404 for positions that exist in Kalshi but not internal state).
         pos_id = None
         for pid, pos in self._positions.items():
             if pos.get('market_id', '').upper() == market_id:
                 pos_id = pid
                 break
 
+        # Fallback: position exists in Kalshi raw data but not internal dict (e.g. after restart).
+        # Synthesise a minimal internal entry so _exit_position can place the sell order.
+        if not pos_id:
+            kp_match = next(
+                (kp for kp in self._kalshi_positions_raw
+                 if kp.get('ticker', '').upper() == market_id),
+                None
+            )
+            if kp_match:
+                contracts = abs(kp_match.get('position', 0))
+                side = 'YES' if kp_match.get('position', 0) > 0 else 'NO'
+                cached = self._markets.get(market_id, {})
+                cur_price = cached.get('yes_price', 0.5) if side == 'YES' else cached.get('no_price', 0.5)
+                exposure = abs(kp_match.get('market_exposure', 0)) / 100
+                entry_price = (exposure / contracts) if contracts > 0 else cur_price
+                pos_id = f'pos_kals_{market_id}'
+                self._positions[pos_id] = {
+                    'market_id': market_id,
+                    'side': side,
+                    'contracts': contracts,
+                    'entry_price': entry_price,
+                    'current_price': cur_price,
+                    'cost': exposure,
+                    'size': exposure,
+                    'question': cached.get('question', market_id),
+                }
+                print(f"[ForceExit] Synthesised internal position for Kalshi-only entry {market_id}")
+
         if not pos_id:
             held = [p.get('market_id') for p in self._positions.values()]
             return web.json_response({'ok': False, 'error': f'{market_id} not in positions', 'held': held}, status=404)
 
         pos = self._positions[pos_id]
+
+        # Return immediately if a pending exit order is already in flight
+        if pos.get('pending_exit'):
+            return web.json_response({
+                'ok': False,
+                'error': 'Exit order already pending — waiting for fill confirmation',
+                'order_id': pos['pending_exit'].get('order_id'),
+            }, status=409)
+
         side = pos.get('side', 'YES')
-        cur_price = pos.get('current_price', pos.get('entry_price', 0.5))
-        exit_price = cur_price if side == 'YES' else (1 - cur_price)
+        # Use live cached price if available, otherwise fall back to stored current_price
+        cached = self._markets.get(market_id, {})
+        live_price = cached.get('yes_price') if side == 'YES' else cached.get('no_price')
+        cur_price = live_price or pos.get('current_price', pos.get('entry_price', 0.5))
+        exit_price = cur_price
         cost = pos.get('cost') or pos.get('size', 0)
         pnl = (exit_price - pos.get('entry_price', exit_price)) * pos.get('contracts', 0)
 
         print(f"[ForceExit] Manual exit triggered for {market_id} ({side}) @ {exit_price:.2f}")
         await self._exit_position(pos_id, exit_price, pnl, 'MANUAL_FORCE_EXIT')
         self._save_state()
+
+        # Check if a pending exit was set (limit order placed) vs immediate removal (writeoff)
+        still_open = pos_id in self._positions
         return web.json_response({
             'ok': True,
-            'message': f'Exit order placed for {market_id}',
+            'message': 'Limit sell order placed — waiting for fill' if still_open else 'Position exited immediately',
             'side': side,
             'exit_price': round(exit_price, 3),
             'estimated_pnl': round(pnl, 2),
@@ -7072,12 +7116,21 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     btn.style.color = '#3fb950';
                     btn.style.borderColor = '#3fb950';
                     setTimeout(fetchPositions, 1500);
+                } else if (r.status === 409) {
+                    // Exit order already in flight — show pending state
+                    btn.textContent = 'Pending';
+                    btn.style.color = '#e3b341';
+                    btn.style.borderColor = '#e3b341';
+                    btn.disabled = false;
+                    alert('An exit order is already pending for ' + marketId + '. Waiting for fill.');
                 } else {
-                    btn.textContent = 'Err';
+                    btn.textContent = 'Exit';
+                    btn.disabled = false;
                     alert('Exit failed: ' + (d.error || JSON.stringify(d)));
                 }
             } catch(e) {
-                btn.textContent = 'Err';
+                btn.textContent = 'Exit';
+                btn.disabled = false;
                 alert('Exit error: ' + e);
             }
         }
