@@ -2717,6 +2717,7 @@ class KalshiBattleBot:
         'nfp', 'non-farm payroll', 'nonfarm payroll', 'jobs report', 'unemployment',
         'retail sales', 'durable goods', 'industrial production',
         'fomc', 'fed funds rate', 'federal reserve', 'interest rate decision',
+        'central bank', 'rate decision', 'rate hike', 'rate cut',
         'jobs added', 'payrolls',
     ]
     # Regex to extract percentage numbers from news snippets (e.g. "2.5%", "0.3%")
@@ -3110,6 +3111,9 @@ class KalshiBattleBot:
         # Only fetched when Claude will actually be called (not on cache hits or inverted crypto).
         _commodity_price_ctx: str | None = None
         _full_question = market.get('question', '')
+        # Pre-compute econ flag here so model routing (Haiku vs Sonnet) can use it
+        # before the AI call. The same flag is re-used in post-signal risk guards below.
+        _is_econ_market = any(kw in _full_question.lower() for kw in self._ECON_DATA_KEYWORDS)
 
         # Build overreaction info string for AI
         overreaction_info = None
@@ -3233,10 +3237,26 @@ class KalshiBattleBot:
                         else _commodity_price_ctx
                     )
 
-                # Use Haiku when there is no live context to synthesise.
-                # Sonnet's edge comes entirely from news/data synthesis — without
-                # context it produces equivalent probabilities at ~10x the cost.
-                _has_live_context = bool(_news_summary_for_claude or (intel and intel.domain_summary))
+                # Model routing: Sonnet only for market types where its synthesis
+                # capability genuinely matters. Haiku is used for everything else —
+                # same JSON output quality and calibrated probabilities, ~10x cheaper.
+                #
+                # Sonnet earns its cost when:
+                #   1. Economic data markets (CPI, GDP, unemployment, Fed) — complex
+                #      numerical reasoning over multiple data series.
+                #   2. Commodity/asset price markets (gold, oil, ETH) — live price
+                #      context requires synthesis of multiple price sources.
+                #
+                # Haiku is sufficient for:
+                #   • Political / event markets (Trump bets, elections, legislation) —
+                #     binary reasoning, no numerical data synthesis required.
+                #   • Crypto range markets — quant model provides the primary signal;
+                #     Claude is only a secondary sanity-check.
+                #   • All other markets (tech layoffs, housing, weather, etc.)
+                #
+                # Previously the routing was "Haiku when no news" — but Brave returns
+                # 5 articles for virtually every market, so Haiku was never used.
+                _needs_sonnet = (_is_econ_market or bool(_commodity_price_ctx)) and not _is_crypto_range_q
                 result = await self._ai_generator.generate_signal(
                     market_question=market.get('question', ''),
                     current_price=current_price,
@@ -3252,8 +3272,8 @@ class KalshiBattleBot:
                     overreaction_info=overreaction_info,
                     # Historical performance for learning
                     historical_performance=historical.get('summary') if historical.get('total_trades', 0) > 0 else None,
-                    # Route to Haiku when no live context — same quality, 10x cheaper
-                    use_haiku=not _has_live_context,
+                    # Haiku for political/event/crypto; Sonnet for econ data + commodity markets
+                    use_haiku=not _needs_sonnet,
                 )
             
                 # Check if AI call succeeded
