@@ -970,20 +970,10 @@ class KalshiBattleBot:
 
             # Step 2: Fetch open positions from Kalshi.
             result = await self._kalshi.get_positions()
-            # Log the raw API response keys so we can diagnose field-name changes
-            _raw_keys = list(result.keys()) if isinstance(result, dict) else []
-            print(f"[Sync] get_positions raw keys: {_raw_keys}")
-            for k in _raw_keys:
-                v = result[k]
-                if isinstance(v, list):
-                    print(f"[Sync]   '{k}': list of {len(v)} items" + (f", sample keys: {list(v[0].keys())}" if v and isinstance(v[0], dict) else ''))
-                elif v is not None:
-                    print(f"[Sync]   '{k}': {str(v)[:80]}")
-            # Store raw result for dashboard debug
-            self._debug_positions_result = {k: (len(v) if isinstance(v, list) else str(v)[:50]) for k, v in result.items()} if isinstance(result, dict) else str(result)[:200]
-            # Try all known field names Kalshi has used
+            # Try all known field names (Kalshi uses market_positions; fall back to alternatives)
             kalshi_positions = (result.get('market_positions') or result.get('positions') or
                                 result.get('portfolio_positions') or result.get('data') or [])
+            print(f"[Sync] get_positions: {len(kalshi_positions)} market_positions returned")
             # Cache for performance endpoint so it doesn't need its own live API calls.
             # Always update (including to []) so the performance tab doesn't show stale
             # positions after they all close. The "no positions" early-return below only
@@ -1596,7 +1586,6 @@ class KalshiBattleBot:
             'total_pnl': realized_pnl + unrealized_pnl,
             'return_pct': return_pct,
             'kalshi_synced': self._kalshi_cash is not None,  # Shows if using real Kalshi data
-            'debug_positions_api': getattr(self, '_debug_positions_result', 'not_yet_synced'),
             # Today's performance
             'today_pnl': today_pnl,
             'today_wins': today_wins,
@@ -2385,6 +2374,9 @@ class KalshiBattleBot:
                         'wins the match', 'win the game', 'beat the spread', 'defeats ',
                         'rebounds', 'assists', 'three-pointers', '3-pointers',
                         'pitcher', 'batter', 'innings', 'overtime period', 'penalty kick',
+                        # Motorsport / F1
+                        'grand prix', 'formula 1', 'formula one', 'fastest lap',
+                        'pole position', 'qualifying lap', 'f1 race', 'pitstop',
                     ]
                     _abbrev_hit = (
                         not _is_econ_politics
@@ -2413,8 +2405,8 @@ class KalshiBattleBot:
                         # European/international soccer leagues (caught by question " vs " but add tickers too)
                         'KXLALIGA', 'KXSERIEA', 'KXBUNDES', 'KXLIGUE1', 'KXPREMIER',
                         'KXLIGAMX', 'KXCOPPA', 'KXFACUP', 'KXEUROPA', 'KXCHAMPIONSLEAGUE',
-                        # Race sports
-                        'KXNASCARRACE', 'KXF1RACE',
+                        # Race sports / motorsport
+                        'KXNASCARRACE', 'KXF1RACE', 'KXF1', 'KXGRANDPRIX', 'KXGP',
                         # Generic game/match tickers not caught above
                         'KXNBLGAME', 'KXWOMHOCKEY', 'KXLALIGA2GAME', 'KXSERIEAGAME',
                         'KXLIGAMXGAME', 'KXBUNDESGAME', 'KXLIGUE1GAME',
