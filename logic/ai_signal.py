@@ -152,7 +152,7 @@ class AISignalGenerator:
     """
     
     DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Used when live news/data context is present
-    HAIKU_MODEL   = "claude-haiku-4-20250514"   # Used when no context — ~10x cheaper, quality parity without news
+    HAIKU_MODEL   = "claude-3-haiku-20240307"    # Used when no context — ~10x cheaper, quality parity without news
     MAX_RETRIES = 1
     TIMEOUT_SECONDS = 30.0
     MAX_TOKENS = 1500  # Raised from 800 — full 9-field JSON schema with list fields can exceed 800 tokens and truncate silently
