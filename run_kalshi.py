@@ -1283,13 +1283,18 @@ class KalshiBattleBot:
                             price_diff = abs(old_price - entry_price) > 0.005
                             size_diff = abs(old_size - actual_size) > 0.01
                             
-                            # Back-fill question if position was stored with empty text
-                            if not pos.get('question'):
+                            # Back-fill question if stored as empty OR as the raw ticker.
+                            # (Old code wrote `or ticker` as a fallback, so ticker string
+                            # ended up stored as a truthy "question" — treat it as missing.)
+                            _stored_q = pos.get('question', '')
+                            if not _stored_q or _stored_q == ticker:
+                                _cache_m = self._markets.get(ticker, {})
                                 _bfq = (
                                     kp.get('title') or kp.get('market_title')
-                                    or cached_market.get('question') or cached_market.get('title')
+                                    or _cache_m.get('question') or _cache_m.get('title')
                                 )
-                                if _bfq:
+                                # Only store if it's a real improvement (not also the ticker)
+                                if _bfq and _bfq != ticker:
                                     pos['question'] = _bfq
 
                             if price_diff or size_diff:
@@ -1306,12 +1311,64 @@ class KalshiBattleBot:
                 print(f"[Sync] Complete: {added_count} added, {updated_count} updated, {removed} removed")
             else:
                 print("[Sync] Positions already in sync with Kalshi")
+
+            # Enrich any positions whose question text is still the raw ticker
+            await self._enrich_position_questions()
                 
         except Exception as e:
             print(f"[Sync] Error syncing with Kalshi: {e}")
             import traceback
             traceback.print_exc()
-    
+
+    async def _enrich_position_questions(self) -> None:
+        """Back-fill human-readable question text for positions that were stored
+        with question == market_id (a previous fallback wrote the raw ticker string).
+
+        Calls the Kalshi /markets/{ticker} endpoint for each affected position so
+        we get the actual market title.  Falls back to the ticker decoder if the API
+        also returns an empty title.
+        """
+        from services.kalshi_client import parse_kalshi_market as _parse
+        needs = [
+            (pos_id, pos, pos['market_id'])
+            for pos_id, pos in self._positions.items()
+            if (q := pos.get('question', '')) == '' or q == pos.get('market_id', '')
+        ]
+        if not needs:
+            return
+        print(f"[Enrich] {len(needs)} position(s) need readable question text")
+        changed = False
+        for pos_id, pos, ticker in needs:
+            # 1. Try the in-memory markets cache first
+            cached = self._markets.get(ticker, {})
+            cache_q = cached.get('question', '') or cached.get('title', '')
+            if cache_q and cache_q != ticker:
+                pos['question'] = cache_q
+                print(f"[Enrich] (cache) {ticker[:30]} → {cache_q[:50]}")
+                changed = True
+                continue
+            # 2. Call the single-market endpoint
+            try:
+                await asyncio.sleep(0.25)  # gentle rate-limiting
+                raw = await self._kalshi.get_market(ticker)
+                mkt = raw.get('market', raw)
+                enriched = _parse(mkt)
+                api_q = enriched.get('question', '')
+                if api_q and api_q != ticker:
+                    pos['question'] = api_q
+                    print(f"[Enrich] (api)   {ticker[:30]} → {api_q[:50]}")
+                    changed = True
+                    continue
+            except Exception as _e:
+                print(f"[Enrich] API error for {ticker}: {_e}")
+            # 3. Decoder fallback — always produces something readable
+            decoded = self._decode_kalshi_ticker(ticker)
+            pos['question'] = decoded
+            print(f"[Enrich] (decode) {ticker[:30]} → {decoded[:50]}")
+            changed = True
+        if changed:
+            self._save_state()
+
     def _get_historical_performance(self) -> dict:
         """Calculate win/loss performance by category from trade history.
         
@@ -3994,10 +4051,13 @@ class KalshiBattleBot:
         MAX_CONTRACTS_PER_ORDER = max(200, int(self.max_position_size / 0.10))
         MIN_PRICE_CENTS = 10   # Floor at 10¢ — quant-validated range bets at 10-14¢ have excellent
                                # win/loss math (25:1 ratio) and the $8 crypto range cap limits downside
-        # Cap at 50¢: at 51% historical hit rate, break-even requires entry < 51¢.
-        # At 50¢: win=$0.50, lose=$0.50 → break-even at 50%. At 40¢: win=$0.60, lose=$0.40 → 
+        # Cap at 50¢ for YES bets: at 51% historical hit rate, break-even requires entry < 51¢.
+        # At 50¢: win=$0.50, lose=$0.50 → break-even at 50%. At 40¢: win=$0.60, lose=$0.40 →
         # break-even at 40% — the lower the entry price, the better the win/loss ratio.
-        # Raising this above 50¢ requires proportionally higher AI accuracy to stay profitable.
+        # NOTE: This cap applies to YES bets only.  For NO bets the edge gate in _analyze_market
+        # (edge = trade_prob - no_fill) already enforces EV > 0 — no separate price cap needed.
+        # The inversion strategy bets NO at 60–80¢ (empirical 80% win rate), so blocking those
+        # by a 50¢ ceiling was silently killing every inversion trade.
         MAX_PRICE_CENTS = 50
         
         # Use the correct price for the side we're trading
@@ -4013,8 +4073,9 @@ class KalshiBattleBot:
         if price_cents < MIN_PRICE_CENTS:
             print(f"[Order] SKIPPED: Price {price_cents}¢ too low (min {MIN_PRICE_CENTS}¢) - too risky")
             return
-        if price_cents > MAX_PRICE_CENTS:
-            print(f"[Order] SKIPPED: Price {price_cents}¢ too high (max {MAX_PRICE_CENTS}¢) - not enough upside")
+        # 50¢ cap only applies to YES bets — for NO bets the edge gate already validates EV > 0.
+        if side.upper() == 'YES' and price_cents > MAX_PRICE_CENTS:
+            print(f"[Order] SKIPPED: YES price {price_cents}¢ too high (max {MAX_PRICE_CENTS}¢) - not enough upside")
             return
         
         # Calculate contracts with STRICT LIMIT
@@ -5463,12 +5524,16 @@ class KalshiBattleBot:
                     # series contracts (e.g. KXCPIYOY-26MAR-T3.1) may have been stored
                     # with question='' because Kalshi returned title='' at order time.
                     _icache = self._markets.get(ticker, {})
-                    question  = (
-                        internal.get('question')
-                        or _icache.get('question')
-                        or _icache.get('title')
-                        or ticker
-                    )
+                    _stored_q = internal.get('question', '')
+                    # Treat question == ticker as "no real question" — use cache or decoder
+                    if _stored_q and _stored_q != ticker:
+                        question = _stored_q
+                    else:
+                        _cache_q = _icache.get('question', '') or _icache.get('title', '')
+                        if _cache_q and _cache_q != ticker:
+                            question = _cache_q
+                        else:
+                            question = self._decode_kalshi_ticker(ticker)
                     entry_time = internal.get('entry_time')
                 elif kpos:
                     raw_c = kpos.get('position', 0)
@@ -5560,25 +5625,92 @@ class KalshiBattleBot:
             import traceback
             return web.json_response({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
 
+    @staticmethod
+    def _decode_kalshi_ticker(ticker: str) -> str:
+        """Convert a raw Kalshi ticker to a human-readable label.
+
+        Used as last-resort when Kalshi's API returns no title for a contract.
+        Examples:
+          KXCPIYOY-26MAR-T3.1  → "CPI YoY: above 3.1 (Mar '26)"
+          KXU3-26MAR-T4.5      → "Unemployment U3: above 4.5 (Mar '26)"
+          KXNEWTARIFFS-26APR01 → "New Tariffs (Apr 1 '26)"
+          KXTX18D-26-AGRE      → "TX 18th District - AGRE ('26)"
+        """
+        import re as _re
+        _SERIES_NAMES: dict[str, str] = {
+            'CPIYOY': 'CPI YoY', 'CPI': 'CPI MoM', 'PCE': 'PCE Inflation',
+            'PCECORE': 'Core PCE', 'U3': 'Unemployment U3', 'U6': 'Unemployment U6',
+            'NONFARM': 'Nonfarm Payrolls', 'JOBSREPORT': 'Jobs Report',
+            'GDPQ': 'GDP Growth', 'FED': 'Fed Funds Rate',
+            'TECHLAYOFF': 'Tech Layoff Rate', 'LAGODAYS': 'Lag Days',
+            'EOWEEK': 'Executive Orders/Week', 'TRUMPMEET': 'Trump Meeting',
+            'NEWTARIFFS': 'New Tariffs', 'TX18D': 'TX 18th District',
+            'BTC': 'Bitcoin Range', 'ETH': 'Ethereum Range',
+            'DOGE': 'Dogecoin Range', 'SOL': 'Solana Range',
+            'NASDAQ100': 'Nasdaq 100 Range',
+        }
+        _MON = {
+            'JAN': 'Jan', 'FEB': 'Feb', 'MAR': 'Mar', 'APR': 'Apr',
+            'MAY': 'May', 'JUN': 'Jun', 'JUL': 'Jul', 'AUG': 'Aug',
+            'SEP': 'Sep', 'OCT': 'Oct', 'NOV': 'Nov', 'DEC': 'Dec',
+        }
+        t = ticker[2:] if ticker.startswith('KX') else ticker
+        parts = t.split('-')
+        if not parts:
+            return ticker
+        series = parts[0]
+        name = _SERIES_NAMES.get(series, series)
+        date_str = ''
+        threshold_str = ''
+        extra: list[str] = []
+        for part in parts[1:]:
+            m = _re.match(
+                r'^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{0,2})$',
+                part,
+            )
+            if m:
+                yy, mon, day = m.group(1), _MON[m.group(2)], m.group(3)
+                date_str = f"{mon}{' ' + day.lstrip('0') if day else ''} '{yy}"
+            elif _re.match(r'^\d{2}$', part):
+                date_str = f"'{part}"
+            elif part.startswith('T') and len(part) > 1 and _re.match(r'^T[\d.]+$', part):
+                threshold_str = f'above {part[1:]}'
+            elif _re.match(r'^[\d.]+$', part):
+                threshold_str = f'above {part}'
+            else:
+                extra.append(part)
+        label = name
+        if threshold_str:
+            label += f': {threshold_str}'
+        if date_str:
+            label += f' ({date_str})'
+        if extra:
+            label += f' [{"-".join(extra)}]'
+        return label
+
     def _enrich_positions(self) -> list:
         """Return positions list with question text resolved from _markets cache.
 
         Positions created from Kalshi series contracts (e.g. KXCPIYOY-26MAR-T3.1)
-        are often stored with question='' because Kalshi returns title='' on those
-        contracts.  Always overlay from _markets cache so the UI shows real text.
+        were sometimes stored with question == market_id (ticker string) because Kalshi
+        returns title='' for those contracts and an old fallback wrote the raw ticker.
+        We must treat question == ticker as "no readable question" and override it.
         """
         enriched = []
         for pos in self._positions.values():
             ticker = pos.get('market_id', '')
-            cached = self._markets.get(ticker, {})
-            best_q = (
-                pos.get('question')
-                or cached.get('question')
-                or cached.get('title')
-                or None  # keep None so the display can show the ticker as last resort
-            )
-            if best_q and best_q != pos.get('question'):
-                pos = {**pos, 'question': best_q}
+            stored_q = pos.get('question', '')
+            # A question that IS the ticker is not a real question — treat as missing
+            needs_q = not stored_q or stored_q == ticker
+            if needs_q:
+                cached = self._markets.get(ticker, {})
+                cache_q = cached.get('question', '') or cached.get('title', '')
+                # Ignore cache if it also just contains the ticker
+                if cache_q and cache_q != ticker:
+                    pos = {**pos, 'question': cache_q}
+                else:
+                    # Last resort: decode ticker into a human-readable label
+                    pos = {**pos, 'question': self._decode_kalshi_ticker(ticker)}
             enriched.append(pos)
         return enriched
 
