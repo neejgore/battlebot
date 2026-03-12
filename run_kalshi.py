@@ -165,6 +165,11 @@ class KalshiBattleBot:
         # 500ms order rate-limit gate (workspace rule: min 500ms between placements)
         self._last_order_time: datetime = datetime.utcnow() - timedelta(seconds=1)
 
+        # Entry lock: prevents concurrent _analyze_market coroutines from entering
+        # the same market simultaneously. Without this, two tasks can both pass the
+        # ALREADY_IN_POSITION check before either has updated _pending_orders.
+        self._entry_lock: asyncio.Lock = asyncio.Lock()
+
         # Price updates counter (incremented by WS ticker callback and REST refresh)
         self._price_update_count = 0
         
@@ -3552,6 +3557,25 @@ class KalshiBattleBot:
             self._signal_log[-1]['skip_reason'] = ', '.join(reasons) if not should_trade else None
         
         if should_trade:
+            # ENTRY LOCK: prevents concurrent _analyze_market coroutines from both passing
+            # ALREADY_IN_POSITION and placing duplicate orders on the same market.
+            # Pattern: acquire lock → re-check → plant placeholder → release lock.
+            # The placeholder immediately blocks any other task's ALREADY_IN_POSITION check
+            # (it checks _pending_orders by market_id), so the lock only needs to cover
+            # the tiny re-check + placeholder-insert window, not the full async API call.
+            _placeholder_key = f'_reserving_{market_id}'
+            async with self._entry_lock:
+                _held_now = {p.get('market_id') for p in self._positions.values()}
+                _pending_now = {o.get('market_id') for o in self._pending_orders.values()}
+                _questions_now = {p.get('question', '').strip().lower() for p in self._positions.values()}
+                if (market_id in _held_now or market_id in _pending_now
+                        or _this_question in _questions_now):
+                    print(f"[EntryLock] {market_id[:35]} — skipped, another task already entered")
+                    return
+                # Plant placeholder so any concurrent task sees this market as reserved
+                self._pending_orders[_placeholder_key] = {'market_id': market_id, 'size': 0, 'placeholder': True}
+            # Lock released — placeholder now blocks other tasks without holding lock during API call
+
             # Sync total + per-market exposure so both global and per-market limits fire.
             # Include pending orders in both exposure and count so the max_positions
             # check fires correctly before pending orders fill (not just after).
@@ -3637,9 +3661,14 @@ class KalshiBattleBot:
             print(f"[Debug] Position size: ${position_size:.2f}")
 
             if position_size > 0:
-                await self._enter_position(market, side, position_size, adjusted_prob, edge, signal.confidence)
-                print(f"[AI] {question}... | ✓ TRADE | Edge: +{edge*100:.1f}% | Conf: {signal.confidence*100:.0f}%")
+                try:
+                    await self._enter_position(market, side, position_size, adjusted_prob, edge, signal.confidence)
+                    print(f"[AI] {question}... | ✓ TRADE | Edge: +{edge*100:.1f}% | Conf: {signal.confidence*100:.0f}%")
+                finally:
+                    # Remove placeholder — real order (if placed) is now in _pending_orders under its order_id
+                    self._pending_orders.pop(_placeholder_key, None)
             else:
+                self._pending_orders.pop(_placeholder_key, None)
                 print(f"[AI] {question}... | ✗ SKIP | Size: $0 (edge={edge:.2%}, conf={signal.confidence:.2%})")
         else:
             print(f"[AI] {question}... | ✗ SKIP | {', '.join(reasons)}")
