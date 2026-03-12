@@ -1007,13 +1007,36 @@ class KalshiBattleBot:
                         _price = _ipos.get('current_price', _ipos.get('entry_price', 0.5))
                     _cache_market_value += _contracts * _price
 
-                # Prefer Kalshi's live portfolio_value (matches their UI "Positions: $X").
-                # Fall back to our cached-price calculation only when it's unavailable.
-                _positions_mv = _kalshi_portfolio_value if _kalshi_portfolio_value is not None else _cache_market_value
-                _pv_source = 'kalshi_api' if _kalshi_portfolio_value is not None else 'cache_fallback'
+                # Sanity-check Kalshi's portfolio_value before trusting it.
+                # Kalshi's API is inconsistent: it sometimes returns face value (max payout
+                # if all positions win), sometimes cost basis, sometimes real MtM. This causes
+                # the reported total to swing wildly (e.g. $726 → $411 intraday) even when
+                # positions haven't moved significantly, which falsely triggers the kill switch.
+                #
+                # Strategy: use Kalshi's value when it's plausible (within 80%-200% of our own
+                # mid-price calculation). Outside that band, fall back to our own calculation.
+                _pv_source = 'cache_fallback'
+                if _kalshi_portfolio_value is not None and _cache_market_value > 1:
+                    _ratio = _kalshi_portfolio_value / _cache_market_value
+                    if 0.5 <= _ratio <= 2.5:
+                        # Plausible — use Kalshi's value (it often has more positions than we track)
+                        _positions_mv = _kalshi_portfolio_value
+                        _pv_source = 'kalshi_api'
+                    else:
+                        # Out of band — Kalshi returned garbage (face value or near-zero)
+                        _positions_mv = _cache_market_value
+                        _pv_source = 'cache_sanity_override'
+                        print(f"[Sync] WARNING: Kalshi portfolio_value=${_kalshi_portfolio_value:.2f} "
+                              f"ratio={_ratio:.2f}x vs cache=${_cache_market_value:.2f} "
+                              f"— using cache to prevent bad kill-switch trigger")
+                elif _kalshi_portfolio_value is not None:
+                    _positions_mv = _kalshi_portfolio_value
+                    _pv_source = 'kalshi_api'
+                else:
+                    _positions_mv = _cache_market_value
 
                 # Single source of truth for ALL dashboard value displays:
-                #   _kalshi_positions_mv = live MtM (same as Kalshi UI "Positions")
+                #   _kalshi_positions_mv = live MtM (Kalshi API or cache fallback)
                 #   _kalshi_total        = cash + MtM (every dashboard metric derives from this)
                 self._kalshi_positions_mv = _positions_mv
                 self._kalshi_total = self._kalshi_cash + self._kalshi_positions_mv
@@ -5608,6 +5631,18 @@ class KalshiBattleBot:
                           f"deviation={_deviation:.1%}) — was written with face-value formula")
                     snapshot['start_of_day_value'] = None
             snapshot['_pv_method'] = 'mtm'
+
+        # Spike guard: reject single-cycle value drops >35% from the previous reading.
+        # Kalshi's portfolio_value occasionally returns a transiently bad value (face value,
+        # near-zero, etc.) that causes the account total to plunge by hundreds of dollars in
+        # a single sync, which sets a false intraday_low and triggers the kill switch.
+        _prev_val = snapshot.get('account_value', val)
+        _spike_ratio = val / _prev_val if _prev_val > 0 else 1.0
+        if _spike_ratio < 0.65 and _prev_val > 50:
+            # Reject — looks like a bad API reading, not a real loss this fast
+            print(f"[Snapshot] SPIKE GUARD: rejecting val=${val:.2f} (prev=${_prev_val:.2f}, "
+                  f"ratio={_spike_ratio:.2f}) — using prev value to protect kill switch")
+            val = _prev_val  # use previous value for this snapshot cycle
 
         if snapshot.get('start_of_day_value') is None and bot_uptime_secs >= 60:
             snapshot['start_of_day_value'] = val

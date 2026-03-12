@@ -50,7 +50,8 @@ class PositionWithExitRules:
 @dataclass
 class RiskLimits:
     """Configurable risk limits."""
-    max_daily_drawdown: float = 0.15  # 15%
+    max_daily_drawdown: float = 0.20  # 20% — raised from 15% to account for positions
+                                       # that can individually represent 15-20% of bankroll
     max_position_size: float = 50.0  # $50 per position
     max_percent_bankroll_per_market: float = 0.10  # 10% of bankroll per market
     max_total_open_risk: float = 0.30  # 30% of bankroll in open positions
