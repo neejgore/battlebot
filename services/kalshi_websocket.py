@@ -440,6 +440,11 @@ class KalshiWebSocketClient:
 
         self._ticker_count += 1
 
+        # Debug: log first 3 ticker payloads to verify field names/format
+        if self._ticker_count <= 3:
+            logger.info(f"[WS Debug] ticker #{self._ticker_count} payload keys={list(payload.keys())} "
+                        f"yes_bid={yes_bid} yes_ask={yes_ask} price={last_price}")
+
         for cb in self._ticker_callbacks:
             try:
                 cb(ticker, yes_bid, yes_ask, last_price, volume, open_interest)
