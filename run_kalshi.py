@@ -2795,32 +2795,87 @@ class KalshiBattleBot:
     # Real-world tradeable assets whose threshold markets require live price context.
     # Maps lowercase keyword found in the market question → Brave search query for current price.
     _COMMODITY_PRICE_QUERIES: dict[str, str] = {
-        'gold':        'gold futures price today site:reuters.com OR site:bloomberg.com OR site:cnbc.com',
-        'silver':      'silver futures price today',
-        'crude oil':   'WTI crude oil price today',
-        'wti':         'WTI crude oil price today',
-        'brent':       'Brent crude oil price today',
-        'natural gas': 'natural gas futures price today',
-        'wheat':       'wheat futures price today',
-        'corn':        'corn futures price today',
-        'copper':      'copper futures price today',
-        's&p 500':     'S&P 500 index current price today',
-        'sp500':       'S&P 500 index current price today',
-        'dow jones':   'Dow Jones index current price today',
-        'russell 2000':'Russell 2000 index current price today',
-        'nasdaq':      'NASDAQ 100 index current price today',
-        'nikkei':      'Nikkei 225 index current price today',
-        'ftse':        'FTSE 100 index current price today',
+        # ── Commodities ────────────────────────────────────────────────────────
+        'gold':          'gold futures spot price today site:reuters.com OR site:bloomberg.com OR site:cnbc.com',
+        'silver':        'silver futures spot price today site:reuters.com OR site:cnbc.com',
+        'crude oil':     'WTI crude oil price today site:reuters.com OR site:cnbc.com',
+        'wti':           'WTI crude oil price today site:reuters.com',
+        'brent':         'Brent crude oil price today site:reuters.com',
+        'natural gas':   'natural gas futures price today site:reuters.com OR site:cnbc.com',
+        'wheat':         'wheat futures price today site:reuters.com',
+        'corn':          'corn futures price today site:reuters.com',
+        'copper':        'copper futures price today site:reuters.com',
+        # ── Equity indices ─────────────────────────────────────────────────────
+        's&p 500':       'S&P 500 index current price today site:cnbc.com OR site:reuters.com',
+        'sp500':         'S&P 500 index current price today',
+        'dow jones':     'Dow Jones DJIA current price today site:cnbc.com',
+        'russell 2000':  'Russell 2000 index current price today',
+        'nasdaq':        'NASDAQ 100 index current price today site:cnbc.com',
+        'nikkei':        'Nikkei 225 index current price today',
+        'ftse':          'FTSE 100 index current price today',
+        # ── Inflation ──────────────────────────────────────────────────────────
+        # Order matters: more specific phrases first so they match before substrings
+        'core pce':      'latest core PCE inflation rate year-over-year 2026 site:bea.gov OR site:reuters.com OR site:cnbc.com',
+        'core cpi':      'latest core CPI inflation rate ex food energy year-over-year 2026 site:bls.gov OR site:reuters.com',
+        'consumer price index': 'latest CPI consumer price index year-over-year 2026 site:bls.gov OR site:reuters.com',
+        'cpi':           'latest US CPI inflation rate year-over-year 2026 site:bls.gov OR site:reuters.com OR site:cnbc.com',
+        'pce':           'latest PCE personal consumption expenditures inflation 2026 site:bea.gov OR site:reuters.com',
+        'ppi':           'latest US PPI producer price index year-over-year 2026 site:bls.gov OR site:reuters.com',
+        'inflation rate':'latest US inflation rate CPI year-over-year 2026 site:bls.gov OR site:reuters.com',
+        # ── Employment ─────────────────────────────────────────────────────────
+        'nonfarm payroll':   'latest US nonfarm payrolls jobs added 2026 site:bls.gov OR site:reuters.com OR site:cnbc.com',
+        'nonfarm':           'latest US nonfarm payrolls jobs added 2026 bureau of labor statistics',
+        'payroll':           'latest US nonfarm payrolls jobs report 2026 site:bls.gov OR site:reuters.com',
+        'unemployment rate': 'latest US unemployment rate U-3 2026 site:bls.gov OR site:reuters.com OR site:cnbc.com',
+        'unemployment':      'latest US unemployment rate 2026 bureau of labor statistics',
+        'u-3':               'latest US U-3 unemployment rate 2026 site:bls.gov',
+        'u-6':               'latest US U-6 underemployment rate 2026 site:bls.gov OR site:reuters.com',
+        'jobless claims':    'latest weekly initial jobless claims 2026 site:dol.gov OR site:reuters.com OR site:cnbc.com',
+        'initial claims':    'latest weekly initial jobless claims 2026 department of labor',
+        'adp':               'latest ADP private payrolls employment report 2026 site:reuters.com OR site:cnbc.com',
+        'labor force':       'latest US labor force participation rate 2026 site:bls.gov',
+        # ── GDP & Growth ───────────────────────────────────────────────────────
+        'gdp':               'latest US GDP growth rate quarterly annualized 2026 site:bea.gov OR site:reuters.com OR site:cnbc.com',
+        'gross domestic':    'latest US GDP growth rate 2026 site:bea.gov OR site:reuters.com',
+        # ── Federal Reserve & Rates ────────────────────────────────────────────
+        'federal funds rate':'current federal funds rate FOMC 2026 site:federalreserve.gov OR site:reuters.com',
+        'fed funds':         'current federal funds rate 2026 site:federalreserve.gov OR site:cnbc.com',
+        'fomc':              'latest FOMC meeting decision federal funds rate 2026 site:federalreserve.gov OR site:reuters.com',
+        '10-year treasury':  'current 10-year US treasury yield 2026 site:reuters.com OR site:cnbc.com',
+        '10 year treasury':  'current 10-year US treasury yield 2026 site:reuters.com',
+        '10-year yield':     'current 10-year US treasury yield 2026',
+        '2-year treasury':   'current 2-year US treasury yield 2026 site:reuters.com',
+        '30-year treasury':  'current 30-year US treasury yield 2026 site:reuters.com',
+        # ── Housing ────────────────────────────────────────────────────────────
+        'housing starts':    'latest US housing starts 2026 site:census.gov OR site:reuters.com OR site:cnbc.com',
+        'existing home':     'latest existing home sales 2026 site:nar.realtor OR site:reuters.com',
+        'case-shiller':      'latest Case-Shiller home price index 2026 site:reuters.com OR site:cnbc.com',
+        # ── Consumer ───────────────────────────────────────────────────────────
+        'retail sales':      'latest US retail sales month-over-month 2026 site:census.gov OR site:reuters.com OR site:cnbc.com',
+        'consumer confidence':'latest consumer confidence index 2026 conference board site:reuters.com OR site:cnbc.com',
+        'consumer sentiment':'latest University of Michigan consumer sentiment index 2026 site:reuters.com',
+        # ── Manufacturing & Services ───────────────────────────────────────────
+        'ism manufacturing': 'latest ISM manufacturing PMI index 2026 site:reuters.com OR site:cnbc.com',
+        'ism services':      'latest ISM services PMI non-manufacturing index 2026 site:reuters.com',
+        'pmi':               'latest US PMI purchasing managers index 2026 site:reuters.com OR site:cnbc.com',
+        # ── Trade ──────────────────────────────────────────────────────────────
+        'trade deficit':     'latest US trade deficit balance 2026 site:census.gov OR site:reuters.com',
+        'trade balance':     'latest US trade balance 2026 site:census.gov OR site:reuters.com',
     }
-    # Regex for "above/below/over/under $NUMBER" patterns in market questions
+    # Regex for price/rate threshold patterns in market questions.
+    # Matches: "above $1,500"  "below 4.5%"  "exceed 150,000"  "above 50" (ISM PMI)
+    # The number group makes % optional so bare integers (NFP, claims, PMI) are caught.
+    # False positives are harmless: the keyword lookup is the real gate.
     _PRICE_THRESHOLD_RE = re.compile(
-        r'\b(above|below|over|under|exceed|at least|at most|higher than|lower than)\s+\$[\d,]+',
+        r'\b(above|below|over|under|exceed|at least|at most|higher than|lower than)'
+        r'\s+(\$[\d,]+(?:\.\d+)?|[\d,]+(?:\.\d+)?(?:\s*%)?)',
         re.IGNORECASE,
     )
 
-    async def _fetch_commodity_price_context(self, question_full: str) -> str | None:
-        """For real-world asset threshold markets, fetch a targeted Brave search for the
-        current spot/futures price so Claude isn't flying blind with stale training data.
+    async def _fetch_live_data_context(self, question_full: str) -> str | None:
+        """Fetch a targeted Brave search for the current value of any real-world
+        asset price or economic indicator referenced in a threshold market question,
+        so Claude is never forced to rely on stale training-data numbers.
         Returns a short context string to prepend to Claude's news summary, or None."""
         if not self._PRICE_THRESHOLD_RE.search(question_full):
             return None
@@ -2843,13 +2898,13 @@ class KalshiBattleBot:
                 for it in items[:3]
             )
             ctx = (
-                f"⚠️  LIVE PRICE DATA for '{matched_asset}' (fetched right now — use this, "
-                f"NOT your training-data price which may be years out of date):\n{snippets}"
+                f"⚠️  LIVE DATA for '{matched_asset}' (fetched right now — use this number, "
+                f"NOT your training-data value which may be months or years out of date):\n{snippets}"
             )
-            print(f"[PriceGuard] Fetched live price context for '{matched_asset}': {len(items)} results")
+            print(f"[LiveData] Fetched live context for '{matched_asset}': {len(items)} results")
             return ctx
         except Exception as e:
-            print(f"[PriceGuard] Price context fetch failed (non-fatal): {e}")
+            print(f"[LiveData] Context fetch failed (non-fatal): {e}")
             return None
 
     async def _analyze_market(self, market: dict):
@@ -2965,14 +3020,11 @@ class KalshiBattleBot:
                 print(f"[Intel] Failed to gather: {e}")
                 intel = None
 
-        # Step 2c: For real-world asset price-threshold markets (gold, oil, NASDAQ, etc.),
-        # fetch live spot/futures price via Brave so Claude doesn't use stale training data.
-        # Example: gold was ~$2,700 in Claude's training data but trades at $5,200 today.
-        # Without this, Claude bets NO on "above $5,159" because it thinks $5,159 is impossible.
+        # Step 2c: For real-world asset / economic-indicator threshold markets, fetch live data
+        # via Brave so Claude isn't forced to use stale training-data numbers.
+        # Only fetched when Claude will actually be called (not on cache hits or inverted crypto).
         _commodity_price_ctx: str | None = None
         _full_question = market.get('question', '')
-        if not _is_crypto_range_q:  # crypto already has the quant model for live prices
-            _commodity_price_ctx = await self._fetch_commodity_price_context(_full_question)
 
         # Build overreaction info string for AI
         overreaction_info = None
@@ -3074,7 +3126,12 @@ class KalshiBattleBot:
                     except Exception:
                         pass
 
-                # Merge quant context + commodity live price + news intel for Claude prompt
+                # Fetch live asset/indicator data right before calling Claude.
+                # Only runs here (not on cache hits or inverted crypto) to avoid wasted calls.
+                if not _is_crypto_range_q:
+                    _commodity_price_ctx = await self._fetch_live_data_context(_full_question)
+
+                # Merge quant context + live data + news intel for Claude prompt
                 _news_summary_for_claude = intel.news_summary if intel else None
                 if _quant_result:
                     quant_block = _quant_result.context_summary
@@ -3083,7 +3140,7 @@ class KalshiBattleBot:
                         if _news_summary_for_claude
                         else quant_block
                     )
-                # Prepend live commodity price data so Claude doesn't use stale training prices
+                # Prepend live data so Claude doesn't use stale training numbers
                 if _commodity_price_ctx:
                     _news_summary_for_claude = (
                         _commodity_price_ctx + "\n\n" + _news_summary_for_claude
