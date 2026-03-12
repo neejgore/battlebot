@@ -233,7 +233,8 @@ class KalshiBattleBot:
                         except Exception:
                             pass
                     self._recently_exited_reason = state.get('recently_exited_reason', {})
-                    # Restore today's starting bankroll and conditionally restore kill switch.
+                    # _today must be defined before any snapshot lookup that uses it.
+                    _today = datetime.utcnow().strftime('%Y-%m-%d')
                     _today_snap = self._daily_snapshots.get(_today, {})
                     # If the kill switch was manually reset today, use the reset baseline
                     # (stored as _ks_reset_baseline) instead of the original start_of_day.
@@ -252,7 +253,6 @@ class KalshiBattleBot:
                     # respect that across redeploys. The kill switch can still fire during the run
                     # from genuine losses; it just won't auto-start the bot in a halted state.
                     _ks_date = state.get('kill_switch_date', '')
-                    _today = datetime.utcnow().strftime('%Y-%m-%d')
                     _user_reset_today = bool(_ks_reset_baseline)
                     if state.get('kill_switch_triggered') and _ks_date == _today and not _user_reset_today:
                         self._risk_engine.daily_stats.kill_switch_triggered = True
