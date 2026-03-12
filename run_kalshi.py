@@ -1564,6 +1564,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/api/filters', self._handle_filters)
         self._app.router.add_get('/api/nightly', self._handle_nightly)
         self._app.router.add_get('/api/reset-killswitch', self._handle_reset_killswitch)
+        self._app.router.add_get('/api/force-exit', self._handle_force_exit)
         self._app.router.add_get('/healthz', self._handle_healthz)
         
         self._runner = web.AppRunner(self._app)
@@ -4979,6 +4980,42 @@ class KalshiBattleBot:
     async def _handle_healthz(self, request):
         """Railway health check — returns 200 as soon as the HTTP server is up."""
         return web.Response(text='ok', content_type='text/plain')
+
+    async def _handle_force_exit(self, request):
+        """Force-exit a position by market_id. Usage: /api/force-exit?market_id=KXU3-26MAR-T4.5"""
+        market_id = request.rel_url.query.get('market_id', '').strip().upper()
+        if not market_id:
+            return web.json_response({'ok': False, 'error': 'market_id param required'}, status=400)
+
+        # Find the position
+        pos_id = None
+        for pid, pos in self._positions.items():
+            if pos.get('market_id', '').upper() == market_id:
+                pos_id = pid
+                break
+
+        if not pos_id:
+            held = [p.get('market_id') for p in self._positions.values()]
+            return web.json_response({'ok': False, 'error': f'{market_id} not in positions', 'held': held}, status=404)
+
+        pos = self._positions[pos_id]
+        side = pos.get('side', 'YES')
+        cur_price = pos.get('current_price', pos.get('entry_price', 0.5))
+        exit_price = cur_price if side == 'YES' else (1 - cur_price)
+        cost = pos.get('cost') or pos.get('size', 0)
+        pnl = (exit_price - pos.get('entry_price', exit_price)) * pos.get('contracts', 0)
+
+        print(f"[ForceExit] Manual exit triggered for {market_id} ({side}) @ {exit_price:.2f}")
+        await self._exit_position(pos_id, exit_price, pnl, 'MANUAL_FORCE_EXIT')
+        self._save_state()
+        return web.json_response({
+            'ok': True,
+            'message': f'Exit order placed for {market_id}',
+            'side': side,
+            'exit_price': round(exit_price, 3),
+            'estimated_pnl': round(pnl, 2),
+            'cost': round(cost, 2),
+        })
 
     async def _handle_reset_killswitch(self, request):
         """Manually clear the kill switch and re-baseline drawdown from current value."""
