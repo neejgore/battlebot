@@ -1565,6 +1565,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/api/nightly', self._handle_nightly)
         self._app.router.add_get('/api/reset-killswitch', self._handle_reset_killswitch)
         self._app.router.add_get('/api/force-exit', self._handle_force_exit)
+        self._app.router.add_get('/api/positions', self._handle_positions)
         self._app.router.add_get('/healthz', self._handle_healthz)
         
         self._runner = web.AppRunner(self._app)
@@ -5086,6 +5087,88 @@ class KalshiBattleBot:
         print(f"[KILL SWITCH] Manually reset via /api/reset-killswitch — new baseline ${live:.2f}")
         return web.json_response({'ok': True, 'message': f'Kill switch cleared — drawdown re-baselined from ${live:.2f}.'})
 
+    async def _handle_positions(self, request):
+        """Dedicated positions endpoint — full question text, all positions, live P&L."""
+        try:
+            if self._kalshi_cash is None or self._kalshi_total is None:
+                return web.json_response({'error': 'syncing', 'positions': []})
+
+            kalshi_positions = self._kalshi_positions_raw
+            positions_detail = []
+
+            for pos in kalshi_positions:
+                contracts = pos.get('position', 0)
+                if contracts == 0:
+                    continue
+
+                ticker = pos.get('ticker', '')
+                side = 'yes' if contracts > 0 else 'no'
+                contracts = abs(contracts)
+
+                cached_market = self._markets.get(ticker, {})
+                yes_price = cached_market.get('yes_price')
+                no_price = cached_market.get('no_price')
+
+                if yes_price is None:
+                    _exp = abs(pos.get('market_exposure', 0)) / 100
+                    yes_price = (_exp / contracts) if side == 'yes' and contracts > 0 else (1 - _exp / contracts if contracts > 0 else 0.5)
+                if no_price is None:
+                    no_price = 1 - yes_price
+
+                current_price = yes_price if side == 'yes' else no_price
+                question = cached_market.get('question', ticker)  # full question, not truncated
+
+                entry_price = current_price
+                entry_time = None
+                for p in self._positions.values():
+                    if p.get('market_id') == ticker:
+                        entry_price = p.get('entry_price', current_price)
+                        question = p.get('question', question)
+                        entry_time = p.get('entry_time')
+                        break
+
+                cost = contracts * entry_price
+                value = contracts * current_price
+                unrealized = value - cost
+                unrealized_pct = (unrealized / cost * 100) if cost > 0 else 0
+
+                positions_detail.append({
+                    'ticker': ticker,
+                    'question': question,
+                    'side': side.upper(),
+                    'contracts': contracts,
+                    'entry_price': round(entry_price, 4),
+                    'current_price': round(current_price, 4),
+                    'cost': round(cost, 2),
+                    'value': round(value, 2),
+                    'unrealized_pnl': round(unrealized, 2),
+                    'unrealized_pct': round(unrealized_pct, 1),
+                    'entry_time': entry_time,
+                })
+
+            positions_detail.sort(key=lambda p: p['unrealized_pnl'])
+
+            total_cost = sum(p['cost'] for p in positions_detail)
+            total_unrealized = sum(p['unrealized_pnl'] for p in positions_detail)
+            winning = len([p for p in positions_detail if p['unrealized_pnl'] > 0])
+            losing = len([p for p in positions_detail if p['unrealized_pnl'] < 0])
+
+            return web.json_response({
+                'positions': positions_detail,
+                'summary': {
+                    'count': len(positions_detail),
+                    'winning': winning,
+                    'losing': losing,
+                    'flat': len(positions_detail) - winning - losing,
+                    'total_cost': round(total_cost, 2),
+                    'total_unrealized': round(total_unrealized, 2),
+                },
+                'timestamp': datetime.utcnow().isoformat(),
+            })
+        except Exception as e:
+            import traceback
+            return web.json_response({'error': str(e), 'traceback': traceback.format_exc()}, status=500)
+
     async def _handle_state(self, request):
         """API endpoint for current state."""
         return web.json_response({
@@ -5801,6 +5884,29 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         .analysis-decision.trade { background: #238636; }
         .analysis-decision.skip { background: #6e7681; }
         .badge-group { display: flex; gap: 8px; }
+        /* Positions page */
+        .pos-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
+        .pos-table-wrap { overflow-x: auto; }
+        .pos-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .pos-table th { padding: 8px 12px; text-align: left; font-size: 11px; color: #8b949e; text-transform: uppercase; border-bottom: 1px solid #30363d; white-space: nowrap; }
+        .pos-table td { padding: 10px 12px; border-bottom: 1px solid #21262d; vertical-align: top; }
+        .pos-table tr:hover td { background: #161b22; }
+        .pos-question { max-width: 320px; line-height: 1.4; }
+        .pos-ticker { font-size: 11px; color: #8b949e; margin-top: 3px; font-family: monospace; }
+        .pnl-pos { color: #3fb950; font-weight: 600; }
+        .pnl-neg { color: #f85149; font-weight: 600; }
+        .pnl-flat { color: #8b949e; }
+        .side-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+        .side-badge.YES { background: #238636; color: #fff; }
+        .side-badge.NO  { background: #6e2929; color: #f85149; border: 1px solid #f85149; }
+        .exit-btn { padding: 3px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; background: #21262d; color: #f85149; border: 1px solid #f85149; white-space: nowrap; }
+        .exit-btn:hover { background: #3d1c1c; }
+        .pos-empty { text-align: center; padding: 40px; color: #8b949e; font-size: 14px; }
+        .pos-last-refresh { font-size: 11px; color: #6e7681; text-align: right; margin-bottom: 8px; }
+        .pos-bar { display: flex; gap: 4px; height: 4px; border-radius: 2px; margin-bottom: 20px; overflow: hidden; background: #21262d; }
+        .pos-bar-win { background: #3fb950; }
+        .pos-bar-loss { background: #f85149; }
+        .pos-bar-flat { background: #6e7681; }
     </style>
 </head>
 <body>
@@ -5818,11 +5924,45 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     </div>
     <div class="tabs">
         <div class="tab active" data-tab="portfolio">Portfolio</div>
+        <div class="tab" data-tab="positions">Positions</div>
         <div class="tab" data-tab="txlog">Settlements</div>
         <div class="tab" data-tab="activity">Activity</div>
         <div class="tab" data-tab="markets">Markets</div>
     </div>
     <div class="content">
+        <div id="positions" class="tab-content hidden">
+            <div class="pos-last-refresh">Auto-refreshes every 3s &nbsp;·&nbsp; Last update: <span id="posRefreshTime">—</span></div>
+            <div class="pos-summary">
+                <div class="card"><div class="card-label">Open Positions</div><div class="card-value" id="posCount2">—</div></div>
+                <div class="card"><div class="card-label">Winning / Losing</div><div class="card-value" id="posWinLoss">—</div><div class="card-sub" id="posFlat"></div></div>
+                <div class="card"><div class="card-label">Total Deployed</div><div class="card-value yellow" id="posTotalCost">—</div></div>
+                <div class="card"><div class="card-label">Unrealized P&L</div><div class="card-value" id="posTotalPnl">—</div></div>
+            </div>
+            <div class="pos-bar" id="posBar"></div>
+            <div class="pos-table-wrap">
+                <table class="pos-table">
+                    <thead>
+                        <tr>
+                            <th>Market</th>
+                            <th>Side</th>
+                            <th>Contracts</th>
+                            <th>Entry ¢</th>
+                            <th>Current ¢</th>
+                            <th>Move</th>
+                            <th>Deployed</th>
+                            <th>Value</th>
+                            <th>P&L</th>
+                            <th>P&L %</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="posTableBody">
+                        <tr><td colspan="11" class="pos-empty">Loading positions…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
         <div id="portfolio" class="tab-content">
             <div class="section-title">ACCOUNT</div>
             <div class="grid">
@@ -5930,6 +6070,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     <script>
         let ws;
         const tabs = document.querySelectorAll('.tab');
+        let positionsInterval = null;
         tabs.forEach(tab => {
             tab.addEventListener('click', () => {
                 tabs.forEach(t => t.classList.remove('active'));
@@ -5937,6 +6078,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
                 document.getElementById(tab.dataset.tab).classList.remove('hidden');
                 if (tab.dataset.tab === 'txlog') fetchSettlements();
+                if (tab.dataset.tab === 'positions') {
+                    fetchPositions();
+                    if (!positionsInterval) positionsInterval = setInterval(fetchPositions, 3000);
+                } else {
+                    if (positionsInterval) { clearInterval(positionsInterval); positionsInterval = null; }
+                }
             });
         });
         
@@ -6744,6 +6891,104 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 }
             } catch(e) { console.warn('fetchFilters error', e); }
         }
+
+        // ── Positions page ────────────────────────────────────────────────────
+        function fmtCents(v) { return Math.round(v * 100) + '¢'; }
+        function fmtDollar(v) {
+            const s = (v >= 0 ? '+' : '') + '$' + Math.abs(v).toFixed(2);
+            return s;
+        }
+        function pnlClass(v) { return v > 0.005 ? 'pnl-pos' : (v < -0.005 ? 'pnl-neg' : 'pnl-flat'); }
+
+        async function fetchPositions() {
+            try {
+                const r = await fetch('/api/positions');
+                const d = await r.json();
+                if (d.error) { return; }
+
+                const s = d.summary;
+                document.getElementById('posCount2').textContent = s.count;
+
+                const wl = document.getElementById('posWinLoss');
+                wl.innerHTML = `<span class="pnl-pos">${s.winning}W</span> / <span class="pnl-neg">${s.losing}L</span>`;
+                const flat = document.getElementById('posFlat');
+                flat.textContent = s.flat > 0 ? `${s.flat} flat` : 'vs entry price';
+
+                document.getElementById('posTotalCost').textContent = '$' + s.total_cost.toFixed(2);
+                const pnlEl = document.getElementById('posTotalPnl');
+                pnlEl.textContent = (s.total_unrealized >= 0 ? '+' : '') + '$' + s.total_unrealized.toFixed(2);
+                pnlEl.className = 'card-value ' + pnlClass(s.total_unrealized);
+
+                // Win/loss bar
+                const bar = document.getElementById('posBar');
+                if (s.count > 0) {
+                    const wp = (s.winning / s.count * 100).toFixed(1);
+                    const lp = (s.losing  / s.count * 100).toFixed(1);
+                    const fp = (s.flat    / s.count * 100).toFixed(1);
+                    bar.innerHTML = `<div class="pos-bar-win" style="width:${wp}%"></div><div class="pos-bar-loss" style="width:${lp}%"></div><div class="pos-bar-flat" style="width:${fp}%"></div>`;
+                } else {
+                    bar.innerHTML = '';
+                }
+
+                // Table rows — sorted losing-first (worst P&L at top) so problems are obvious
+                const tbody = document.getElementById('posTableBody');
+                if (d.positions.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="11" class="pos-empty">No open positions</td></tr>';
+                } else {
+                    tbody.innerHTML = d.positions.map(p => {
+                        const move = p.current_price - p.entry_price;
+                        const moveClass = pnlClass(move);
+                        const moveTxt = (move >= 0 ? '+' : '') + Math.round(move * 100) + '¢';
+                        const pnlTxt  = (p.unrealized_pnl >= 0 ? '+$' : '-$') + Math.abs(p.unrealized_pnl).toFixed(2);
+                        const pnlPct  = (p.unrealized_pct >= 0 ? '+' : '') + p.unrealized_pct.toFixed(1) + '%';
+                        const tickerShort = p.ticker.length > 22 ? p.ticker.slice(0, 22) + '…' : p.ticker;
+                        const entryDate = p.entry_time ? new Date(p.entry_time).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '—';
+                        return `<tr>
+                            <td class="pos-question">
+                                <div>${p.question}</div>
+                                <div class="pos-ticker">${tickerShort} · entered ${entryDate}</div>
+                            </td>
+                            <td><span class="side-badge ${p.side}">${p.side}</span></td>
+                            <td>${p.contracts}</td>
+                            <td>${fmtCents(p.entry_price)}</td>
+                            <td>${fmtCents(p.current_price)}</td>
+                            <td class="${moveClass}">${moveTxt}</td>
+                            <td>$${p.cost.toFixed(2)}</td>
+                            <td>$${p.value.toFixed(2)}</td>
+                            <td class="${pnlClass(p.unrealized_pnl)}">${pnlTxt}</td>
+                            <td class="${pnlClass(p.unrealized_pct)}">${pnlPct}</td>
+                            <td><button class="exit-btn" onclick="forceExit('${p.ticker}', this)">Exit</button></td>
+                        </tr>`;
+                    }).join('');
+                }
+
+                const ts = new Date(d.timestamp);
+                document.getElementById('posRefreshTime').textContent = ts.toLocaleTimeString();
+            } catch(e) { console.warn('fetchPositions error', e); }
+        }
+
+        async function forceExit(marketId, btn) {
+            if (!confirm('Force-exit ' + marketId + '?')) return;
+            btn.textContent = '…';
+            btn.disabled = true;
+            try {
+                const r = await fetch('/api/force-exit?market_id=' + encodeURIComponent(marketId));
+                const d = await r.json();
+                if (d.ok) {
+                    btn.textContent = 'Done';
+                    btn.style.color = '#3fb950';
+                    btn.style.borderColor = '#3fb950';
+                    setTimeout(fetchPositions, 1500);
+                } else {
+                    btn.textContent = 'Err';
+                    alert('Exit failed: ' + (d.error || JSON.stringify(d)));
+                }
+            } catch(e) {
+                btn.textContent = 'Err';
+                alert('Exit error: ' + e);
+            }
+        }
+
     </script>
 </body>
 </html>
