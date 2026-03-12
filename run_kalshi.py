@@ -4329,9 +4329,13 @@ class KalshiBattleBot:
         if yes_bid is not None and yes_ask is not None and yes_ask > yes_bid:
             yes_price = (yes_bid + yes_ask) / 2 / 100
             spread = (yes_ask - yes_bid) / 100
+            yes_bid_price = yes_bid / 100   # actual bid — what you'd receive selling YES
+            no_bid_price  = 1.0 - yes_ask / 100  # what you'd receive selling NO
         elif last_price is not None:
             yes_price = last_price / 100
             spread = 0.02
+            yes_bid_price = yes_price - 0.01   # conservative 1¢ below last
+            no_bid_price  = 1.0 - yes_price - 0.01
         else:
             return  # No price data — WS receipt counted above, nothing to cache
 
@@ -4342,6 +4346,11 @@ class KalshiBattleBot:
             'no_price': no_price,
             'price': yes_price,
             'spread': spread,
+            # Bid prices = actual liquidation value (what you receive selling now).
+            # Used by the positions page and portfolio valuation so they agree with
+            # Kalshi's portfolio_value (which is also bid-based).
+            'yes_bid_price': round(yes_bid_price, 4),
+            'no_bid_price':  round(max(0.01, no_bid_price), 4),
         }
         if last_price is not None:
             update['last_price'] = last_price / 100
@@ -4356,8 +4365,6 @@ class KalshiBattleBot:
             self._markets[ticker].update(update)
         if ticker in self._monitored:
             self._monitored[ticker].update(update)
-
-        self._price_update_count += 1
 
     def _on_ws_fill(self, fill: dict) -> None:
         """Handle a real-time fill notification from the Kalshi WebSocket.
@@ -5211,8 +5218,10 @@ class KalshiBattleBot:
 
                 # Current price: prefer live _markets cache, fall back to market_exposure
                 cached_market = self._markets.get(ticker, {})
-                yes_price = cached_market.get('yes_price')
-                no_price  = cached_market.get('no_price')
+                yes_price     = cached_market.get('yes_price')      # mid-price display
+                no_price      = cached_market.get('no_price')
+                yes_bid_price = cached_market.get('yes_bid_price')  # actual bid (exit value)
+                no_bid_price  = cached_market.get('no_bid_price')
 
                 if yes_price is None and kpos:
                     _exp = abs(kpos.get('market_exposure', 0)) / 100
@@ -5223,13 +5232,19 @@ class KalshiBattleBot:
                     yes_price = entry_price or 0.5
                 if no_price is None:
                     no_price = 1 - yes_price
+                _spread = cached_market.get('spread', 0.02)
+                if yes_bid_price is None:
+                    yes_bid_price = yes_price - _spread / 2
+                if no_bid_price is None:
+                    no_bid_price = no_price - _spread / 2
 
-                current_price = yes_price if side == 'YES' else no_price
+                current_price_mid = yes_price if side == 'YES' else no_price
+                current_price_bid = yes_bid_price if side == 'YES' else no_bid_price
                 if entry_price is None:
-                    entry_price = current_price  # unknown entry — show flat
+                    entry_price = current_price_mid  # unknown entry — show flat
 
                 cost = contracts * entry_price
-                value = contracts * current_price
+                value = contracts * current_price_bid   # bid = true exit value
                 unrealized = value - cost
                 unrealized_pct = (unrealized / cost * 100) if cost > 0 else 0
 
@@ -5239,9 +5254,10 @@ class KalshiBattleBot:
                     'side': side,
                     'contracts': contracts,
                     'entry_price': round(entry_price, 4),
-                    'current_price': round(current_price, 4),
+                    'current_price': round(current_price_mid, 4),   # mid shown in table
+                    'current_price_bid': round(current_price_bid, 4),
                     'cost': round(cost, 2),
-                    'value': round(value, 2),
+                    'value': round(value, 2),  # bid-based
                     'unrealized_pnl': round(unrealized, 2),
                     'unrealized_pct': round(unrealized_pct, 1),
                     'entry_time': entry_time,
@@ -5393,8 +5409,12 @@ class KalshiBattleBot:
                     continue
 
                 cached_market = self._markets.get(ticker, {})
-                yes_price = cached_market.get('yes_price')
-                no_price  = cached_market.get('no_price')
+                yes_price = cached_market.get('yes_price')      # mid-price
+                no_price  = cached_market.get('no_price')       # mid-price
+                # Bid prices = actual exit/liquidation value.  Consistent with Kalshi's
+                # portfolio_value (bid-based), so positions page P&L matches portfolio today.
+                yes_bid_price = cached_market.get('yes_bid_price')
+                no_bid_price  = cached_market.get('no_bid_price')
 
                 # Fallback: derive price from Kalshi's market_exposure — never default to 0.50
                 if yes_price is None and kpos:
@@ -5406,12 +5426,20 @@ class KalshiBattleBot:
                     yes_price = entry_price_internal or 0.5
                 if no_price is None:
                     no_price = 1 - yes_price
+                # Bid fallback: subtract half the spread (or 1¢ if spread unknown)
+                _spread = cached_market.get('spread', 0.02)
+                if yes_bid_price is None:
+                    yes_bid_price = yes_price - _spread / 2
+                if no_bid_price is None:
+                    no_bid_price = no_price - _spread / 2
 
-                current_price = yes_price if side == 'yes' else no_price
-                entry_price = entry_price_internal if entry_price_internal is not None else current_price
+                # Use bid price for valuation (matches Kalshi's portfolio_value MtM)
+                current_price_mid = yes_price if side == 'yes' else no_price
+                current_price_bid = yes_bid_price if side == 'yes' else no_bid_price
+                entry_price = entry_price_internal if entry_price_internal is not None else current_price_mid
 
                 cost = contracts * entry_price
-                value = contracts * current_price
+                value = contracts * current_price_bid   # bid-based = true liquidation value
                 unrealized = value - cost
 
                 total_position_cost += cost
@@ -5423,9 +5451,11 @@ class KalshiBattleBot:
                     'side': side.upper(),
                     'contracts': contracts,
                     'entry_price': entry_price,
-                    'current_price': current_price,
+                    'current_price': current_price_mid,  # show mid in table (more intuitive)
+                    'current_price_bid': current_price_bid,  # bid = exit value
                     'cost': cost,
-                    'unrealized_pnl': unrealized,
+                    'value': value,  # bid-based value
+                    'unrealized_pnl': unrealized,  # bid-based so it matches portfolio today
                 })
 
             # 3. Canonical account value: cash + market value of positions (Kalshi API, ~5 min refresh).
@@ -5469,6 +5499,12 @@ class KalshiBattleBot:
             # which uses the same _kalshi_total-based value. Calling it here with potentially
             # cold-cache prices was corrupting start_of_day_value and today_pnl.
 
+            # 8b. Realized P&L today (closed/exited positions that settled today)
+            today_exits = [t for t in self._trades
+                           if t.get('action') == 'EXIT'
+                           and t.get('timestamp', '').startswith(today_str)]
+            realized_pnl_today = round(sum(t.get('pnl', 0) for t in today_exits), 2)
+
             # 9. Today's P&L from snapshot (set by sync loop)
             today_snapshot = self._daily_snapshots.get(today_str, {})
             start_of_day_value = today_snapshot.get('start_of_day_value')
@@ -5498,7 +5534,11 @@ class KalshiBattleBot:
                     'today_pnl': today_pnl,                       # total_value - start_of_day
                     'today_pnl_pct': today_pnl_pct,
                     'start_of_day_value': start_of_day_value,
-                    'unrealized_pnl': round(unrealized_pnl, 2),
+                    # P&L breakdown — explains why "Today" ≠ "Unrealized on open bets"
+                    # today_pnl = unrealized_pnl (open bets, bid-based) + realized_pnl_today
+                    # (closed bets today) + any Kalshi mark-to-market lag.
+                    'unrealized_pnl': round(unrealized_pnl, 2),  # open bets at bid price
+                    'realized_pnl_today': realized_pnl_today,     # closed/exited bets today
                     # Intraday high/low for "was up, gave it back" analysis
                     'intraday_high': today_snapshot.get('intraday_high'),
                     'intraday_high_time': today_snapshot.get('intraday_high_time'),
@@ -6365,14 +6405,30 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 document.getElementById('returnPct').className = 'card-value ' + (returnPctVal >= 0 ? 'green' : 'red');
                 
                 // Today's change = account value now - start of day (from Kalshi)
-                const todayPn = p.performance.today_pnl;
+                const todayPn  = p.performance.today_pnl;
                 const todayPct = p.performance.today_pnl_pct;
-                const todayEl = document.getElementById('todayPnl');
+                const unrealPn = p.performance.unrealized_pnl;
+                const realPn   = p.performance.realized_pnl_today;
+                const todayEl    = document.getElementById('todayPnl');
                 const todaySubEl = document.getElementById('todayPnlSub');
                 if (todayPn != null && todayPct != null) {
                     todayEl.textContent = (todayPn >= 0 ? '+' : '') + '$' + todayPn.toFixed(2);
                     todayEl.className = 'card-value ' + (todayPn >= 0 ? 'green' : 'red');
-                    todaySubEl.textContent = (todayPct >= 0 ? '+' : '') + todayPct.toFixed(1) + '% vs start of day';
+                    // Sub-line shows breakdown so user can see why today ≠ positions P&L
+                    let breakdownParts = [];
+                    if (unrealPn != null) {
+                        const uSign = unrealPn >= 0 ? '+' : '';
+                        breakdownParts.push(`open: ${uSign}$${unrealPn.toFixed(2)}`);
+                    }
+                    if (realPn != null && realPn !== 0) {
+                        const rSign = realPn >= 0 ? '+' : '';
+                        breakdownParts.push(`closed: ${rSign}$${realPn.toFixed(2)}`);
+                    }
+                    const pctStr = (todayPct >= 0 ? '+' : '') + todayPct.toFixed(1) + '%';
+                    todaySubEl.textContent = breakdownParts.length
+                        ? pctStr + ' · ' + breakdownParts.join(' · ')
+                        : pctStr + ' vs start of day';
+                    todaySubEl.className = 'card-sub';
                 } else {
                     todayEl.textContent = '—';
                     todayEl.className = 'card-value';
@@ -6380,7 +6436,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 }
                 
                 document.getElementById('positionStatus').textContent = p.positions.winning + ' winning / ' + p.positions.losing + ' losing';
-                document.getElementById('positionStatusSub').textContent = 'vs entry price';
+                document.getElementById('positionStatusSub').textContent = 'at bid (exit) price';
                 // Keep Settlements tab deposit label in sync
                 const sdl = document.getElementById('settlDepositsLabel');
                 if (sdl) sdl.textContent = '$' + (p.account.total_deposits || 150);
