@@ -3465,6 +3465,7 @@ class KalshiBattleBot:
             'info_quality': signal.information_quality,
             'latency_ms': result.latency_ms,
             'calibration_method': calibration_method,
+            'model': ('haiku' if not (_is_econ_market or bool(_commodity_price_ctx)) and not _is_crypto_range_q else 'sonnet'),
         }
         
         # Add intelligence data if available
@@ -3489,7 +3490,7 @@ class KalshiBattleBot:
             'side': side,
             'market_price': current_price,
             'ai_probability': signal.raw_prob,
-            'close_time': market.get('close_time'),
+            'close_time': market.get('end_date') or market.get('close_time'),
             'timestamp': datetime.utcnow().isoformat(),
             'outcome': None,  # To be filled when market settles
             'outcome_checked': False,
@@ -3578,7 +3579,7 @@ class KalshiBattleBot:
         # YES on "above 2.6%" — that is betting directly against every published forecast.
         # Professional traders price these markets using Bloomberg consensus; Claude's
         # priors about inflation/growth are unreliable against hard published forecasts.
-        if not _is_crypto_range_q and intel and intel.news_items:
+        if _is_econ_market and not _is_crypto_range_q and intel and intel.news_items:
             _econ_block, _econ_reason = self._extract_economic_consensus(
                 market.get('question', ''), intel.news_items, side
             )
@@ -3624,7 +3625,7 @@ class KalshiBattleBot:
         # data the market is the only reliable forward-looking signal we have.
         if _is_econ_market and not _is_crypto_range_q:
             _is_fwd_econ, _fwd_econ_tag = self._check_temporal_data_availability(
-                market.get('question', ''), market.get('close_time')
+                market.get('question', ''), market.get('end_date') or market.get('close_time')
             )
             if _is_fwd_econ:
                 _fwd_our_side_mkt = current_price if side == 'YES' else (1.0 - current_price)
