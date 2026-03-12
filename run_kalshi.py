@@ -2988,8 +2988,14 @@ class KalshiBattleBot:
                     else:
                         _quant_override_prob = _quant_result.quant_prob
                 else:
-                    # evaluate_range_market returned None (NASDAQ or unparseable) — fall through to normal flow
-                    pass
+                    # evaluate_range_market returned None — either NASDAQ (different model) or
+                    # a single-threshold ticker like KXBTC-26MAR1217-B68750 (no T bound to parse).
+                    # For BTC/ETH: these are not range buckets so inversion doesn't apply.
+                    # Block them rather than wasting Brave+Claude on unparseable markets.
+                    if _is_btc_eth_range:
+                        self._log_filter(market_id, market.get('question', ''), 'BTC_ETH_QUANT_UNPARSEABLE', current_price)
+                        print(f"[QuantEdge] BLOCK {market_id[:30]} — BTC/ETH quant returned None (single-threshold, not range bucket)")
+                        return
             except Exception as _qe:
                 print(f"[QuantEdge] Evaluation error (non-fatal): {_qe}")
                 _quant_result = None
@@ -5293,45 +5299,54 @@ class KalshiBattleBot:
                 return web.json_response({'error': 'syncing', 'message': 'Waiting for initial Kalshi sync...'})
 
             cash = self._kalshi_cash
-            kalshi_positions = self._kalshi_positions_raw
 
-            # 2. Per-position detail (for breakdown table and unrealized P&L column).
-            # Uses cached prices with market_exposure/contracts as fallback — no 0.50 guesses.
+            # 2. Per-position detail — union of internal _positions and _kalshi_positions_raw
+            # so the count is never 0 after restart (positions restored from state file before
+            # Kalshi API sync repopulates _kalshi_positions_raw).
+            kalshi_by_ticker = {p.get('ticker', ''): p for p in self._kalshi_positions_raw if p.get('position', 0) != 0}
+            internal_by_ticker = {p.get('market_id', ''): p for p in self._positions.values() if p.get('market_id')}
+            all_tickers = set(internal_by_ticker) | set(kalshi_by_ticker)
+
             total_position_cost = 0
             total_position_value = 0
             positions_detail = []
 
-            for pos in kalshi_positions:
-                contracts = pos.get('position', 0)
-                if contracts == 0:
-                    continue
+            for ticker in all_tickers:
+                internal = internal_by_ticker.get(ticker, {})
+                kpos     = kalshi_by_ticker.get(ticker, {})
 
-                ticker = pos.get('ticker', '')
-                side = 'yes' if contracts > 0 else 'no'
-                contracts = abs(contracts)
+                if internal:
+                    side      = internal.get('side', 'YES').lower()
+                    contracts = internal.get('contracts', 0)
+                    entry_price_internal = internal.get('entry_price', None)
+                    question  = internal.get('question', ticker)[:50]
+                elif kpos:
+                    raw_c = kpos.get('position', 0)
+                    side  = 'yes' if raw_c > 0 else 'no'
+                    contracts = abs(raw_c)
+                    entry_price_internal = None
+                    cached_market = self._markets.get(ticker, {})
+                    question = cached_market.get('question', ticker)[:50]
+                else:
+                    continue
 
                 cached_market = self._markets.get(ticker, {})
                 yes_price = cached_market.get('yes_price')
-                no_price = cached_market.get('no_price')
+                no_price  = cached_market.get('no_price')
 
-                # Fallback: derive price from Kalshi's market_exposure (≈ current market value)
-                # Never default to 0.50 — that corrupts account_value when cache is cold.
+                # Fallback: derive price from Kalshi's market_exposure — never default to 0.50
+                if yes_price is None and kpos:
+                    _exp = abs(kpos.get('market_exposure', 0)) / 100
+                    _c   = abs(kpos.get('position', contracts))
+                    if _exp > 0 and _c > 0:
+                        yes_price = _exp / _c if side == 'yes' else 1 - _exp / _c
                 if yes_price is None:
-                    _exp = abs(pos.get('market_exposure', 0)) / 100
-                    yes_price = (_exp / contracts) if side == 'yes' and contracts > 0 else (1 - _exp / contracts if contracts > 0 else 0.5)
+                    yes_price = entry_price_internal or 0.5
                 if no_price is None:
                     no_price = 1 - yes_price
 
                 current_price = yes_price if side == 'yes' else no_price
-                question = cached_market.get('question', ticker)[:50]
-
-                # Entry price from internal records
-                entry_price = current_price  # default to current (zero unrealized) when unknown
-                for p in self._positions.values():
-                    if p.get('market_id') == ticker:
-                        entry_price = p.get('entry_price', current_price)
-                        question = p.get('question', question)[:50]
-                        break
+                entry_price = entry_price_internal if entry_price_internal is not None else current_price
 
                 cost = contracts * entry_price
                 value = contracts * current_price
