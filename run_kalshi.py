@@ -2751,13 +2751,26 @@ class KalshiBattleBot:
         threshold = float(m.group(2))
         bet_above = direction in ('above', 'over', 'higher than', 'exceed', 'at least')
 
-        # Collect all percentage numbers from news snippets
+        # Collect percentage numbers from news snippets.
+        # Critically: filter to the SAME order-of-magnitude as the threshold to avoid
+        # YoY percentages (2.4%, 2.5%) polluting the median for MoM markets (0.7%).
+        # Example failure: "Will CPI rise more than 0.7%?" threshold=0.7 (MoM).
+        # News contains "2.4% YoY", "0.6% MoM forecast", "2.5% core".  Unfiltered
+        # median lands at 2.4%, above 0.7%, so the guard thinks YES is correct — but
+        # the actual forward-looking MoM consensus is 0.6% which is BELOW 0.7%.
+        # Fix: for small thresholds (<2%), only count small percentages (<2%).
+        _small_threshold = threshold < 2.0
         forecast_numbers = []
         for item in (news_items or []):
             text = f"{getattr(item, 'title', '')} {getattr(item, 'snippet', '')}"
-            nums = [float(n) for n in self._PCT_RE.findall(text)
-                    if 0.0 < float(n) < 20.0]  # plausible econ data range
-            forecast_numbers.extend(nums)
+            for n_str in self._PCT_RE.findall(text):
+                n = float(n_str)
+                if _small_threshold:
+                    if 0.0 < n < 2.0:   # MoM / low-threshold range only
+                        forecast_numbers.append(n)
+                else:
+                    if 0.0 < n < 20.0:  # normal YoY / rate range
+                        forecast_numbers.append(n)
 
         if not forecast_numbers:
             return False, ''
