@@ -5088,44 +5088,46 @@ class KalshiBattleBot:
         return web.json_response({'ok': True, 'message': f'Kill switch cleared — drawdown re-baselined from ${live:.2f}.'})
 
     async def _handle_positions(self, request):
-        """Dedicated positions endpoint — full question text, all positions, live P&L."""
+        """Dedicated positions endpoint — full question text, all positions, live P&L.
+        Uses internal _positions dict as source of truth (always complete) and enriches
+        with live prices from _markets cache + _kalshi_positions_raw fallback."""
         try:
             if self._kalshi_cash is None or self._kalshi_total is None:
                 return web.json_response({'error': 'syncing', 'positions': []})
 
-            kalshi_positions = self._kalshi_positions_raw
+            # Build a quick ticker→kalshi_pos lookup for market_exposure fallback
+            kalshi_by_ticker = {p.get('ticker', ''): p for p in self._kalshi_positions_raw}
+
             positions_detail = []
 
-            for pos in kalshi_positions:
-                contracts = pos.get('position', 0)
-                if contracts == 0:
+            for pos in self._positions.values():
+                ticker = pos.get('market_id', '')
+                if not ticker:
                     continue
 
-                ticker = pos.get('ticker', '')
-                side = 'yes' if contracts > 0 else 'no'
-                contracts = abs(contracts)
+                side = pos.get('side', 'YES').upper()
+                contracts = pos.get('contracts', 0)
+                entry_price = pos.get('entry_price', 0.5)
+                question = pos.get('question', ticker)
+                entry_time = pos.get('entry_time')
 
+                # Current price: prefer live _markets cache, fall back to kalshi market_exposure
                 cached_market = self._markets.get(ticker, {})
                 yes_price = cached_market.get('yes_price')
                 no_price = cached_market.get('no_price')
 
                 if yes_price is None:
-                    _exp = abs(pos.get('market_exposure', 0)) / 100
-                    yes_price = (_exp / contracts) if side == 'yes' and contracts > 0 else (1 - _exp / contracts if contracts > 0 else 0.5)
+                    kpos = kalshi_by_ticker.get(ticker, {})
+                    _exp = abs(kpos.get('market_exposure', 0)) / 100
+                    _c = abs(kpos.get('position', contracts))
+                    if _exp > 0 and _c > 0:
+                        yes_price = _exp / _c if side == 'YES' else 1 - _exp / _c
+                    else:
+                        yes_price = entry_price  # no movement data yet — show flat
                 if no_price is None:
                     no_price = 1 - yes_price
 
-                current_price = yes_price if side == 'yes' else no_price
-                question = cached_market.get('question', ticker)  # full question, not truncated
-
-                entry_price = current_price
-                entry_time = None
-                for p in self._positions.values():
-                    if p.get('market_id') == ticker:
-                        entry_price = p.get('entry_price', current_price)
-                        question = p.get('question', question)
-                        entry_time = p.get('entry_time')
-                        break
+                current_price = yes_price if side == 'YES' else no_price
 
                 cost = contracts * entry_price
                 value = contracts * current_price
@@ -5135,7 +5137,7 @@ class KalshiBattleBot:
                 positions_detail.append({
                     'ticker': ticker,
                     'question': question,
-                    'side': side.upper(),
+                    'side': side,
                     'contracts': contracts,
                     'entry_price': round(entry_price, 4),
                     'current_price': round(current_price, 4),
@@ -6935,7 +6937,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 if (d.positions.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="11" class="pos-empty">No open positions</td></tr>';
                 } else {
-                    tbody.innerHTML = d.positions.map(p => {
+                    const rows = d.positions.map(p => {
                         const move = p.current_price - p.entry_price;
                         const moveClass = pnlClass(move);
                         const moveTxt = (move >= 0 ? '+' : '') + Math.round(move * 100) + '¢';
@@ -6960,6 +6962,23 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                             <td><button class="exit-btn" onclick="forceExit('${p.ticker}', this)">Exit</button></td>
                         </tr>`;
                     }).join('');
+
+                    const totalCost  = d.summary.total_cost;
+                    const totalPnl   = d.summary.total_unrealized;
+                    const totalValue = d.positions.reduce((a, p) => a + p.value, 0);
+                    const totPnlTxt  = (totalPnl >= 0 ? '+$' : '-$') + Math.abs(totalPnl).toFixed(2);
+                    const totPnlPct  = totalCost > 0 ? ((totalPnl / totalCost) * 100).toFixed(1) : '0.0';
+                    const totClass   = pnlClass(totalPnl);
+                    const totalRow   = `<tr style="border-top:2px solid #30363d;font-weight:600;background:#161b22;">
+                        <td colspan="6" style="color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;">Total (${d.positions.length} positions)</td>
+                        <td>$${totalCost.toFixed(2)}</td>
+                        <td>$${totalValue.toFixed(2)}</td>
+                        <td class="${totClass}">${totPnlTxt}</td>
+                        <td class="${totClass}">${totPnlPct >= 0 ? '+' : ''}${totPnlPct}%</td>
+                        <td></td>
+                    </tr>`;
+
+                    tbody.innerHTML = rows + totalRow;
                 }
 
                 const ts = new Date(d.timestamp);
