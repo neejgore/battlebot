@@ -445,6 +445,8 @@ class KalshiWebSocketClient:
             logger.info(f"[WS Debug] ticker #{self._ticker_count} payload keys={list(payload.keys())} "
                         f"yes_bid={yes_bid} yes_ask={yes_ask} price={last_price}")
 
+        # Always notify callbacks — even null-price snapshots are valid WS receipts
+
         for cb in self._ticker_callbacks:
             try:
                 cb(ticker, yes_bid, yes_ask, last_price, volume, open_interest)

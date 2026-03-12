@@ -4321,6 +4321,10 @@ class KalshiBattleBot:
         trading loop and performance endpoint always see fresh prices
         without waiting for the 30-second REST poll.
         """
+        # Count every WS ticker receipt — Poll badge shows WS is alive even when
+        # markets have no active orderbook (null bid/ask is a valid WS message).
+        self._price_update_count += 1
+
         # Compute dollar prices from cent integers
         if yes_bid is not None and yes_ask is not None and yes_ask > yes_bid:
             yes_price = (yes_bid + yes_ask) / 2 / 100
@@ -4329,7 +4333,7 @@ class KalshiBattleBot:
             yes_price = last_price / 100
             spread = 0.02
         else:
-            return  # Nothing useful to update
+            return  # No price data — WS receipt counted above, nothing to cache
 
         no_price = round(1.0 - yes_price, 6)
 
@@ -4406,12 +4410,8 @@ class KalshiBattleBot:
 
                 ws_live = self._ws_client.is_connected
 
-                if ws_live:
-                    # WS is delivering live prices — skip per-market REST calls
-                    # to avoid wasting rate-limit budget.
-                    pass
-                else:
-                    # WS is down — fall back to REST polling for every market
+                if not ws_live:
+                    # WS is down — REST poll every market at full rate
                     for market_id in monitored_tickers:
                         try:
                             result = await self._kalshi.get_market(market_id)
