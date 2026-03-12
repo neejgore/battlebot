@@ -960,11 +960,14 @@ class KalshiBattleBot:
             # fires when our own _positions dict is also empty — i.e. genuinely nothing open.
             self._kalshi_positions_raw = kalshi_positions
             
-            # Step 3: Compute mark-to-market portfolio value from cached prices.
-            # _kalshi_portfolio = cost basis (sum of market_exposure) — "capital at risk"
-            # _kalshi_positions_mv = MtM = contracts × current price — used for all P&L
-            # We ignore balance.portfolio_value; empirical testing showed it tracks face
-            # value (max payout) not current bid, which overstates positions by ~2x.
+            # Step 3: Compute portfolio value from positions data.
+            # _kalshi_portfolio     = cost basis (sum of |market_exposure|) — capital at risk
+            # _kalshi_positions_mv  = Kalshi's own live MtM (balance.portfolio_value)
+            #                         This is exactly what Kalshi's UI shows as "Positions: $X"
+            #                         and matches their internal pricing — preferred over our
+            #                         cached prices which can lag by up to 20 min.
+            # Fallback to contracts × cached_price when portfolio_value is unavailable
+            # (e.g. a position was just filled and hasn't synced to balance yet).
             if _balance_ok and self._kalshi_cash is not None:
                 _portfolio_exposure_cents = sum(
                     abs(kp.get('market_exposure', 0))
@@ -973,15 +976,8 @@ class KalshiBattleBot:
                 )
                 self._kalshi_portfolio = _portfolio_exposure_cents / 100
 
-                # Compute mark-to-market value: contracts × current_bid/ask price.
-                # NOTE: we deliberately ignore Kalshi's balance.portfolio_value here.
-                # Testing showed it tracks something close to face value (max payout)
-                # rather than current market price — e.g. $582 when actual MtM is $284.
-                # Using it would double-count position value and corrupt all P&L metrics.
-                _market_value = 0.0
-
-                # Union: Kalshi positions + internal positions (handles cold-start where
-                # _kalshi_positions_raw is empty but _positions was restored from disk).
+                # Compute our own cached-price MtM as a fallback and for per-position P&L.
+                _cache_market_value = 0.0
                 _seen_tickers: set = set()
                 for kp in kalshi_positions:
                     _contracts = kp.get('position', 0)
@@ -996,9 +992,9 @@ class KalshiBattleBot:
                     if _price is None:
                         _exposure = abs(kp.get('market_exposure', 0)) / 100
                         _price = (_exposure / _contracts) if _contracts > 0 else 0.5
-                    _market_value += _contracts * _price
+                    _cache_market_value += _contracts * _price
 
-                # Add any internal positions not yet in the Kalshi sync (e.g. just filled)
+                # Include internal positions not yet in Kalshi sync (e.g. just filled)
                 for _ipos in self._positions.values():
                     _ticker = _ipos.get('market_id', '')
                     if not _ticker or _ticker in _seen_tickers:
@@ -1009,20 +1005,25 @@ class KalshiBattleBot:
                     _price = _cached.get('yes_price') if _side == 'yes' else _cached.get('no_price')
                     if _price is None:
                         _price = _ipos.get('current_price', _ipos.get('entry_price', 0.5))
-                    _market_value += _contracts * _price
+                    _cache_market_value += _contracts * _price
+
+                # Prefer Kalshi's live portfolio_value (matches their UI "Positions: $X").
+                # Fall back to our cached-price calculation only when it's unavailable.
+                _positions_mv = _kalshi_portfolio_value if _kalshi_portfolio_value is not None else _cache_market_value
+                _pv_source = 'kalshi_api' if _kalshi_portfolio_value is not None else 'cache_fallback'
 
                 # Single source of truth for ALL dashboard value displays:
-                #   _kalshi_positions_mv = MtM value (contracts × live price)
-                #   _kalshi_total        = cash + MtM  (all dashboard metrics derive from this)
-                self._kalshi_positions_mv = _market_value
+                #   _kalshi_positions_mv = live MtM (same as Kalshi UI "Positions")
+                #   _kalshi_total        = cash + MtM (every dashboard metric derives from this)
+                self._kalshi_positions_mv = _positions_mv
                 self._kalshi_total = self._kalshi_cash + self._kalshi_positions_mv
                 _account_for_snapshot = self._kalshi_total
                 print(f"[Sync] Kalshi: Cash=${self._kalshi_cash:.2f}, "
                       f"Positions(cost)=${self._kalshi_portfolio:.2f}, "
-                      f"Positions(MtM)=${self._kalshi_positions_mv:.2f}, "
-                      f"Kalshi_pv=${_kalshi_portfolio_value or 0:.2f} (ignored — not MtM), "
+                      f"Positions(MtM/{_pv_source})=${self._kalshi_positions_mv:.2f}, "
+                      f"CachedMtM=${_cache_market_value:.2f}, "
                       f"Total=${self._kalshi_total:.2f}")
-                await self._save_daily_snapshot(_account_for_snapshot, self._kalshi_cash, _market_value)
+                await self._save_daily_snapshot(_account_for_snapshot, self._kalshi_cash, _positions_mv)
 
                 # Sync the risk engine with current market value (not cost basis) so the
                 # kill-switch sees real unrealized losses, not just settled cash changes.
