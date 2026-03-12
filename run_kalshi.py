@@ -233,25 +233,7 @@ class KalshiBattleBot:
                         except Exception:
                             pass
                     self._recently_exited_reason = state.get('recently_exited_reason', {})
-                    # Restore kill switch if it fired today — prevents trading resuming after restart
-                    _ks_date = state.get('kill_switch_date', '')
-                    _today = datetime.utcnow().strftime('%Y-%m-%d')
-                    if state.get('kill_switch_triggered') and _ks_date == _today:
-                        self._risk_engine.daily_stats.kill_switch_triggered = True
-                        self._kill_switch_fire_date = _ks_date
-                        print(f"[State] Kill switch restored from state (triggered today {_ks_date})")
-                    # Restore analysis cooldowns to prevent burst re-analysis on restart
-                    for k, v in state.get('last_analysis', {}).items():
-                        try:
-                            self._last_analysis[k] = datetime.fromisoformat(v)
-                        except Exception:
-                            pass
-                    # Restore today's starting bankroll so kill-switch drawdown is measured
-                    # from the correct baseline.  Without this, if the bankroll has grown
-                    # (e.g. $100 → $120), starting_bankroll resets to the env-var $100 on
-                    # restart, and drawdown = (100-120)/100 = -20% → 0%, so the kill-switch
-                    # never fires until current_bankroll drops below $100 (i.e. a full 20%
-                    # real loss instead of 15%).
+                    # Restore today's starting bankroll and conditionally restore kill switch.
                     _today_snap = self._daily_snapshots.get(_today, {})
                     # If the kill switch was manually reset today, use the reset baseline
                     # (stored as _ks_reset_baseline) instead of the original start_of_day.
@@ -262,6 +244,28 @@ class KalshiBattleBot:
                         self._risk_engine.daily_stats.starting_bankroll = _today_start
                         _label = 'reset baseline' if _ks_reset_baseline else 'start_of_day'
                         print(f"[State] Restored today's starting bankroll ({_label}): ${_today_start:.2f}")
+                    # Restore kill switch ONLY if it fired today AND user has NOT manually reset it.
+                    # Without the reset-baseline guard, a bad Kalshi API reading re-triggers the
+                    # kill switch after a manual reset, saves triggered=True, and every subsequent
+                    # redeploy (e.g. from a code push) starts halted again.
+                    # Rule: if _ks_reset_baseline exists, the user overrode the kill switch today —
+                    # respect that across redeploys. The kill switch can still fire during the run
+                    # from genuine losses; it just won't auto-start the bot in a halted state.
+                    _ks_date = state.get('kill_switch_date', '')
+                    _today = datetime.utcnow().strftime('%Y-%m-%d')
+                    _user_reset_today = bool(_ks_reset_baseline)
+                    if state.get('kill_switch_triggered') and _ks_date == _today and not _user_reset_today:
+                        self._risk_engine.daily_stats.kill_switch_triggered = True
+                        self._kill_switch_fire_date = _ks_date
+                        print(f"[State] Kill switch restored from state (triggered today {_ks_date})")
+                    elif state.get('kill_switch_triggered') and _ks_date == _today and _user_reset_today:
+                        print(f"[State] Kill switch NOT restored — user manually reset today (baseline ${_ks_reset_baseline:.2f})")
+                    # Restore analysis cooldowns to prevent burst re-analysis on restart
+                    for k, v in state.get('last_analysis', {}).items():
+                        try:
+                            self._last_analysis[k] = datetime.fromisoformat(v)
+                        except Exception:
+                            pass
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades, {len(self._signal_log)} signals, {len(self._recently_exited)} exit cooldowns")
                     
                     # Clear ALL reconciled trades - they have corrupted P&L data
@@ -293,14 +297,18 @@ class KalshiBattleBot:
                     # Restore kill-switch state (same date-gate as primary path)
                     _ks_date_bak = state.get('kill_switch_date', '')
                     _today_bak = datetime.utcnow().strftime('%Y-%m-%d')
-                    if state.get('kill_switch_triggered') and _ks_date_bak == _today_bak:
-                        self._risk_engine.daily_stats.kill_switch_triggered = True
-                        print(f"[State] Kill-switch restored from backup (triggered today)")
                     _today_snap_bak = self._daily_snapshots.get(_today_bak, {})
-                    _today_start_bak = _today_snap_bak.get('start_of_day_value')
+                    _ks_reset_baseline_bak = _today_snap_bak.get('_ks_reset_baseline')
+                    _today_start_bak = _ks_reset_baseline_bak or _today_snap_bak.get('start_of_day_value')
                     if _today_start_bak and _today_start_bak > 0:
                         self._risk_engine.daily_stats.starting_bankroll = _today_start_bak
                         print(f"[State] Restored today's starting bankroll from backup: ${_today_start_bak:.2f}")
+                    _user_reset_today_bak = bool(_ks_reset_baseline_bak)
+                    if state.get('kill_switch_triggered') and _ks_date_bak == _today_bak and not _user_reset_today_bak:
+                        self._risk_engine.daily_stats.kill_switch_triggered = True
+                        print(f"[State] Kill-switch restored from backup (triggered today)")
+                    elif state.get('kill_switch_triggered') and _ks_date_bak == _today_bak and _user_reset_today_bak:
+                        print(f"[State] Kill-switch NOT restored from backup — user manually reset today")
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades from backup")
         except json.JSONDecodeError as e:
             print(f"[State] WARNING: Corrupted state file, starting fresh: {e}")
