@@ -1650,6 +1650,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/api/reset-killswitch', self._handle_reset_killswitch)
         self._app.router.add_get('/api/force-exit', self._handle_force_exit)
         self._app.router.add_get('/api/positions', self._handle_positions)
+        self._app.router.add_get('/api/debug-positions', self._handle_debug_positions)
         self._app.router.add_get('/healthz', self._handle_healthz)
         
         self._runner = web.AppRunner(self._app)
@@ -5289,6 +5290,27 @@ class KalshiBattleBot:
         self._save_state()
         print(f"[KILL SWITCH] Manually reset via /api/reset-killswitch — new baseline ${live:.2f}")
         return web.json_response({'ok': True, 'message': f'Kill switch cleared — drawdown re-baselined from ${live:.2f}.'})
+
+    async def _handle_debug_positions(self, request):
+        """Debug endpoint: directly calls Kalshi positions API and returns raw result."""
+        try:
+            result = await self._kalshi.get_positions()
+            raw_count = len(result.get('market_positions') or [])
+            event_count = len(result.get('event_positions') or [])
+            # Sample first few of each for inspection
+            mp_sample = (result.get('market_positions') or [])[:5]
+            ep_sample = (result.get('event_positions') or [])[:5]
+            return web.json_response({
+                'keys': list(result.keys()) if isinstance(result, dict) else [],
+                'market_positions_count': raw_count,
+                'event_positions_count': event_count,
+                'market_positions_sample': mp_sample,
+                'event_positions_sample': ep_sample,
+                'cached_raw_count': len(self._kalshi_positions_raw),
+                'internal_positions': len(self._positions),
+            })
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=500)
 
     async def _handle_positions(self, request):
         """Dedicated positions endpoint — full question text, all positions, live P&L.
