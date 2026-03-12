@@ -970,13 +970,20 @@ class KalshiBattleBot:
 
             # Step 2: Fetch open positions from Kalshi.
             result = await self._kalshi.get_positions()
-            print(f"[Sync] get_positions raw keys: {list(result.keys()) if isinstance(result, dict) else type(result)}")
-            print(f"[Sync] market_positions count: {len(result.get('market_positions', []))}, positions count: {len(result.get('positions', []))}")
-            if isinstance(result, dict):
-                for k, v in result.items():
-                    if isinstance(v, list) and len(v) > 0:
-                        print(f"[Sync] field '{k}' has {len(v)} items, sample keys: {list(v[0].keys()) if isinstance(v[0], dict) else v[0]}")
-            kalshi_positions = result.get('market_positions', []) or result.get('positions', [])
+            # Log the raw API response keys so we can diagnose field-name changes
+            _raw_keys = list(result.keys()) if isinstance(result, dict) else []
+            print(f"[Sync] get_positions raw keys: {_raw_keys}")
+            for k in _raw_keys:
+                v = result[k]
+                if isinstance(v, list):
+                    print(f"[Sync]   '{k}': list of {len(v)} items" + (f", sample keys: {list(v[0].keys())}" if v and isinstance(v[0], dict) else ''))
+                elif v is not None:
+                    print(f"[Sync]   '{k}': {str(v)[:80]}")
+            # Store raw result for dashboard debug
+            self._debug_positions_result = {k: (len(v) if isinstance(v, list) else str(v)[:50]) for k, v in result.items()} if isinstance(result, dict) else str(result)[:200]
+            # Try all known field names Kalshi has used
+            kalshi_positions = (result.get('market_positions') or result.get('positions') or
+                                result.get('portfolio_positions') or result.get('data') or [])
             # Cache for performance endpoint so it doesn't need its own live API calls.
             # Always update (including to []) so the performance tab doesn't show stale
             # positions after they all close. The "no positions" early-return below only
@@ -1572,6 +1579,7 @@ class KalshiBattleBot:
             'total_pnl': realized_pnl + unrealized_pnl,
             'return_pct': return_pct,
             'kalshi_synced': self._kalshi_cash is not None,  # Shows if using real Kalshi data
+            'debug_positions_api': getattr(self, '_debug_positions_result', 'not_yet_synced'),
             # Today's performance
             'today_pnl': today_pnl,
             'today_wins': today_wins,
