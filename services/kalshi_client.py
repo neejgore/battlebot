@@ -527,12 +527,14 @@ def parse_kalshi_market(market: dict) -> dict:
         None
     )
     
-    # Volume - Kalshi reports in contracts
-    volume = market.get('volume', 0) or 0
-    volume_24h = market.get('volume_24h', volume) or volume
-    
+    # Volume - Kalshi API now uses _fp suffix for fractional-contract fields.
+    # Fall back to the older non-suffix field names for compatibility.
+    volume = float(market.get('volume_fp') or market.get('volume') or 0)
+    volume_24h = float(market.get('volume_24h_fp') or market.get('volume_24h') or volume)
+    open_interest = float(market.get('open_interest_fp') or market.get('open_interest') or 0)
+
     # Liquidity estimate from open interest
-    liquidity = market.get('open_interest', 0) * yes_price
+    liquidity = open_interest * yes_price
     
     # Build resolution rules from available fields
     # Kalshi uses different fields depending on market type
@@ -568,7 +570,7 @@ def parse_kalshi_market(market: dict) -> dict:
         'volume': volume,
         'volume_24h': volume_24h,
         'volume_display': f"${volume_24h:,.0f}" if volume_24h >= 1000 else f"${volume_24h:.0f}",
-        'open_interest': market.get('open_interest', 0) or 0,
+        'open_interest': open_interest,
         'end_date': end_date,
         'category': market.get('category', 'other'),
         'url': f"https://kalshi.com/markets/{market.get('ticker', '')}",
