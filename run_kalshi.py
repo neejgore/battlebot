@@ -1244,7 +1244,11 @@ class KalshiBattleBot:
                     # Add missing position
                     pos_id = f"pos_kalshi_{ticker[:20]}_{int(datetime.utcnow().timestamp())}"
                     cached_market = self._markets.get(ticker, {})
-                    question = kp.get('title', kp.get('market_title', cached_market.get('question', ticker)))
+                    question = (
+                        kp.get('title') or kp.get('market_title')
+                        or cached_market.get('question') or cached_market.get('title')
+                        or ticker
+                    )
                     
                     self._positions[pos_id] = {
                         'id': pos_id,
@@ -1279,6 +1283,15 @@ class KalshiBattleBot:
                             price_diff = abs(old_price - entry_price) > 0.005
                             size_diff = abs(old_size - actual_size) > 0.01
                             
+                            # Back-fill question if position was stored with empty text
+                            if not pos.get('question'):
+                                _bfq = (
+                                    kp.get('title') or kp.get('market_title')
+                                    or cached_market.get('question') or cached_market.get('title')
+                                )
+                                if _bfq:
+                                    pos['question'] = _bfq
+
                             if price_diff or size_diff:
                                 print(f"[Sync] Updating: {old_price*100:.0f}¢→{entry_price*100:.0f}¢, ${old_size:.2f}→${actual_size:.2f} | {pos.get('question', '')[:40]}...")
                                 pos['entry_price'] = entry_price
@@ -2322,8 +2335,10 @@ class KalshiBattleBot:
                         # Movies / TV / streaming
                         'rotten tomatoes', 'box office', 'opening weekend', 'domestic gross',
                         'metacritic', 'imdb', 'certified fresh', 'audience score',
-                        'streaming', 'netflix', 'hulu', 'disney+', 'max series',
-                        'episode', 'season finale', 'series finale', 'pilot episode',
+                        'streaming service', 'streaming platform', 'streaming subscriber',
+                        'netflix', 'hulu', 'disney+', 'max series', 'peacock',
+                        'season finale', 'series finale', 'pilot episode',
+                        'tv show', 'tv series', 'movie rating', 'film rating',
                         # Awards ceremonies
                         'oscar', 'academy award', 'golden globe', 'emmy award', 'grammy',
                         'bafta', 'sag award', 'tony award', 'peoples choice', 'mtv award',
@@ -3398,7 +3413,7 @@ class KalshiBattleBot:
                     print(f"[AI] FAILED: {error_msg}")
                     self._analyses.insert(0, {
                         'market_id': market_id,
-                        'question': market.get('question', ''),
+                        'question': market.get('question') or market.get('title', ''),
                         'market_price': current_price,
                         'ai_probability': None,
                         'confidence': None,
@@ -3565,7 +3580,7 @@ class KalshiBattleBot:
         # Store analysis with intelligence data
         analysis_record = {
             'market_id': market_id,
-            'question': market.get('question', ''),
+            'question': market.get('question') or market.get('title', ''),
             'market_price': current_price,
             'ai_probability': signal.raw_prob,
             'calibrated_probability': calibrated_prob,
@@ -4070,7 +4085,7 @@ class KalshiBattleBot:
             'id': pos_id,
             'order_id': order_id,
             'market_id': market_id,
-            'question': market.get('question', ''),
+            'question': market.get('question') or market.get('title', ''),
             'side': side,
             'size': size,
             'entry_price': entry_price,
@@ -4124,7 +4139,7 @@ class KalshiBattleBot:
             trade = {
                 'id': pos_id,
                 'market_id': market_id,
-                'question': market.get('question', ''),
+                'question': market.get('question') or market.get('title', ''),
                 'action': 'ENTRY',
                 'side': side,
                 'price': entry_price,
@@ -4157,7 +4172,7 @@ class KalshiBattleBot:
             trade = {
                 'id': pos_id,
                 'market_id': market_id,
-                'question': market.get('question', ''),
+                'question': market.get('question') or market.get('title', ''),
                 'action': 'ORDER_PLACED',
                 'side': side,
                 'price': entry_price,
@@ -4255,6 +4270,9 @@ class KalshiBattleBot:
                                 market = parse_kalshi_market(raw['market'])
                                 # Cache it so the next loop cycle is free
                                 self._markets[pos['market_id']] = market
+                                # Back-fill question if position was stored with empty text
+                                if not pos.get('question'):
+                                    pos['question'] = market.get('question', '')
                                 print(f"[Monitor] Fetched untracked market for {pos_id[:8]}: {pos.get('question','')[:45]}")
                         except Exception as _fetch_err:
                             print(f"[Monitor] Failed to fetch market for {pos_id[:8]} ({pos.get('market_id','')[:25]}): {_fetch_err}")
@@ -6823,10 +6841,12 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         
         function renderPositions(positions) {
             document.getElementById('positionCount').textContent = positions.length;
-            const html = positions.map(p => `
+            const html = positions.map(p => {
+                const displayQ = p.question || p.market_id || '—';
+                return `
                 <div class="position">
                     <div class="position-header">
-                        <div class="position-title">${esc(p.question)}</div>
+                        <div class="position-title">${esc(displayQ)}</div>
                         <span class="position-side ${p.side.toLowerCase()}">${p.side}</span>
                     </div>
                     <div class="position-details">
@@ -6836,7 +6856,8 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                         <div><div class="position-detail-label">P&L</div><div class="position-detail-value ${p.unrealized_pnl >= 0 ? 'green' : 'red'}">${p.unrealized_pnl >= 0 ? '+' : ''}$${p.unrealized_pnl.toFixed(2)}</div></div>
                     </div>
                 </div>
-            `).join('');
+            `;
+            }).join('');
             document.getElementById('positions').innerHTML = html || '<div style="color:#8b949e;font-size:13px;padding:12px;">No open positions</div>';
         }
         
@@ -7429,9 +7450,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                         const pnlPct  = (p.unrealized_pct >= 0 ? '+' : '') + p.unrealized_pct.toFixed(1) + '%';
                         const tickerShort = p.ticker.length > 22 ? p.ticker.slice(0, 22) + '…' : p.ticker;
                         const entryDate = p.entry_time ? new Date(p.entry_time).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '—';
+                        // Always show something in the question cell — fall back to ticker if empty
+                        const displayQuestion = p.question || p.ticker;
                         return `<tr>
                             <td class="pos-question">
-                                <div>${p.question}</div>
+                                <div>${displayQuestion}</div>
                                 <div class="pos-ticker">${tickerShort} · entered ${entryDate}</div>
                             </td>
                             <td><span class="side-badge ${p.side}">${p.side}</span></td>
