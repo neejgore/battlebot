@@ -90,7 +90,7 @@ class NewsService:
     
     def __init__(self):
         self._cache: dict[str, tuple[datetime, list[NewsItem]]] = {}
-        self._cache_ttl = timedelta(minutes=30)  # 30 min cache - balance freshness vs API costs
+        self._cache_ttl = timedelta(minutes=60)  # 60 min cache — reduces repeat Brave calls
         self._brave_api_key = os.getenv('BRAVE_API_KEY')
         self._brave_searches = 0  # Track usage
         self._brave_rate_limited_until: datetime | None = None  # 429 backoff expiry
@@ -508,6 +508,20 @@ class NewsService:
         
         return news_items
     
+    # Patterns that will never produce useful news — skip Brave and return empty.
+    # These burn API quota with zero signal value.
+    _NO_NEWS_PATTERNS = (
+        'will trump say',
+        'will trump use the word',
+        'will trump use the phrase',
+        'trump say the word',
+        'trump mention',
+        'trump nickname',
+        'trump tweet',
+        'will trump post',
+        'number of times trump',
+    )
+
     async def fetch_news(
         self,
         question: str,
@@ -519,6 +533,13 @@ class NewsService:
         Uses Brave Search API (primary) with Google News RSS fallback.
         Results are cached for 60 minutes to minimize API usage.
         """
+        # Skip Brave for question types that never have news coverage.
+        # Saves API quota for questions where news actually adds signal.
+        q_lower = question.lower()
+        if any(pat in q_lower for pat in self._NO_NEWS_PATTERNS):
+            logger.debug(f"[News] Skipping Brave for no-news pattern: {question[:50]}")
+            return []
+
         # Check cache
         cache_key = f"{question[:50]}:{category}"
         if cache_key in self._cache:

@@ -3185,6 +3185,12 @@ class KalshiBattleBot:
         re.IGNORECASE,
     )
 
+    # Cache for live commodity/economic data: keyed by matched_asset keyword.
+    # All CPI market variants (T3.1, T3.2, T2.9...) share one Brave call.
+    # TTL: 10 minutes — fresh enough for intraday analysis without per-market calls.
+    _live_data_cache: dict = {}
+    _live_data_cache_ttl: float = 600.0  # seconds
+
     async def _fetch_live_data_context(self, question_full: str) -> str | None:
         """Fetch a targeted Brave search for the current value of any real-world
         asset price or economic indicator referenced in a threshold market question,
@@ -3202,6 +3208,11 @@ class KalshiBattleBot:
                 break
         if not search_query:
             return None
+        # Check per-keyword cache — all CPI/gas/etc. markets share one Brave call per TTL.
+        _now_ts = time.time()
+        _cached = self._live_data_cache.get(matched_asset)
+        if _cached and (_now_ts - _cached['ts']) < self._live_data_cache_ttl:
+            return _cached['ctx']
         try:
             items = await self._intelligence.news_service._fetch_brave(search_query, max_results=3)
             if not items:
@@ -3215,6 +3226,7 @@ class KalshiBattleBot:
                 f"NOT your training-data value which may be months or years out of date):\n{snippets}"
             )
             print(f"[LiveData] Fetched live context for '{matched_asset}': {len(items)} results")
+            self._live_data_cache[matched_asset] = {'ts': _now_ts, 'ctx': ctx}
             return ctx
         except Exception as e:
             print(f"[LiveData] Context fetch failed (non-fatal): {e}")
