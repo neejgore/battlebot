@@ -228,6 +228,36 @@ class CryptoEdgeService:
             return lo, hi
         return None
 
+    def parse_threshold_from_ticker(self, ticker: str) -> Optional[tuple[str, float]]:
+        """Extract (direction, threshold) from Kalshi threshold market tickers.
+
+        Kalshi switched from range markets (BxTy) to threshold markets:
+          KXBTC-26MAR1301-B78875     → ('below', 78875.0)   YES = P(BTC < 78875)
+          KXBTC-26MAR1301-T78999.99  → ('above', 78999.99)  YES = P(BTC > 78999.99)
+
+        Returns None if not a threshold market (keeps range market path unaffected).
+        """
+        up = ticker.upper()
+        # Must NOT have both B and T in the price suffix (that's a range market)
+        # Threshold suffix is the LAST segment after the date part
+        parts = up.rsplit('-', 1)
+        if len(parts) != 2:
+            return None
+        suffix = parts[1]
+        # Below threshold: starts with B, no T following
+        if suffix.startswith('B') and 'T' not in suffix:
+            try:
+                return ('below', float(suffix[1:]))
+            except ValueError:
+                return None
+        # Above threshold: starts with T, no B following
+        if suffix.startswith('T') and 'B' not in suffix:
+            try:
+                return ('above', float(suffix[1:]))
+            except ValueError:
+                return None
+        return None
+
     def parse_range_from_question(self, question: str) -> Optional[tuple[float, float]]:
         """Extract (low, high) from text like 'between $95,000 and $96,000'."""
         nums_raw = re.findall(r"\$[\d,]+(?:\.\d+)?", question)
@@ -263,13 +293,47 @@ class CryptoEdgeService:
         return "BTC"  # safe default for unknown crypto range
 
     # ------------------------------------------------------------------
-    # Core math: log-normal range probability
+    # Core math: log-normal range + threshold probability
     # ------------------------------------------------------------------
 
     @staticmethod
     def _ncdf(x: float) -> float:
         """Standard normal CDF via math.erf (no scipy required)."""
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    def lognormal_threshold_prob(
+        self,
+        spot: float,
+        threshold: float,
+        direction: str,
+        vol: float,
+        hours_to_expiry: float,
+    ) -> float:
+        """P(S_T < threshold) or P(S_T > threshold) under log-normal model.
+
+        Black-Scholes digital formula:
+            d = [ln(K/S₀) - σ²T/2] / (σ√T)
+            P(S_T < K) = N(d)
+            P(S_T > K) = 1 - N(d)
+
+        Args:
+            spot: Current price
+            threshold: Strike price K
+            direction: 'below' or 'above'
+            vol: Annualized implied vol
+            hours_to_expiry: Time to resolution in hours
+        """
+        if hours_to_expiry <= 0 or vol <= 0 or spot <= 0 or threshold <= 0:
+            return 0.5
+        T = max(hours_to_expiry, 0.5) / 8760.0
+        sigma_sqrt_T = vol * math.sqrt(T)
+        drift = -0.5 * vol ** 2 * T  # risk-neutral log drift (Itô correction)
+        d = (math.log(threshold / spot) + drift) / sigma_sqrt_T
+        prob_below = self._ncdf(d)
+        if direction == 'below':
+            return max(0.0, min(1.0, prob_below))
+        else:
+            return max(0.0, min(1.0, 1.0 - prob_below))
 
     def lognormal_range_prob(
         self,
@@ -411,5 +475,81 @@ class CryptoEdgeService:
             kalshi_price=kalshi_price,
             edge=edge,
             context_summary=context_summary,
+            vol_source=vol_src,
+        )
+
+    async def evaluate_threshold_market(
+        self,
+        ticker: str,
+        question: str,
+        kalshi_price: float,
+        hours_to_expiry: float,
+    ) -> Optional['CryptoEdgeResult']:
+        """Evaluate a BTC/ETH threshold market using Black-Scholes digital formula.
+
+        Kalshi threshold markets (new format as of 2026):
+          KXBTC-26MAR1301-B78875    → YES = P(BTC < 78875)
+          KXBTC-26MAR1301-T78999.99 → YES = P(BTC > 78999.99)
+
+        Edge = model_prob - kalshi_yes_price. No AI involved.
+        """
+        asset = self.detect_asset(ticker, question)
+        if asset is None:
+            return None
+
+        parsed = self.parse_threshold_from_ticker(ticker)
+        if not parsed:
+            return None
+        direction, threshold = parsed
+
+        spot, vol_result = await asyncio.gather(
+            self.get_spot_price(asset),
+            self.get_implied_vol(asset),
+            return_exceptions=True,
+        )
+        if isinstance(spot, BaseException) or spot is None:
+            logger.warning(f"[CryptoEdge] Spot fetch failed for threshold market {ticker}")
+            return None
+        if isinstance(vol_result, BaseException):
+            vol_result = (self._VOL_DEFAULTS.get(asset, 0.80), 'historical_default')
+        vol, vol_src = vol_result
+
+        prob = self.lognormal_threshold_prob(spot, threshold, direction, vol, hours_to_expiry)
+        edge = prob - kalshi_price
+
+        dist_pct = (threshold - spot) / spot * 100
+        dist_label = f"{abs(dist_pct):.1f}% {'above' if threshold > spot else 'below'} spot"
+
+        lines = [
+            f"QUANTITATIVE THRESHOLD ANALYSIS ({asset}):",
+            f"  Current {asset} spot        : ${spot:,.2f}",
+            f"  Threshold                   : ${threshold:,.2f}  ({dist_label})",
+            f"  Market question             : Will {asset} be {'below' if direction == 'below' else 'above'} ${threshold:,.2f}?",
+            f"  Implied vol (annualized)    : {vol * 100:.0f}%  [{vol_src}]",
+            f"  Hours to expiry             : {hours_to_expiry:.1f}h",
+            f"  Log-normal P(YES)           : {prob:.1%}",
+            f"  Kalshi YES price            : {kalshi_price:.1%}",
+            f"  Quant edge                  : {edge:+.1%}",
+        ]
+        if edge >= 0.10:
+            lines.append("  Signal: STRONG QUANT EDGE — model probability exceeds market price.")
+        elif edge >= 0.05:
+            lines.append("  Signal: MODERATE QUANT EDGE.")
+        elif edge <= -0.10:
+            lines.append("  Signal: STRONG QUANT EDGE FOR NO SIDE.")
+        else:
+            lines.append("  Signal: NO SIGNIFICANT EDGE — model close to market price.")
+
+        return CryptoEdgeResult(
+            asset=asset,
+            spot_price=spot,
+            range_low=min(threshold, spot),
+            range_high=max(threshold, spot),
+            implied_vol=vol,
+            hours_to_expiry=hours_to_expiry,
+            quant_prob=prob,
+            kalshi_price=kalshi_price,
+            edge=edge,
+            context_summary="\n".join(lines),
             vol_source=vol_src,
         )

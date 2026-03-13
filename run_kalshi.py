@@ -3287,14 +3287,56 @@ class KalshiBattleBot:
                     else:
                         _quant_override_prob = _quant_result.quant_prob
                 else:
-                    # evaluate_range_market returned None — either NASDAQ (different model) or
-                    # a single-threshold ticker like KXBTC-26MAR1217-B68750 (no T bound to parse).
-                    # For BTC/ETH: these are not range buckets so inversion doesn't apply.
-                    # Block them rather than wasting Brave+Claude on unparseable markets.
+                    # evaluate_range_market returned None — Kalshi migrated from range markets
+                    # (BxTy) to threshold markets (B-only or T-only) in 2026.
+                    # Try the threshold model before blocking.
                     if _is_btc_eth_range:
-                        self._log_filter(market_id, market.get('question', ''), 'BTC_ETH_QUANT_UNPARSEABLE', current_price)
-                        print(f"[QuantEdge] BLOCK {market_id[:30]} — BTC/ETH quant returned None (single-threshold, not range bucket)")
-                        return
+                        try:
+                            _quant_result = await self._crypto_edge.evaluate_threshold_market(
+                                ticker=market_id,
+                                question=market.get('question', ''),
+                                kalshi_price=current_price,
+                                hours_to_expiry=float(hours_to_res),
+                            )
+                        except Exception as _te:
+                            print(f"[QuantEdge] Threshold eval error: {_te}")
+                            _quant_result = None
+
+                        if _quant_result:
+                            print(
+                                f"[QuantEdge] THRESHOLD {market_id[:35]} | "
+                                f"spot=${_quant_result.spot_price:,.0f} "
+                                f"iv={_quant_result.implied_vol*100:.0f}% "
+                                f"model={_quant_result.quant_prob:.1%} "
+                                f"kalshi={_quant_result.kalshi_price:.1%} "
+                                f"edge={_quant_result.edge:+.1%} "
+                                f"[{_quant_result.vol_source}]"
+                            )
+                            QUANT_MIN_EDGE = float(os.getenv('CRYPTO_QUANT_MIN_EDGE', str(self.min_edge)))
+                            if abs(_quant_result.edge) < QUANT_MIN_EDGE:
+                                # Edge too small — market is efficiently priced
+                                reason = f"QUANT_NO_EDGE_{_quant_result.edge*100:+.0f}pct"
+                                self._log_filter(market_id, market.get('question', ''), reason, current_price)
+                                return
+                            # For threshold markets: bet the side with positive edge directly.
+                            # If model > kalshi → YES has edge (quant_prob used as-is).
+                            # If model < kalshi → NO has edge (use 1 - quant_prob for NO side).
+                            # No inversion heuristic needed — the math IS the signal.
+                            if _quant_result.edge >= QUANT_MIN_EDGE:
+                                _quant_override_prob = _quant_result.quant_prob  # bet YES
+                            else:
+                                _quant_override_prob = 1.0 - _quant_result.quant_prob  # bet NO
+                            _invert_crypto_range = True  # still use the inversion fast-path
+                            print(
+                                f"[QuantEdge] THRESHOLD signal: "
+                                f"{'YES' if _quant_result.edge >= QUANT_MIN_EDGE else 'NO'} | "
+                                f"model={_quant_result.quant_prob:.1%} kalshi={_quant_result.kalshi_price:.1%} "
+                                f"edge={_quant_result.edge:+.1%}"
+                            )
+                        else:
+                            # Both range and threshold parsing failed — skip market
+                            self._log_filter(market_id, market.get('question', ''), 'BTC_ETH_QUANT_UNPARSEABLE', current_price)
+                            return
             except Exception as _qe:
                 print(f"[QuantEdge] Evaluation error (non-fatal): {_qe}")
                 _quant_result = None
