@@ -4048,7 +4048,33 @@ class KalshiBattleBot:
         """Enter a new position."""
         market_id = market['id']
         pos_id = f"pos_{int(datetime.utcnow().timestamp()*1000)}"
-        
+
+        # HARD BLOCK: Don't enter bets with < 24h to resolution.
+        # FILTER 6b already blocks < 12h, but 12–24h bets are dangerous:
+        # stop-loss dead zone (near_settlement kicks in at 12h) means a bad
+        # high-priced entry can bleed from entry to settlement with no exit.
+        _end_date_str = market.get('end_date', '')
+        if _end_date_str:
+            try:
+                _end_dt = datetime.fromisoformat(_end_date_str.replace('Z', '+00:00'))
+                _hours_left = (_end_dt - datetime.now(_end_dt.tzinfo)).total_seconds() / 3600
+                if _hours_left < 24:
+                    print(f"[Order] SKIPPED: {_hours_left:.1f}h to resolution — too close (min 24h). "
+                          f"Stop-loss dead zone for same-day bets is unacceptable.")
+                    return
+            except Exception:
+                pass
+
+        # SINGLE-POSITION SIZE CAP: no single bet may exceed MAX_SINGLE_POSITION_PCT
+        # of the total portfolio value. Default 15% — a $500 portfolio → $75 max per bet.
+        # The gold-bet blowup ($279 on a $541 account = 51%) is the canonical failure mode.
+        _max_pct = float(os.getenv('MAX_SINGLE_POSITION_PCT', '0.15'))
+        _portfolio = self._kalshi_total or self.initial_bankroll
+        _max_size = _portfolio * _max_pct
+        if size > _max_size:
+            print(f"[Order] Size ${size:.2f} → ${_max_size:.2f} (capped at {_max_pct*100:.0f}% of ${_portfolio:.0f} portfolio)")
+            size = _max_size
+
         # STRICT LIMITS - prevent runaway orders
         # Contract cap: floor at 200; effectively uncapped since Kelly dollar limit fires first.
         MAX_CONTRACTS_PER_ORDER = max(200, int(self.max_position_size / 0.10))
@@ -4434,14 +4460,32 @@ class KalshiBattleBot:
                     # Without a stop, losers go to 100% loss at settlement.
                     # Cutting at -50% halves the average loss and drops break-even
                     # win rate from 67% to ~50%, a dramatically better math profile.
-                    # Skip for positions within 24h of resolution — let them settle.
+                    #
+                    # near_settlement: MUST match the FILTER 6b entry floor (12h).
+                    # Using 24h caused a dead zone: bets entered at 12–24h to resolution
+                    # had stop-loss bypassed from the very first monitor cycle, meaning a
+                    # bad high-priced entry (e.g. 78¢ YES) could fall to 26¢ with NO exit.
                     stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '0.50'))
-                    near_settlement = days_to_res is not None and days_to_res <= 1.0
+                    near_settlement = days_to_res is not None and days_to_res <= 0.5
                     if (gain_pct <= -stop_loss_pct
                             and cost_basis > 0
                             and not near_settlement):
                         should_exit = True
                         exit_reason_mon = f"STOP_LOSS_{abs(gain_pct)*100:.0f}pct"
+
+                    # NEAR-SETTLEMENT EMERGENCY EXIT: Once a position is within the 12h
+                    # settlement window the standard stop-loss is bypassed (let it settle).
+                    # BUT if the *dollar* loss is large enough it is irrational to hold —
+                    # the remaining upside optionality is tiny vs the capital at risk.
+                    # Trigger: down ≥ STOP_LOSS_PCT AND unrealised loss ≥ threshold USD.
+                    _ns_emergency_usd = float(os.getenv('NEAR_SETTLE_EMERGENCY_LOSS_USD', '20'))
+                    if (not should_exit
+                            and near_settlement
+                            and gain_pct <= -stop_loss_pct
+                            and cost_basis > 0
+                            and abs(unrealized_pnl) >= _ns_emergency_usd):
+                        should_exit = True
+                        exit_reason_mon = f"NEAR_SETTLE_EMERGENCY_{abs(gain_pct)*100:.0f}pct"
 
                     # PROFIT-LOCK: Exit when position has gained significantly
                     # Logic: if we're up 50%+, the market has already priced in our view —
