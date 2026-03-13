@@ -4069,9 +4069,12 @@ class KalshiBattleBot:
             _is_range_question = any(x in _q_lower_range for x in
                                      ['bitcoin price range', 'ethereum price range', 'btc price range',
                                       'eth price range', 'solana price range', 'nasdaq price range'])
-            CRYPTO_RANGE_MAX = float(os.getenv('CRYPTO_RANGE_MAX_SIZE', '16.0'))
+            # Inversion bets: hard $10 cap — concept is theoretically sound (NO at 20-40¢
+            # beats YES at 60-80¢ on odds math) but has zero verified trades. Keep it small
+            # until there is real performance data. Overridable via CRYPTO_RANGE_MAX_SIZE.
+            CRYPTO_RANGE_MAX = float(os.getenv('CRYPTO_RANGE_MAX_SIZE', '10.0'))
             if (_is_range_market or _is_range_question) and position_size > CRYPTO_RANGE_MAX:
-                print(f"[Crypto Range Cap] ${position_size:.2f} → ${CRYPTO_RANGE_MAX:.2f} (range market size limit)")
+                print(f"[Crypto Range Cap] ${position_size:.2f} → ${CRYPTO_RANGE_MAX:.2f} (inversion strategy cap)")
                 position_size = CRYPTO_RANGE_MAX
 
             print(f"[Debug] Position size: ${position_size:.2f}")
