@@ -170,7 +170,11 @@ class KalshiBattleBot:
         self._btc_price_cache: dict = {'price': None, 'fetched_at': 0}
         self._monitor_log_times: dict[str, float] = {}  # pos_id -> last 70%-down log epoch
         # Profit-lock threshold — read once from env, not per-position per-cycle
-        self._profit_lock_pct: float = float(os.getenv('PROFIT_LOCK_PCT', '0.50'))
+        # Profit-lock: exit when gain exceeds this % of cost basis.
+        # Hard cap at 0.80 — prediction market prices are bounded [0,1].
+        # A 120% profit-lock (old Railway env var default) is unreachable for any
+        # entry above 45¢ and effectively disables profit protection. Cap at 80%.
+        self._profit_lock_pct: float = min(0.80, float(os.getenv('PROFIT_LOCK_PCT', '0.50')))
         
         # Kill-switch fire date: set once (False→True transition), never overwritten.
         # Persisted to state so a restart after midnight doesn't keep the switch active.
@@ -4107,6 +4111,26 @@ class KalshiBattleBot:
             _market_id_upper = market_id.upper()
             _RANGE_PREFIXES = ('KXBTC-', 'KXETH-', 'KXNASDAQ100-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXBCH-')
             _is_range_market = any(_market_id_upper.startswith(p) for p in _RANGE_PREFIXES)
+
+            # CORRELATION CAP: BTC and ETH positions are highly correlated — if BTC
+            # tanks, every BTC/ETH threshold bet moves against us simultaneously.
+            # Cap at 3 concurrent BTC/ETH positions regardless of size or edge.
+            # Without this, the quant model could open 20+ simultaneous $10 bets
+            # (=$200) on correlated assets.
+            _BTC_ETH_PREFIXES = ('KXBTC-', 'KXETH-')
+            _is_btc_eth = any(_market_id_upper.startswith(p) for p in _BTC_ETH_PREFIXES)
+            if _is_btc_eth:
+                _MAX_BTC_ETH_POSITIONS = int(os.getenv('MAX_BTC_ETH_POSITIONS', '3'))
+                _btc_eth_open = sum(
+                    1 for _p in self._positions.values()
+                    if any(_p.get('market_id', '').upper().startswith(px) for px in _BTC_ETH_PREFIXES)
+                )
+                if _btc_eth_open >= _MAX_BTC_ETH_POSITIONS:
+                    print(
+                        f"[Correlation Cap] SKIP {market_id[:35]} — already {_btc_eth_open} "
+                        f"BTC/ETH positions open (max {_MAX_BTC_ETH_POSITIONS})"
+                    )
+                    return
             _q_lower_range = market.get('question', '').lower()
             _is_range_question = any(x in _q_lower_range for x in
                                      ['bitcoin price range', 'ethereum price range', 'btc price range',
