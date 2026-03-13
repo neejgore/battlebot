@@ -2637,11 +2637,34 @@ class KalshiBattleBot:
                         self._log_filter(market_id, question_raw, 'NO_INTEL_PATTERN', market.get('price', 0))
                         continue  # Skip: no reliable news intelligence for this market
 
+                    # FILTER: Block commodity and financial price threshold markets.
+                    # "Will gold be above $X", "Will oil be above $Y", FX, equity indices —
+                    # these are INTRADAY PRICE PREDICTION. The AI has no quant model for these.
+                    # The gold blowup (KXGOLDW YES 78¢, -$184, stop-loss bypassed) is the
+                    # canonical example. These markets have zero AI edge.
+                    # NOTE: KXNASDAQ100- (weekly range bucket) is NOT blocked — it uses
+                    # the same quant range model as KXBTC- and is explicitly in scope.
+                    _ticker_upper = market_id.upper()
+                    _COMMODITY_PREFIXES = (
+                        'KXGOLD',   # Gold weekly/monthly price thresholds
+                        'KXOIL',    # Crude oil price thresholds
+                        'KXSILVER', # Silver
+                        'KXCOPPER', # Copper
+                        'KXGAS',    # Natural gas
+                        'KXSPD',    # S&P 500 intraday (not KXNASDAQ100-)
+                        'KXVIX',    # VIX level
+                        'KXEUR',    # EUR/USD FX
+                        'KXGBP',    # GBP/USD FX
+                        'KXJPY',    # JPY FX
+                    )
+                    if any(_ticker_upper.startswith(p) for p in _COMMODITY_PREFIXES):
+                        self._log_filter(market_id, question_raw, 'COMMODITY_PRICE_MARKET', market.get('price', 0))
+                        continue  # Financial price prediction — no AI edge
+
                     # FILTER: Block crypto EXACT-PRICE series — these have no edge (29% WR, -$67).
                     # Strategy: INVERTED BLOCKLIST — only block tickers we know are exact-price ladders.
                     # This means any NEW range/bucket series Kalshi adds is automatically eligible
                     # (it passes EXTREME_PRICE + VOLUME gates below, then Claude decides).
-                    _ticker_upper = market_id.upper()
                     _is_exact_price_series = any(_ticker_upper.startswith(p) for p in _CRYPTO_EXACT_SUFFIXES)
                     if _is_exact_price_series:
                         self._log_filter(market_id, question_raw, 'CRYPTO_EXACT_PRICE', market.get('price', 0))
@@ -3725,9 +3748,17 @@ class KalshiBattleBot:
         # Inverted BTC/ETH range bets use an empirical 80% win rate, not a model probability.
         # Their edge guard is the `edge < 0` check in the inversion block above — we don't
         # apply the standard 12% min_edge here because the formula measures different things.
-        if edge < self.min_edge and not _is_doge_market and not _invert_crypto_range:
+        #
+        # SCALED EDGE FLOOR for expensive bets (>55¢):
+        # At 75¢ entry you risk 75¢ to win 25¢ (3:1 against). A 12% edge at that price is
+        # marginal — calibration error easily erases it. Require 20%+ edge for any bet
+        # where the fill price exceeds 55¢. Inversion bets are exempt (empirical 80% WR).
+        _min_edge_required = self.min_edge
+        if trade_price > 0.55 and not _invert_crypto_range:
+            _min_edge_required = max(self.min_edge, 0.20)
+        if edge < _min_edge_required and not _is_doge_market and not _invert_crypto_range:
             should_trade = False
-            reasons.append('LOW_EDGE')
+            reasons.append('LOW_EDGE' if trade_price <= 0.55 else f'LOW_EDGE_EXPENSIVE_BET_{trade_price*100:.0f}c')
 
         # Confidence check — global minimum.
         # High-edge bypass: if edge is very strong (>= 2x min_edge), allow confidence

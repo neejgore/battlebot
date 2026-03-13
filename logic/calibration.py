@@ -46,10 +46,19 @@ class CalibrationEngine:
     PRIOR_BETA = 1.0   # Pseudo-count for failures
     
     # Shrinkage parameters
-    BASE_SHRINKAGE = 0.3  # Minimum weight to market price
-    CONFIDENCE_BOOST = 0.4  # Additional weight from confidence
-    SAMPLE_SIZE_BOOST = 0.3  # Additional weight from sample size
-    SAMPLE_SIZE_SCALE = 50  # Samples needed for full boost
+    # When sample_size < MIN_SAMPLES_FOR_CALIBRATION the calibration is running
+    # "passthrough" (returning raw_prob with no bias correction). In that regime
+    # we MUST lean heavily on the market price — it is the best available signal.
+    # BASE_SHRINKAGE is the floor weight given to our estimate; (1 - weight) goes
+    # to market price. At BASE_SHRINKAGE=0.3, a 0.80-confidence cold-start gives:
+    #   weight = 0.3 + 0.4*0.80 = 0.62 → only 38% market-price influence.
+    # That caused the gold blowup: Claude said 90%, market was 78%,
+    # adjusted landed at 85% — enough edge to bet, but totally wrong.
+    # FIX: cold-start (no data) maximum weight = 0.4, so market gets ≥60% influence.
+    BASE_SHRINKAGE = 0.3  # Minimum weight to our estimate (market gets 1-BASE at minimum)
+    CONFIDENCE_BOOST = 0.1  # Reduced from 0.4 — confidence is not calibrated yet
+    SAMPLE_SIZE_BOOST = 0.6  # Weight earned through empirical accuracy (was 0.3)
+    SAMPLE_SIZE_SCALE = 50   # Samples needed for full boost
     
     def __init__(self, db: Optional[TelemetryDB] = None):
         """Initialize the calibration engine.
