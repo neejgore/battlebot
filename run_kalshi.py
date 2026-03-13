@@ -201,7 +201,9 @@ class KalshiBattleBot:
         self._intelligence = get_intelligence_service()
         self._use_intelligence = os.getenv('USE_INTELLIGENCE', 'true').lower() == 'true'
         self._prefer_inefficient = os.getenv('PREFER_INEFFICIENT_MARKETS', 'true').lower() == 'true'
-        self._use_contrarian = os.getenv('USE_CONTRARIAN_TIMING', 'true').lower() == 'true'
+        # Contrarian timing: disabled by default — no empirical evidence it works (0% WR),
+        # and the edge-boost mechanism was forcing bad bets past the edge filter.
+        self._use_contrarian = os.getenv('USE_CONTRARIAN_TIMING', 'false').lower() == 'true'
         
         # Inefficiency threshold: prefer markets with score > this
         self._min_inefficiency_score = float(os.getenv('MIN_INEFFICIENCY_SCORE', '0.1'))
