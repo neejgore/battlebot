@@ -409,13 +409,15 @@ class AISignalGenerator:
             intelligence_section += "\nIMPORTANT: The above intelligence may contain information NOT yet priced into the market. Use it!\n"
         
         # Build overreaction section
+        # Keep framing neutral — large moves represent market consensus updating, not automatic
+        # contrarian opportunities. The system prompt already says: don't be contrarian by default.
         overreaction_section = ""
         if overreaction_info:
             overreaction_section = f"""
-=== MARKET DYNAMICS ALERT ===
+=== MARKET DYNAMICS NOTE ===
 {overreaction_info}
 
-CONSIDER: Large recent price moves often overshoot. If your analysis contradicts the move, this could be an opportunity.
+CAUTION: Large price moves usually reflect genuine new information. Do NOT assume it is an overreaction without specific evidence. Verify whether the move is justified before deviating from the updated market price.
 """
         
         # Build historical performance section (learning from past trades)

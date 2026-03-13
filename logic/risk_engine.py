@@ -284,6 +284,7 @@ class RiskEngine:
         confidence: float,
         market_id: str,
         custom_max_pos: Optional[float] = None,
+        market_mid: Optional[float] = None,
     ) -> float:
         """Calculate optimal position size for a trade.
         
@@ -296,11 +297,13 @@ class RiskEngine:
         
         Args:
             adjusted_prob: Calibrated and adjusted probability
-            market_price: Current market price
+            market_price: Fill price used for Kelly sizing (includes spread + slippage)
             edge: Calculated edge
             confidence: AI confidence score
             market_id: Market identifier
             custom_max_pos: Optional custom max position
+            market_mid: Raw market mid price (used for consensus deviation penalty).
+                        If omitted, falls back to market_price.
             
         Returns:
             Recommended position size in USDC
@@ -379,7 +382,12 @@ class RiskEngine:
             # High edge → large Kelly → largest positions → worst outcomes.
             # Fix: size DOWN as AI estimate diverges from market, not up.
             #
-            # Penalty curve (deviation = |adjusted_prob - market_price|):
+            # Use market_mid (raw mid price) not market_price (fill price) for the
+            # deviation — we want deviation from market consensus, not from fill cost.
+            # Fill price is ~4–7pp higher than mid due to spread/slippage, which would
+            # artificially understate the deviation and make the penalty too weak.
+            #
+            # Penalty curve (deviation = |adjusted_prob - market_mid|):
             #   0–5%:   1.00  (AI closely agrees with market — full size)
             #   10%:    0.70  (moderate disagreement — 30% haircut)
             #   15%:    0.55  (significant disagreement — 45% haircut)
@@ -388,7 +396,8 @@ class RiskEngine:
             #
             # This inverts the overconfidence failure mode without blocking bets
             # entirely — genuine edge still trades, just at a responsible size.
-            _deviation = abs(adjusted_prob - market_price)
+            _consensus_ref = market_mid if market_mid is not None else market_price
+            _deviation = abs(adjusted_prob - _consensus_ref)
             _consensus_penalty = max(0.25, 1.0 - _deviation * 3.0)
             size *= _consensus_penalty
 

@@ -3330,12 +3330,14 @@ class KalshiBattleBot:
         _is_econ_market = any(kw in _full_question.lower() for kw in self._ECON_DATA_KEYWORDS)
 
         # Build overreaction info string for AI
+        # NOTE: Neutral framing only — do NOT suggest contrarianism. The system prompt
+        # establishes market consensus as the prior; a large recent move IS market consensus.
         overreaction_info = None
         if intel and intel.overreaction_detected:
             overreaction_info = (
-                f"ALERT: Market moved {intel.overreaction_magnitude:.1%} {intel.overreaction_direction} recently. "
-                f"Price change 24h: {intel.recent_price_change:+.1%}. "
-                f"This could be an overreaction - consider if the move is justified."
+                f"NOTE: Market moved {intel.overreaction_magnitude:.1%} {intel.overreaction_direction} recently "
+                f"(24h price change: {intel.recent_price_change:+.1%}). "
+                f"This move likely reflects new information. Only deviate if you have concrete evidence the move is wrong."
             )
 
         # Step 2b: Get historical performance for learning
@@ -3997,13 +3999,18 @@ class KalshiBattleBot:
             self._risk_engine.sync_market_exposure(market_exposures)
 
             # Calculate position size (async with proper params)
-            print(f"[Debug] Calculating size: prob={trade_prob:.2f}, price={trade_price:.2f}, edge={edge:.2f}, conf={signal.confidence:.2f}")
+            # market_price = fill price (used for Kelly); market_mid = raw consensus price
+            # used only for the consensus deviation penalty (fill includes spread/slippage,
+            # which would understate how far the AI has deviated from market consensus).
+            _side_mid_price = current_price if side == 'YES' else (1.0 - current_price)
+            print(f"[Debug] Calculating size: prob={trade_prob:.2f}, fill={trade_price:.2f}, mid={_side_mid_price:.2f}, edge={edge:.2f}, conf={signal.confidence:.2f}")
             position_size = await self._risk_engine.calculate_position_size(
                 adjusted_prob=trade_prob,
                 market_price=trade_price,
                 edge=edge,
                 confidence=signal.confidence,
                 market_id=market_id,
+                market_mid=_side_mid_price,
             )
 
             # News-backed bets: only cap sizing on very low confidence (< 0.70) signals.
