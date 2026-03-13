@@ -57,8 +57,30 @@ class CryptoEdgeService:
             # pass result.context_summary to Claude
     """
 
-    DERIBIT_BASE = "https://www.deribit.com/api/v2/public"
-    BINANCE_BASE = "https://api.binance.com/api/v3"
+    DERIBIT_BASE   = "https://www.deribit.com/api/v2/public"
+    BINANCE_BASE   = "https://api.binance.com/api/v3"
+    COINBASE_BASE  = "https://api.coinbase.com/v2/prices"
+    KRAKEN_BASE    = "https://api.kraken.com/0/public"
+    COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+
+    # Kraken symbol map (Kraken uses different symbols)
+    _KRAKEN_SYMBOLS = {
+        'BTC': 'XBTUSD',
+        'ETH': 'ETHUSD',
+        'SOL': 'SOLUSD',
+        'DOGE': 'XDGUSD',
+        'XRP': 'XXRPZUSD',
+        'BCH': 'BCHUSD',
+    }
+    # CoinGecko ID map
+    _COINGECKO_IDS = {
+        'BTC': 'bitcoin',
+        'ETH': 'ethereum',
+        'SOL': 'solana',
+        'DOGE': 'dogecoin',
+        'XRP': 'ripple',
+        'BCH': 'bitcoin-cash',
+    }
 
     # Default annualized vol by asset when all APIs fail
     _VOL_DEFAULTS = {
@@ -92,26 +114,79 @@ class CryptoEdgeService:
     # ------------------------------------------------------------------
 
     async def get_spot_price(self, asset: str) -> Optional[float]:
-        """Fetch current spot price from Binance (30-second cache)."""
+        """Fetch current spot price — tries Binance, Coinbase, Kraken, CoinGecko in order.
+
+        Binance returns 451 (geo-blocked) on some hosting providers (e.g. Railway US).
+        Multiple fallbacks ensure the quant model always has a live price.
+        30-second cache shared across all sources.
+        """
         now = time.time()
         cached = self._price_cache.get(asset)
         if cached and now - cached[0] < 30:
             return cached[1]
 
-        symbol = f"{asset}USDT"
+        client = await self._get_client()
+
+        # 1. Binance (fastest, most liquid — may be geo-blocked)
         try:
-            client = await self._get_client()
             r = await client.get(
                 f"{self.BINANCE_BASE}/ticker/price",
-                params={"symbol": symbol},
+                params={"symbol": f"{asset}USDT"},
             )
             r.raise_for_status()
             price = float(r.json()["price"])
             self._price_cache[asset] = (now, price)
             return price
-        except Exception as exc:
-            logger.warning(f"[CryptoEdge] Binance price fetch failed for {asset}: {exc}")
-            return None
+        except Exception:
+            pass
+
+        # 2. Coinbase (widely available, no auth required)
+        try:
+            r = await client.get(f"{self.COINBASE_BASE}/{asset}-USD/spot")
+            r.raise_for_status()
+            price = float(r.json()["data"]["amount"])
+            self._price_cache[asset] = (now, price)
+            logger.debug(f"[CryptoEdge] Coinbase spot for {asset}: ${price:,.2f}")
+            return price
+        except Exception:
+            pass
+
+        # 3. Kraken
+        try:
+            kraken_sym = self._KRAKEN_SYMBOLS.get(asset)
+            if kraken_sym:
+                r = await client.get(
+                    f"{self.KRAKEN_BASE}/Ticker",
+                    params={"pair": kraken_sym},
+                )
+                r.raise_for_status()
+                result = r.json().get("result", {})
+                for v in result.values():
+                    price = float(v["c"][0])  # last trade close price
+                    self._price_cache[asset] = (now, price)
+                    logger.debug(f"[CryptoEdge] Kraken spot for {asset}: ${price:,.2f}")
+                    return price
+        except Exception:
+            pass
+
+        # 4. CoinGecko (rate-limited but free fallback)
+        try:
+            cg_id = self._COINGECKO_IDS.get(asset)
+            if cg_id:
+                r = await client.get(
+                    f"{self.COINGECKO_BASE}/simple/price",
+                    params={"ids": cg_id, "vs_currencies": "usd"},
+                )
+                r.raise_for_status()
+                price = float(r.json()[cg_id]["usd"])
+                self._price_cache[asset] = (now, price)
+                logger.debug(f"[CryptoEdge] CoinGecko spot for {asset}: ${price:,.2f}")
+                return price
+        except Exception:
+            pass
+
+        logger.warning(f"[CryptoEdge] All spot price sources failed for {asset}")
+        return None
 
     # ------------------------------------------------------------------
     # Implied volatility

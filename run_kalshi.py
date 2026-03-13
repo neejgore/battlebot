@@ -3225,7 +3225,97 @@ class KalshiBattleBot:
         
         print(f"[AI] Analyzing: {question}...")
         self._ai_calls += 1
-        
+
+        # ── LONGSHOT BIAS STRATEGY ────────────────────────────────────────────────
+        # Academic finding: prediction markets systematically OVERprice low-probability
+        # events. Events priced at 5-13% actually happen ~3-8% of the time (bias factor
+        # ~0.60). Betting NO on these longshots has measurable positive expected value.
+        #
+        # This path is PURELY statistical — no Claude call, no news, no AI opinion.
+        # It fires in addition to the quant and AI paths (system stays intact).
+        #
+        # Entry conditions:
+        #   1. YES price < LONGSHOT_YES_THRESHOLD (default 13¢)
+        #   2. Market not crypto (quant model handles those)
+        #   3. Days to resolution: 3–30 (avoid near-settlement and very long horizons)
+        #   4. Minimum open interest (basic liquidity check)
+        #   5. Not already positioned in this market
+        # ─────────────────────────────────────────────────────────────────────────
+        _ticker_upper_ls = market_id.upper()
+        _is_crypto_ls = any(_ticker_upper_ls.startswith(p) for p in
+                            ('KXBTC-', 'KXETH-', 'KXDOGE-', 'KXSOL-', 'KXXRP-', 'KXBCH-', 'KXNASDAQ100-'))
+        _ls_threshold = float(os.getenv('LONGSHOT_YES_THRESHOLD', '0.13'))
+        _ls_bet_size  = float(os.getenv('LONGSHOT_BET_SIZE', '8.0'))
+
+        if (not _is_crypto_ls
+                and current_price <= _ls_threshold
+                and current_price >= 0.03):   # floor: 3¢ spreads destroy edge below this
+
+            # Liquidity gate: minimum open interest
+            _oi = market.get('open_interest', market.get('volume', 0)) or 0
+            _min_oi_ls = int(os.getenv('LONGSHOT_MIN_OI', '100'))
+
+            # Time gate
+            _days_ls = market.get('days_to_resolution', 9999)
+            if _days_ls == 9999:
+                _end_ls = market.get('end_date')
+                if _end_ls:
+                    try:
+                        _ed = datetime.fromisoformat(_end_ls.replace('Z', '+00:00'))
+                        _days_ls = (_ed - datetime.now(_ed.tzinfo)).total_seconds() / 86400
+                    except Exception:
+                        _days_ls = 9999
+
+            _min_days_ls = float(os.getenv('LONGSHOT_MIN_DAYS', '3.0'))
+            _max_days_ls = float(os.getenv('LONGSHOT_MAX_DAYS', '30.0'))
+
+            # Already have a position in this market?
+            _already_in_ls = any(
+                p.get('market_id') == market_id for p in self._positions.values()
+            )
+
+            if (not _already_in_ls
+                    and _min_days_ls <= _days_ls <= _max_days_ls
+                    and _oi >= _min_oi_ls):
+
+                # Edge model: empirical calibration shows longshots overpriced by ~40%
+                # True probability ≈ 0.60 × market_yes_price (after bias adjustment)
+                _ls_bias_factor = float(os.getenv('LONGSHOT_BIAS_FACTOR', '0.60'))
+                _true_prob_yes  = _ls_bias_factor * current_price
+                _true_prob_no   = 1.0 - _true_prob_yes
+
+                # Fill price for NO: (1 - yes_price) + spread
+                _half_spread = market.get('spread', 0.04) / 2
+                _slip        = float(os.getenv('FILL_SLIPPAGE', '0.02'))
+                _no_fill     = min(0.98, (1.0 - current_price) + _half_spread + _slip)
+                _ls_edge     = _true_prob_no - _no_fill
+
+                _min_ls_edge = float(os.getenv('LONGSHOT_MIN_EDGE', str(self.min_edge)))
+
+                if _ls_edge >= _min_ls_edge:
+                    print(
+                        f"[Longshot] {market_id[:40]} | YES={current_price*100:.0f}¢ "
+                        f"true_yes≈{_true_prob_yes*100:.0f}% no_fill={_no_fill*100:.0f}¢ "
+                        f"edge={_ls_edge*100:.1f}% days={_days_ls:.0f}"
+                    )
+                    # Size: fixed small bet — volume is the edge, not size
+                    _ls_size = min(_ls_bet_size,
+                                   (self._kalshi_total or self.initial_bankroll) *
+                                   float(os.getenv('MAX_SINGLE_POSITION_PCT', '0.15')))
+                    _ls_market = dict(market)
+                    await self._enter_position(
+                        _ls_market, 'NO', _ls_size,
+                        prob=_true_prob_no, edge=_ls_edge, confidence=0.62
+                    )
+                    await self._broadcast_update()
+                    return   # done — don't also run AI on this market
+                else:
+                    print(
+                        f"[Longshot] SKIP {market_id[:35]} | YES={current_price*100:.0f}¢ "
+                        f"edge={_ls_edge*100:.1f}% < {_min_ls_edge*100:.0f}% threshold"
+                    )
+        # ── END LONGSHOT BIAS ─────────────────────────────────────────────────────
+
         # Step 1: Quant gate for crypto range markets — runs BEFORE intel gathering.
         # Range markets (KXBTC-/KXETH-/etc.) are math problems, not news problems.
         # The log-normal model using Deribit IV + Binance spot is the primary signal.
