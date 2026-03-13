@@ -48,7 +48,11 @@ class KalshiBattleBot:
         self.dry_run = os.getenv('DRY_RUN', 'true').lower() == 'true'
         self.initial_bankroll = float(os.getenv('INITIAL_BANKROLL', 100))
         self.min_edge = max(0.05, float(os.getenv('MIN_EDGE', 0.12)))  # 12% edge floor — data shows 8-11% range is net-negative
-        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.72))  # 72% confidence floor
+        # 0.55 matches the honest confidence range the recalibrated prompt produces (0.35–0.65).
+        # Previous 0.72 floor was calibrated for an overconfident prompt that inflated to 0.85+.
+        # After rewriting the prompt to say "high confidence requires verifiable facts", Claude
+        # correctly outputs 0.35–0.60 — and 0.72 was blocking every single trade.
+        self.min_confidence = float(os.getenv('MIN_CONFIDENCE', 0.55))  # 55% confidence floor
         # Historical note: "0.65-0.79 loses money, only >=0.80 profitable" — that was true before
         # the consensus guard, temporal guard, econ sanity, and intel filters were added.
         # Those guards now filter out the low-quality signals that dragged down 0.65-0.79 winrate.
@@ -3769,7 +3773,10 @@ class KalshiBattleBot:
         # down to 0.65. A 20%+ edge with 65% confidence is statistically more valuable
         # than a 12% edge with 80% confidence.
         # Inverted bets use a fixed synthetic confidence (0.85) which always passes.
-        _conf_floor = 0.65 if edge >= (self.min_edge * 2) else self.min_confidence
+        # High-edge relaxed floor: if edge is 2× the minimum, accept slightly lower confidence.
+        # Set to 0.45 (was 0.65) — recalibrated prompt honestly outputs 0.35-0.60, so 0.65
+        # was still blocking strong-edge trades just as badly as the 0.72 main floor.
+        _conf_floor = 0.45 if edge >= (self.min_edge * 2) else self.min_confidence
         # Persist effective threshold so the dashboard shows the right "need X%" label.
         if self._analyses:
             self._analyses[0]['conf_threshold_effective'] = round(_conf_floor, 4)
