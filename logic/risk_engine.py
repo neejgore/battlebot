@@ -372,9 +372,29 @@ class RiskEngine:
                 max_pos=effective_max,
                 edge_throttle=edge_throttle,
             )
-            
+
+            # CONSENSUS DEVIATION PENALTY
+            # Empirical finding: the larger the AI's deviation from market consensus,
+            # the more likely it is overconfident (not genuinely informed).
+            # High edge → large Kelly → largest positions → worst outcomes.
+            # Fix: size DOWN as AI estimate diverges from market, not up.
+            #
+            # Penalty curve (deviation = |adjusted_prob - market_price|):
+            #   0–5%:   1.00  (AI closely agrees with market — full size)
+            #   10%:    0.70  (moderate disagreement — 30% haircut)
+            #   15%:    0.55  (significant disagreement — 45% haircut)
+            #   20%:    0.40  (large disagreement — 60% haircut)
+            #   25%+:   0.25  (extreme disagreement — 75% haircut, floor)
+            #
+            # This inverts the overconfidence failure mode without blocking bets
+            # entirely — genuine edge still trades, just at a responsible size.
+            _deviation = abs(adjusted_prob - market_price)
+            _consensus_penalty = max(0.25, 1.0 - _deviation * 3.0)
+            size *= _consensus_penalty
+
             logger.debug(
                 f"Position size calculated | Edge: {edge:.2%} | Throttle: {edge_throttle:.2f} | "
+                f"Deviation: {_deviation:.2%} | ConsensusPenalty: {_consensus_penalty:.2f} | "
                 f"Size: ${size:.2f} | Max: ${effective_max:.2f}"
             )
             
