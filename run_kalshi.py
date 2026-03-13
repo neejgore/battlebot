@@ -3391,6 +3391,7 @@ class KalshiBattleBot:
                                 question=market.get('question', ''),
                                 kalshi_price=current_price,
                                 hours_to_expiry=float(hours_to_res),
+                                description=market.get('description', ''),
                             )
                         except Exception as _te:
                             print(f"[QuantEdge] Threshold eval error: {_te}")

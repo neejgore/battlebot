@@ -559,12 +559,19 @@ class CryptoEdgeService:
         question: str,
         kalshi_price: float,
         hours_to_expiry: float,
+        description: str = "",
     ) -> Optional['CryptoEdgeResult']:
-        """Evaluate a BTC/ETH threshold market using Black-Scholes digital formula.
+        """Evaluate a BTC/ETH price market using the correct log-normal model.
 
-        Kalshi threshold markets (new format as of 2026):
-          KXBTC-26MAR1301-B78875    → YES = P(BTC < 78875)
-          KXBTC-26MAR1301-T78999.99 → YES = P(BTC > 78999.99)
+        Handles two new Kalshi market formats (replaced old BxTy range format):
+
+        1. RANGE BUCKET (e.g. KXBTC-26MAR1317-B70250, desc "$70,000 to 70,499.99")
+           The ticker B-value is the bucket midpoint, NOT a threshold.
+           Model: lognormal_range_prob(spot, low, high, vol, T)
+           Detected by: description contains "$X to $Y" two-price pattern.
+
+        2. THRESHOLD (e.g. KXBTC-26MAR1301-B78875 = "Will BTC be below $78,875?")
+           Model: lognormal_threshold_prob(spot, K, direction, vol, T)
 
         Edge = model_prob - kalshi_yes_price. No AI involved.
         """
@@ -572,10 +579,36 @@ class CryptoEdgeService:
         if asset is None:
             return None
 
-        parsed = self.parse_threshold_from_ticker(ticker)
-        if not parsed:
-            return None
-        direction, threshold = parsed
+        # Detect market type: RANGE BUCKET vs TRUE THRESHOLD
+        # Range bucket: description contains "$X to $Y" pattern (two prices)
+        # e.g. "$70,000 to 70,499.99" → compute P(price in [70000, 70499.99])
+        # True threshold: description is a single bound ("below $78,875")
+        # e.g. "B78875" → compute P(price < 78875)
+        # Parse bucket description: "$70,000 to 70,499.99" — second number has no "$"
+        # so parse_range_from_question misses it. Extract all bare numbers from description.
+        _bucket_bounds = None
+        if description:
+            _bucket_bounds = self.parse_range_from_question(description)
+            if _bucket_bounds is None:
+                # Fallback: extract all numbers (with or without $) from description
+                _raw_nums = re.findall(r'[\$]?([\d,]+(?:\.\d+)?)', description)
+                _parsed_nums = []
+                for n in _raw_nums:
+                    try:
+                        _parsed_nums.append(float(n.replace(',', '')))
+                    except ValueError:
+                        pass
+                if len(_parsed_nums) >= 2:
+                    a, b = _parsed_nums[0], _parsed_nums[1]
+                    if a != b:
+                        _bucket_bounds = (min(a, b), max(a, b))
+        _is_bucket = _bucket_bounds is not None and abs(_bucket_bounds[1] - _bucket_bounds[0]) < 2000
+
+        if not _is_bucket:
+            parsed = self.parse_threshold_from_ticker(ticker)
+            if not parsed:
+                return None
+            direction, threshold = parsed
 
         spot, vol_result = await asyncio.gather(
             self.get_spot_price(asset),
@@ -589,23 +622,42 @@ class CryptoEdgeService:
             vol_result = (self._VOL_DEFAULTS.get(asset, 0.80), 'historical_default')
         vol, vol_src = vol_result
 
-        prob = self.lognormal_threshold_prob(spot, threshold, direction, vol, hours_to_expiry)
-        edge = prob - kalshi_price
+        if _is_bucket:
+            # Range bucket: use the full range probability model
+            range_low, range_high = _bucket_bounds
+            prob = self.lognormal_range_prob(spot, range_low, range_high, vol, hours_to_expiry)
+            edge = prob - kalshi_price
+            dist_label = f"${range_low:,.0f}–${range_high:,.0f}"
+            lines = [
+                f"QUANTITATIVE BUCKET ANALYSIS ({asset}):",
+                f"  Current {asset} spot        : ${spot:,.2f}",
+                f"  Bucket range                : {dist_label}",
+                f"  Implied vol (annualized)    : {vol * 100:.0f}%  [{vol_src}]",
+                f"  Hours to expiry             : {hours_to_expiry:.1f}h",
+                f"  Log-normal P(in bucket)     : {prob:.1%}",
+                f"  Kalshi YES price            : {kalshi_price:.1%}",
+                f"  Quant edge                  : {edge:+.1%}",
+            ]
+        else:
+            # True threshold: P(above K) or P(below K)
+            prob = self.lognormal_threshold_prob(spot, threshold, direction, vol, hours_to_expiry)
+            edge = prob - kalshi_price
+            dist_pct = (threshold - spot) / spot * 100
+            dist_label = f"{abs(dist_pct):.1f}% {'above' if threshold > spot else 'below'} spot"
+            range_low  = min(threshold, spot)
+            range_high = max(threshold, spot)
+            lines = [
+                f"QUANTITATIVE THRESHOLD ANALYSIS ({asset}):",
+                f"  Current {asset} spot        : ${spot:,.2f}",
+                f"  Threshold                   : ${threshold:,.2f}  ({dist_label})",
+                f"  Direction                   : {'below' if direction == 'below' else 'above'}",
+                f"  Implied vol (annualized)    : {vol * 100:.0f}%  [{vol_src}]",
+                f"  Hours to expiry             : {hours_to_expiry:.1f}h",
+                f"  Log-normal P(YES)           : {prob:.1%}",
+                f"  Kalshi YES price            : {kalshi_price:.1%}",
+                f"  Quant edge                  : {edge:+.1%}",
+            ]
 
-        dist_pct = (threshold - spot) / spot * 100
-        dist_label = f"{abs(dist_pct):.1f}% {'above' if threshold > spot else 'below'} spot"
-
-        lines = [
-            f"QUANTITATIVE THRESHOLD ANALYSIS ({asset}):",
-            f"  Current {asset} spot        : ${spot:,.2f}",
-            f"  Threshold                   : ${threshold:,.2f}  ({dist_label})",
-            f"  Market question             : Will {asset} be {'below' if direction == 'below' else 'above'} ${threshold:,.2f}?",
-            f"  Implied vol (annualized)    : {vol * 100:.0f}%  [{vol_src}]",
-            f"  Hours to expiry             : {hours_to_expiry:.1f}h",
-            f"  Log-normal P(YES)           : {prob:.1%}",
-            f"  Kalshi YES price            : {kalshi_price:.1%}",
-            f"  Quant edge                  : {edge:+.1%}",
-        ]
         if edge >= 0.10:
             lines.append("  Signal: STRONG QUANT EDGE — model probability exceeds market price.")
         elif edge >= 0.05:
@@ -618,8 +670,8 @@ class CryptoEdgeService:
         return CryptoEdgeResult(
             asset=asset,
             spot_price=spot,
-            range_low=min(threshold, spot),
-            range_high=max(threshold, spot),
+            range_low=range_low if _is_bucket else min(threshold if not _is_bucket else 0, spot),
+            range_high=range_high if _is_bucket else max(threshold if not _is_bucket else 0, spot),
             implied_vol=vol,
             hours_to_expiry=hours_to_expiry,
             quant_prob=prob,
