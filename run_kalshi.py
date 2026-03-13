@@ -3249,7 +3249,7 @@ class KalshiBattleBot:
 
         if (not _is_crypto_ls
                 and current_price <= _ls_threshold
-                and current_price >= 0.03):   # floor: 3¢ spreads destroy edge below this
+                and current_price >= 0.10):   # floor: below 10¢, spread+slippage (4¢) eats all edge
 
             # Liquidity gate: minimum open interest
             _oi = market.get('open_interest', market.get('volume', 0)) or 0
@@ -3290,25 +3290,45 @@ class KalshiBattleBot:
                 _no_fill     = min(0.98, (1.0 - current_price) + _half_spread + _slip)
                 _ls_edge     = _true_prob_no - _no_fill
 
-                _min_ls_edge = float(os.getenv('LONGSHOT_MIN_EDGE', str(self.min_edge)))
+                # Longshot is a volume play: many small-edge bets, not a few large ones.
+                # Max theoretical edge at 13¢ YES with 3¢ spread ≈ 1.7%. Using 0.12 (12%)
+                # as the default kills every single longshot bet. Override is still possible
+                # via LONGSHOT_MIN_EDGE env var, but default must match the strategy math.
+                _min_ls_edge = float(os.getenv('LONGSHOT_MIN_EDGE', '0.005'))
 
                 if _ls_edge >= _min_ls_edge:
-                    print(
-                        f"[Longshot] {market_id[:40]} | YES={current_price*100:.0f}¢ "
-                        f"true_yes≈{_true_prob_yes*100:.0f}% no_fill={_no_fill*100:.0f}¢ "
-                        f"edge={_ls_edge*100:.1f}% days={_days_ls:.0f}"
-                    )
-                    # Size: fixed small bet — volume is the edge, not size
-                    _ls_size = min(_ls_bet_size,
-                                   (self._kalshi_total or self.initial_bankroll) *
-                                   float(os.getenv('MAX_SINGLE_POSITION_PCT', '0.15')))
-                    _ls_market = dict(market)
-                    await self._enter_position(
-                        _ls_market, 'NO', _ls_size,
-                        prob=_true_prob_no, edge=_ls_edge, confidence=0.62
-                    )
-                    await self._broadcast_update()
-                    return   # done — don't also run AI on this market
+                    # Respect daily loss circuit-breaker: the main analysis path checks
+                    # this at the decision gate, but longshot bypasses that gate by calling
+                    # _enter_position directly. Mirror the same -15% check here so a bad
+                    # loss day (e.g. the gold loss) doesn't allow continued longshot firing.
+                    _ls_daily_blocked = False
+                    _today_str_ls = datetime.utcnow().strftime('%Y-%m-%d')
+                    _today_snap_ls = self._daily_snapshots.get(_today_str_ls, {})
+                    _start_val_ls = (_today_snap_ls.get('_ks_reset_baseline')
+                                     or _today_snap_ls.get('start_of_day_value'))
+                    _cur_val_ls = self._kalshi_total
+                    if _start_val_ls and _cur_val_ls and _start_val_ls > 0:
+                        _dl_pct = (_cur_val_ls - _start_val_ls) / _start_val_ls
+                        if _dl_pct < -0.15:
+                            _ls_daily_blocked = True
+                            print(f"[Longshot] BLOCKED by daily loss limit ({_dl_pct*100:.1f}%): {market_id[:35]}")
+                    if not _ls_daily_blocked:
+                        print(
+                            f"[Longshot] {market_id[:40]} | YES={current_price*100:.0f}¢ "
+                            f"true_yes≈{_true_prob_yes*100:.0f}% no_fill={_no_fill*100:.0f}¢ "
+                            f"edge={_ls_edge*100:.1f}% days={_days_ls:.0f}"
+                        )
+                        # Size: fixed small bet — volume is the edge, not size
+                        _ls_size = min(_ls_bet_size,
+                                       (self._kalshi_total or self.initial_bankroll) *
+                                       float(os.getenv('MAX_SINGLE_POSITION_PCT', '0.15')))
+                        _ls_market = dict(market)
+                        await self._enter_position(
+                            _ls_market, 'NO', _ls_size,
+                            prob=_true_prob_no, edge=_ls_edge, confidence=0.62
+                        )
+                        await self._broadcast_update()
+                        return   # done — don't also run AI on this market
                 else:
                     print(
                         f"[Longshot] SKIP {market_id[:35]} | YES={current_price*100:.0f}¢ "
@@ -4617,8 +4637,16 @@ class KalshiBattleBot:
                     gain_pct = (unrealized_pnl / cost_basis) if cost_basis > 0 else 0
                     
                     # Calculate days to resolution
+                    # Backfill end_date from market cache if position dict is missing it
+                    # (old positions synced before end_date storage was added won't have it)
                     days_to_res = None
                     end_date_str = pos.get('end_date')
+                    if not end_date_str:
+                        _mon_mkt = self._markets.get(pos.get('market_id', ''))
+                        if _mon_mkt:
+                            end_date_str = _mon_mkt.get('end_date')
+                            if end_date_str:
+                                pos['end_date'] = end_date_str  # cache on position for next cycle
                     if end_date_str:
                         try:
                             end_dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
