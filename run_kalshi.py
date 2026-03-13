@@ -4804,13 +4804,11 @@ class KalshiBattleBot:
                     inv_c      = inv.get('contracts', 0)
                     if inv_entry <= 0 or inv_c <= 0:
                         continue
-                    # Current price for the shadow side
-                    if inv_side == 'NO':
-                        # Real is YES → shadow is NO
-                        inv_cur = 1.0 - current_price  # current NO price
-                    else:
-                        # Real is NO → shadow is YES
-                        inv_cur = 1.0 - current_price  # current YES price
+                    # Current price for the shadow side.
+                    # current_price is always the price of the REAL side
+                    # (YES price for YES positions, NO price for NO positions).
+                    # The complementary side is always (1 - current_price).
+                    inv_cur = 1.0 - current_price
                     inv_upnl     = (inv_cur - inv_entry) * inv_c
                     inv_gain_pct = (inv_cur - inv_entry) / inv_entry if inv_entry else 0
                     inv['inv_current_price']   = round(inv_cur, 4)
@@ -4968,11 +4966,9 @@ class KalshiBattleBot:
             inv_entry = inv.get('inv_entry', 0)
             inv_c     = inv.get('contracts', 0)
             inv_side  = inv.get('inv_side', '')
-            # Shadow current price at real exit moment
-            if inv_side == 'NO':
-                inv_exit_price = round(1.0 - exit_price, 4)
-            else:
-                inv_exit_price = round(1.0 - exit_price, 4)
+            # Shadow exit price = complement of real exit price.
+            # exit_price is the REAL side price at exit, so shadow = 1 - exit_price.
+            inv_exit_price = round(1.0 - exit_price, 4)
             inv_pnl = round((inv_exit_price - inv_entry) * inv_c, 4)
             inv['status']          = 'closed'
             inv['real_pnl']        = round(pnl, 4)
@@ -6149,11 +6145,14 @@ class KalshiBattleBot:
 
         real_closed_pnl  = sum(e.get('real_pnl', 0) for e in closed)
         inv_closed_pnl   = sum(e.get('inv_pnl', 0) for e in closed)
-        real_open_upnl   = sum(
-            (e.get('inv_current_price', e.get('inv_entry', 0)) - e.get('inv_entry', 0)) *
-            e.get('contracts', 0) * -1  # real side unrealized (approx opposite)
-            for e in open_pos
-        )
+        # Real open unrealized: look up actual position unrealized_pnl directly.
+        # Using -shadow_pnl would be wrong because the two sides have different
+        # contract counts (same dollar size ÷ different entry prices).
+        real_open_upnl = 0.0
+        for e in open_pos:
+            real_pos = self._positions.get(e.get('real_pos_id', ''))
+            if real_pos:
+                real_open_upnl += real_pos.get('unrealized_pnl', 0)
         inv_open_upnl    = sum(e.get('inv_unrealized_pnl', 0) for e in open_pos)
 
         real_wins  = sum(1 for e in closed if e.get('real_pnl', 0) > 0)
