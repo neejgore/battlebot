@@ -95,6 +95,11 @@ class KalshiBattleBot:
         self._analyses: list[dict] = []
         # Signal log for backtesting - tracks ALL AI signals and their outcomes
         self._signal_log: list[dict] = []  # Persisted, checked for outcomes
+        # Inversion tracker — shadow portfolio: same markets, opposite sides.
+        # For every real bet placed from 2026-03-13 onward, records what the
+        # opposite trade would have returned under the same exit rules.
+        # Key question: does inverting the AI's side signal yield better returns?
+        self._inversion_log: list[dict] = []  # Persisted
         # Filter diagnostic log — records every market skipped before Claude, with reason
         self._filter_log: collections.deque = collections.deque(maxlen=500)
         # Nightly strategy report — populated by _nightly_strategy_loop at midnight UTC
@@ -240,6 +245,7 @@ class KalshiBattleBot:
                     self._pending_orders = state.get('pending_orders', {})
                     self._trades = state.get('trades', [])
                     self._signal_log = state.get('signal_log', [])
+                    self._inversion_log = state.get('inversion_log', [])
                     self._daily_snapshots = state.get('daily_snapshots', {})
                     self._portfolio_hourly = state.get('portfolio_hourly', {})
                     # Restore exit cooldowns (ISO strings → datetime)
@@ -302,6 +308,7 @@ class KalshiBattleBot:
                     self._pending_orders = state.get('pending_orders', {})
                     self._trades = state.get('trades', [])
                     self._signal_log = state.get('signal_log', [])
+                    self._inversion_log = state.get('inversion_log', [])
                     self._daily_snapshots = state.get('daily_snapshots', {})
                     self._portfolio_hourly = state.get('portfolio_hourly', {})
                     for k, v in state.get('recently_exited', {}).items():
@@ -354,6 +361,7 @@ class KalshiBattleBot:
                 'pending_orders': self._pending_orders,
                 'trades': self._trades[:500],   # insert(0,...) means newest is at front
                 'signal_log': self._signal_log[-500:],
+                'inversion_log': self._inversion_log[-500:],
                 'daily_snapshots': daily_snapshots,
                 'portfolio_hourly': portfolio_hourly,
                 'recently_exited': recently_exited_serial,
@@ -1743,6 +1751,7 @@ class KalshiBattleBot:
         self._app.router.add_get('/api/filters', self._handle_filters)
         self._app.router.add_get('/api/nightly', self._handle_nightly)
         self._app.router.add_get('/api/reset-killswitch', self._handle_reset_killswitch)
+        self._app.router.add_get('/api/inversion', self._handle_inversion)
         self._app.router.add_get('/api/force-exit', self._handle_force_exit)
         self._app.router.add_get('/api/positions', self._handle_positions)
         self._app.router.add_get('/api/debug-positions', self._handle_debug_positions)
@@ -4505,7 +4514,41 @@ class KalshiBattleBot:
             self._trades.insert(0, trade)
             news_indicator = f" [NEWS:{news_count}]" if news_count > 0 else ""
             print(f"[PENDING] Order {order_id} placed E:{edge*100:.0f}% C:{confidence*100:.0f}%{news_indicator}, waiting to fill...")
-        
+
+        # ── INVERSION SHADOW TRACKER ──────────────────────────────────────────
+        # Record a shadow position on the OPPOSITE side at the same entry price.
+        # Shadow uses the complementary price (1 - entry_price) as its entry.
+        # This lets us answer: "if we always inverted the AI's side, how would
+        # we have done?" over a large enough sample to be statistically useful.
+        # Tracking starts 2026-03-13 (today). Shadow exits recorded separately.
+        _inv_side  = 'NO' if side == 'YES' else 'YES'
+        _inv_entry = round(1.0 - entry_price, 4)
+        _inv_contracts = round(size / _inv_entry, 2) if _inv_entry > 0 else 0
+        self._inversion_log.append({
+            'id':           f'inv_{pos_id}',
+            'real_pos_id':  pos_id,
+            'market_id':    market_id,
+            'question':     market.get('question') or market.get('title', ''),
+            'category':     market.get('category', 'unknown'),
+            'real_side':    side,
+            'real_entry':   entry_price,
+            'inv_side':     _inv_side,
+            'inv_entry':    _inv_entry,
+            'contracts':    _inv_contracts,
+            'size':         size,
+            'opened_at':    datetime.utcnow().isoformat(),
+            'status':       'open',
+            'inv_current_price': _inv_entry,
+            'inv_unrealized_pnl': 0.0,
+            'inv_pnl':      None,
+            'inv_exit_price': None,
+            'inv_exit_reason': None,
+            'real_pnl':     None,
+            'closed_at':    None,
+        })
+        print(f"[Inversion] Shadow {_inv_side} @ {_inv_entry*100:.0f}¢ recorded for {market_id[:35]}")
+        # ── END INVERSION SHADOW TRACKER ─────────────────────────────────────
+
         self._save_state()
         await self._broadcast_update()
     
@@ -4747,7 +4790,50 @@ class KalshiBattleBot:
                               f"entry={entry_price*100:.0f}¢ cur={current_price*100:.0f}¢ "
                               f"uPnL=${unrealized_pnl:+.2f} | {pos.get('question','')[:40]}")
                         await self._exit_position(pos_id, current_price, unrealized_pnl, exit_reason_mon)
-                
+
+                # ── INVERSION SHADOW UPDATE ───────────────────────────────────
+                # For each open real position, update its paired shadow position.
+                # Shadow is on the opposite side, so its current price =
+                # (1 - current_yes_price). YES market = current_price for YES,
+                # NO market = (1 - current_price_of_NO_side) = YES price.
+                for inv in self._inversion_log:
+                    if inv.get('real_pos_id') != pos_id or inv.get('status') != 'open':
+                        continue
+                    inv_entry  = inv.get('inv_entry', 0)
+                    inv_side   = inv.get('inv_side', '')
+                    inv_c      = inv.get('contracts', 0)
+                    if inv_entry <= 0 or inv_c <= 0:
+                        continue
+                    # Current price for the shadow side
+                    if inv_side == 'NO':
+                        # Real is YES → shadow is NO
+                        inv_cur = 1.0 - current_price  # current NO price
+                    else:
+                        # Real is NO → shadow is YES
+                        inv_cur = 1.0 - current_price  # current YES price
+                    inv_upnl     = (inv_cur - inv_entry) * inv_c
+                    inv_gain_pct = (inv_cur - inv_entry) / inv_entry if inv_entry else 0
+                    inv['inv_current_price']   = round(inv_cur, 4)
+                    inv['inv_unrealized_pnl']  = round(inv_upnl, 4)
+                    # Apply same stop-loss (50%) and profit-lock to shadow
+                    _inv_stop_pct = float(os.getenv('STOP_LOSS_PCT', '0.50'))
+                    _inv_lock_pct = self._profit_lock_pct
+                    _inv_exit_reason = None
+                    if inv_gain_pct <= -_inv_stop_pct and inv_entry > 0:
+                        _inv_exit_reason = f'SHADOW_STOP_LOSS_{abs(inv_gain_pct)*100:.0f}pct'
+                    elif inv_gain_pct >= _inv_lock_pct and inv_entry > 0:
+                        _inv_exit_reason = f'SHADOW_PROFIT_LOCK_{inv_gain_pct*100:.0f}pct'
+                    if _inv_exit_reason:
+                        inv['status']          = 'closed'
+                        inv['inv_pnl']         = round(inv_upnl, 4)
+                        inv['inv_exit_price']  = round(inv_cur, 4)
+                        inv['inv_exit_reason'] = _inv_exit_reason
+                        inv['closed_at']       = datetime.utcnow().isoformat()
+                        print(f"[Inversion] Shadow {inv_side} closed: {_inv_exit_reason} "
+                              f"uPnL=${inv_upnl:+.2f} | {inv.get('market_id','')[:35]}")
+                    break
+                # ── END INVERSION SHADOW UPDATE ───────────────────────────────
+
             except Exception as e:
                 import traceback as _tb; print(f"[Monitor Error] {e}"); _tb.print_exc()
             await asyncio.sleep(10)
@@ -4871,7 +4957,35 @@ class KalshiBattleBot:
         
         mode = "[DRY RUN]" if self.dry_run else "[LIVE]"
         print(f"{mode} EXITED: ${pnl:+.2f} ({reason}) | {contracts} contracts @ {int(exit_price*100)}¢ | {position.get('question', '')[:50]}...")
-        
+
+        # ── INVERSION: record real P&L and close shadow at same exit point ────
+        # When real position exits, compute what the shadow would have made at
+        # the SAME exit price (opposite side). This is the fairest comparison —
+        # same market, same moment, just different direction.
+        for inv in self._inversion_log:
+            if inv.get('real_pos_id') != pos_id or inv.get('status') != 'open':
+                continue
+            inv_entry = inv.get('inv_entry', 0)
+            inv_c     = inv.get('contracts', 0)
+            inv_side  = inv.get('inv_side', '')
+            # Shadow current price at real exit moment
+            if inv_side == 'NO':
+                inv_exit_price = round(1.0 - exit_price, 4)
+            else:
+                inv_exit_price = round(1.0 - exit_price, 4)
+            inv_pnl = round((inv_exit_price - inv_entry) * inv_c, 4)
+            inv['status']          = 'closed'
+            inv['real_pnl']        = round(pnl, 4)
+            inv['inv_pnl']         = inv_pnl
+            inv['inv_exit_price']  = inv_exit_price
+            inv['inv_exit_reason'] = f'REAL_EXITED_{reason}'
+            inv['inv_current_price'] = inv_exit_price
+            inv['inv_unrealized_pnl'] = inv_pnl
+            inv['closed_at']       = datetime.utcnow().isoformat()
+            print(f"[Inversion] Shadow closed with real: real_pnl=${pnl:+.2f} inv_pnl=${inv_pnl:+.2f} | {inv.get('market_id','')[:35]}")
+            break
+        # ── END INVERSION CLOSE ───────────────────────────────────────────────
+
         self._save_state()
         await self._broadcast_update()
     
@@ -6014,6 +6128,68 @@ class KalshiBattleBot:
     async def _handle_signals(self, request):
         """API endpoint for signal backtesting analysis."""
         return web.json_response(self._get_signal_performance())
+
+    async def _handle_inversion(self, request):
+        """API endpoint: compares real strategy vs inversion strategy.
+
+        For every bet placed since 2026-03-13, tracks what would have happened
+        if we had taken the OPPOSITE side. Answers: does inverting the AI's
+        signal yield better returns?
+        """
+        log = self._inversion_log
+        if not log:
+            return web.json_response({
+                'message': 'No inversion data yet — tracking starts from 2026-03-13',
+                'total': 0,
+            })
+
+        # Closed positions only (have settled P&L)
+        closed = [e for e in log if e.get('status') == 'closed' and e.get('real_pnl') is not None]
+        open_pos = [e for e in log if e.get('status') == 'open']
+
+        real_closed_pnl  = sum(e.get('real_pnl', 0) for e in closed)
+        inv_closed_pnl   = sum(e.get('inv_pnl', 0) for e in closed)
+        real_open_upnl   = sum(
+            (e.get('inv_current_price', e.get('inv_entry', 0)) - e.get('inv_entry', 0)) *
+            e.get('contracts', 0) * -1  # real side unrealized (approx opposite)
+            for e in open_pos
+        )
+        inv_open_upnl    = sum(e.get('inv_unrealized_pnl', 0) for e in open_pos)
+
+        real_wins  = sum(1 for e in closed if e.get('real_pnl', 0) > 0)
+        real_losses = sum(1 for e in closed if e.get('real_pnl', 0) < 0)
+        inv_wins   = sum(1 for e in closed if e.get('inv_pnl', 0) > 0)
+        inv_losses = sum(1 for e in closed if e.get('inv_pnl', 0) < 0)
+
+        closed_details = sorted(closed, key=lambda x: x.get('closed_at', ''), reverse=True)
+        open_details   = sorted(open_pos, key=lambda x: x.get('opened_at', ''), reverse=True)
+
+        return web.json_response({
+            'summary': {
+                'total_tracked':     len(log),
+                'closed':            len(closed),
+                'open':              len(open_pos),
+                'real_closed_pnl':   round(real_closed_pnl, 2),
+                'inv_closed_pnl':    round(inv_closed_pnl, 2),
+                'real_open_upnl':    round(real_open_upnl, 2),
+                'inv_open_upnl':     round(inv_open_upnl, 2),
+                'real_total':        round(real_closed_pnl + real_open_upnl, 2),
+                'inv_total':         round(inv_closed_pnl + inv_open_upnl, 2),
+                'real_win_rate':     round(real_wins / len(closed), 3) if closed else None,
+                'inv_win_rate':      round(inv_wins / len(closed), 3) if closed else None,
+                'real_wins':         real_wins,
+                'real_losses':       real_losses,
+                'inv_wins':          inv_wins,
+                'inv_losses':        inv_losses,
+                'verdict': (
+                    'INVERSION_BETTER' if inv_closed_pnl > real_closed_pnl
+                    else 'REAL_BETTER' if real_closed_pnl > inv_closed_pnl
+                    else 'TOO_EARLY'
+                ) if closed else 'TOO_EARLY',
+            },
+            'closed': closed_details[:50],
+            'open':   open_details[:25],
+        })
 
     async def _handle_filters(self, request):
         """API endpoint: shows what markets are being filtered and why."""
