@@ -2524,6 +2524,7 @@ class KalshiBattleBot:
                         'nba', 'ncaa', 'wnba', 'nbl', 'nfl', 'mlb', 'nhl',
                         'mls', 'pga', 'lpga', 'atp', 'wta', 'ufc', 'mma',
                         'cfb', 'cfl', 'ipl', 'bbl',  # college football, CFL, cricket, Aus baseball
+                        'ucl', 'uefa', 'ecl', 'uecl',  # UEFA Champions/Europa/Conference League
                     ]
                     # Longer patterns are safe as plain substrings
                     sports_patterns = [
@@ -2561,6 +2562,19 @@ class KalshiBattleBot:
                         # Motorsport / F1
                         'grand prix', 'formula 1', 'formula one', 'fastest lap',
                         'pole position', 'qualifying lap', 'f1 race', 'pitstop',
+                        # UEFA / European soccer — questions use club names, not sport names
+                        'champions league', 'europa league', 'conference league',
+                        'uefa ',
+                        # European club soccer team names (used in "X vs Y Winner?" markets)
+                        'barcelona', 'newcastle', ' real madrid', 'atletico madrid',
+                        'juventus', 'ac milan', 'inter milan', 'ajax amsterdam',
+                        'fc porto', 'celtic fc', 'rangers fc', 'paris saint',
+                        'olympique lyon', 'olympique marseille', 'borussia dortmund',
+                        'fc barcelona', 'manchester city', 'manchester united',
+                        'liverpool fc', 'arsenal fc', 'chelsea fc', 'tottenham hotspur',
+                        'napoli', 'as roma', 'sl benfica', 'sporting cp',
+                        'fc sevilla', 'villarreal cf', 'valencia cf',
+                        'bayer leverkusen', 'fc bayern',
                     ]
                     _abbrev_hit = (
                         not _is_econ_politics
@@ -2623,6 +2637,11 @@ class KalshiBattleBot:
                         # Rugby (was completely unblocked)
                         'KXRUGBY', 'KXSIXNATIONS', 'KXRWC', 'KXRUGBYWC',
                         'KXSUPERRUGBY', 'KXPRUGBY', 'KXTOP14',
+                        # UEFA Champions League / Europa / Conference League games
+                        # e.g. KXUCLGAME-26MAR18BARNEW-BAR (Barcelona vs Newcastle)
+                        'KXUCLGAME', 'KXUEFAGAME', 'KXELGAME', 'KXECLGAME',
+                        # Other soccer cup / club games
+                        'KXCLGAME', 'KXEURGAME',
                     ]
                     if any(pattern in ticker_upper for pattern in sports_ticker_patterns):
                         self._log_filter(market_id, question_raw, 'SPORTS_TICKER', market.get('price', 0))
