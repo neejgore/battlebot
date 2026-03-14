@@ -1212,6 +1212,22 @@ class KalshiBattleBot:
                         self._positions.pop(pos_id)
                         self._recently_exited[market_id] = datetime.utcnow()
                         self._recently_exited_reason[market_id] = 'SYNC_REMOVED'
+                        # Close paired inversion shadow (no fill price available here —
+                        # use last known inv_current_price as best estimate).
+                        for _inv in self._inversion_log:
+                            if _inv.get('real_pos_id') != pos_id or _inv.get('status') != 'open':
+                                continue
+                            _inv_entry  = _inv.get('inv_entry', 0)
+                            _inv_c      = _inv.get('contracts', 0)
+                            _inv_cur    = _inv.get('inv_current_price', _inv_entry)
+                            _inv_pnl    = round((_inv_cur - _inv_entry) * _inv_c, 4)
+                            _inv['status']             = 'closed'
+                            _inv['inv_pnl']            = _inv_pnl
+                            _inv['inv_exit_price']     = _inv_cur
+                            _inv['inv_exit_reason']    = 'REAL_EXITED_SYNC_REMOVED'
+                            _inv['inv_unrealized_pnl'] = _inv_pnl
+                            _inv['closed_at']          = datetime.utcnow().isoformat()
+                            break
                         # Save state after EACH removal so a crash mid-loop doesn't
                         # cause double-removal on the next restart.
                         removed += 1
@@ -5315,6 +5331,28 @@ class KalshiBattleBot:
                         'timestamp': datetime.utcnow().isoformat(),
                     }
                     self._trades.insert(0, trade)
+
+                    # ── INVERSION: close shadow position using actual fill price ──
+                    # _exit_position handles this for dry-run / write-off paths.
+                    # This is the live confirmed-fill path — must mirror that logic.
+                    for _inv in self._inversion_log:
+                        if _inv.get('real_pos_id') != pos_id or _inv.get('status') != 'open':
+                            continue
+                        _inv_entry = _inv.get('inv_entry', 0)
+                        _inv_c     = _inv.get('contracts', 0)
+                        _inv_exit_price = round(1.0 - fill_price, 4)
+                        _inv_pnl   = round((_inv_exit_price - _inv_entry) * _inv_c, 4)
+                        _inv['status']             = 'closed'
+                        _inv['real_pnl']           = round(pnl, 4)
+                        _inv['inv_pnl']            = _inv_pnl
+                        _inv['inv_exit_price']     = _inv_exit_price
+                        _inv['inv_exit_reason']    = f'REAL_EXITED_{reason}'
+                        _inv['inv_current_price']  = _inv_exit_price
+                        _inv['inv_unrealized_pnl'] = _inv_pnl
+                        _inv['closed_at']          = datetime.utcnow().isoformat()
+                        print(f"[Inversion] Shadow closed (confirmed fill): real_pnl=${pnl:+.2f} inv_pnl=${_inv_pnl:+.2f} | {_inv.get('market_id','')[:35]}")
+                        break
+                    # ── END INVERSION CLOSE ───────────────────────────────────────
                     
                     print(f"[EXIT CONFIRMED] ${pnl:+.2f} ({reason}) | {contracts} @ {entry_price*100:.0f}¢→{fill_price*100:.0f}¢ | {position.get('question', '')[:50]}...")
                     self._save_state()
