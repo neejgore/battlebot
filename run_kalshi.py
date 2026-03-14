@@ -3875,6 +3875,10 @@ class KalshiBattleBot:
                     f"[Inversion] SKIP {market_id[:35]} — inverted side too expensive "
                     f"(edge={edge:+.1%} < min={_inv_min_edge:.0%})"
                 )
+                # Tag signal log before returning so analysis tools don't misread as NO_DECISION
+                if self._signal_log and self._signal_log[-1].get('market_id') == market_id:
+                    self._signal_log[-1]['traded'] = False
+                    self._signal_log[-1]['skip_reason'] = f'INVERSION_EDGE_TOO_LOW_{edge:+.1%}'
                 return
         # ── END AI INVERSION ─────────────────────────────────────────────────
 
@@ -4338,7 +4342,7 @@ class KalshiBattleBot:
                     # Use trade_prob (may be empirical inversion rate) not raw adjusted_prob.
                     _entry_prob = trade_prob if _ai_inverted else adjusted_prob
                     _entry_conf = signal.confidence if not _ai_inverted else max(signal.confidence, 0.62)
-                    await self._enter_position(market, side, position_size, _entry_prob, edge, _entry_conf)
+                    await self._enter_position(market, side, position_size, _entry_prob, edge, _entry_conf, ai_inverted=_ai_inverted)
                     _inv_tag = ' [INVERTED]' if _ai_inverted else ''
                     print(f"[AI]{_inv_tag} {question}... | ✓ TRADE | Edge: +{edge*100:.1f}% | Conf: {_entry_conf*100:.0f}%")
                 finally:
@@ -4352,7 +4356,7 @@ class KalshiBattleBot:
         
         await self._broadcast_update()
     
-    async def _enter_position(self, market: dict, side: str, size: float, prob: float, edge: float, confidence: float):
+    async def _enter_position(self, market: dict, side: str, size: float, prob: float, edge: float, confidence: float, ai_inverted: bool = False):
         """Enter a new position."""
         market_id = market['id']
         pos_id = f"pos_{int(datetime.utcnow().timestamp()*1000)}"
@@ -4393,9 +4397,10 @@ class KalshiBattleBot:
         # break-even at 40% — the lower the entry price, the better the win/loss ratio.
         # NOTE: This cap applies to YES bets only.  For NO bets the edge gate in _analyze_market
         # (edge = trade_prob - no_fill) already enforces EV > 0 — no separate price cap needed.
-        # The inversion strategy bets NO at 60–80¢ (empirical 80% win rate), so blocking those
-        # by a 50¢ ceiling was silently killing every inversion trade.
-        MAX_PRICE_CENTS = 50
+        # AI-inverted YES bets use empirical 70% win rate, so break-even at 70¢ is valid.
+        # The edge gate in _analyze_market already blocks YES inversions above ~62¢, so using
+        # 80¢ as the cap for inverted bets is a safe ceiling that won't interfere.
+        MAX_PRICE_CENTS = 80 if ai_inverted else 50
         
         # Use the correct price for the side we're trading
         if side.upper() == 'YES':
@@ -4617,6 +4622,9 @@ class KalshiBattleBot:
             'inv_exit_reason': None,
             'real_pnl':     None,
             'closed_at':    None,
+            # True when USE_AI_INVERSION is active — real bet IS the inversion,
+            # shadow represents the original AI direction for comparison.
+            'live_inversion': ai_inverted,
         })
         print(f"[Inversion] Shadow {_inv_side} @ {_inv_entry*100:.0f}¢ recorded for {market_id[:35]}")
         # ── END INVERSION SHADOW TRACKER ─────────────────────────────────────
