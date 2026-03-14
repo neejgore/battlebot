@@ -337,6 +337,13 @@ class KalshiBattleBot:
                         print(f"[State] Kill-switch restored from backup (triggered today)")
                     elif state.get('kill_switch_triggered') and _ks_date_bak == _today_bak and _user_reset_today_bak:
                         print(f"[State] Kill-switch NOT restored from backup — user manually reset today")
+                    # Restore analysis cooldowns (same as primary path — prevents burst re-analysis
+                    # on backup restore that could spike Claude/Brave API spend in the first minute).
+                    for k, v in state.get('last_analysis', {}).items():
+                        try:
+                            self._last_analysis[k] = datetime.fromisoformat(v)
+                        except Exception:
+                            pass
                     print(f"[State] Loaded {len(self._positions)} positions, {len(self._pending_orders)} pending orders, {len(self._trades)} trades from backup")
         except json.JSONDecodeError as e:
             print(f"[State] WARNING: Corrupted state file, starting fresh: {e}")
@@ -3295,9 +3302,12 @@ class KalshiBattleBot:
             _min_days_ls = float(os.getenv('LONGSHOT_MIN_DAYS', '3.0'))
             _max_days_ls = float(os.getenv('LONGSHOT_MAX_DAYS', '30.0'))
 
-            # Already have a position in this market?
-            _already_in_ls = any(
-                p.get('market_id') == market_id for p in self._positions.values()
+            # Already have a position OR a pending order in this market?
+            # Must check both: a pending longshot order hasn't moved to _positions yet,
+            # so checking only _positions would allow a duplicate entry on the next cycle.
+            _already_in_ls = (
+                any(p.get('market_id') == market_id for p in self._positions.values())
+                or any(o.get('market_id') == market_id for o in self._pending_orders.values())
             )
 
             if (not _already_in_ls
@@ -4245,7 +4255,14 @@ class KalshiBattleBot:
             # market_price = fill price (used for Kelly); market_mid = raw consensus price
             # used only for the consensus deviation penalty (fill includes spread/slippage,
             # which would understate how far the AI has deviated from market consensus).
-            _side_mid_price = current_price if side == 'YES' else (1.0 - current_price)
+            # For AI-inverted bets, the consensus deviation concept is inverted too:
+            # we're deliberately disagreeing with consensus, so the deviation penalty
+            # would catastrophically misfired (e.g. NO@20¢ with emp_prob=70% → |0.70-0.20|=0.50
+            # → 75% haircut). Pass trade_prob as market_mid so deviation=0, penalty=1.0.
+            if _ai_inverted:
+                _side_mid_price = trade_prob  # deviation = 0 → no consensus penalty
+            else:
+                _side_mid_price = current_price if side == 'YES' else (1.0 - current_price)
             # For inverted bets, use at least 0.62 confidence (empirical win rate).
             # The AI confidence reflects the AI's certainty in the WRONG direction —
             # using it raw for sizing would penalise high-edge inversions with low AI conf.
