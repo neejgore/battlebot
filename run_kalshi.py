@@ -6070,6 +6070,17 @@ class KalshiBattleBot:
                 if t and kp.get('position', 0) != 0:
                     kalshi_by_ticker[t] = kp
 
+            # Build inversion-log lookup by market_id so positions that were placed
+            # before the ai_inverted flag was added to order_data can still show the
+            # INVERTED badge. _inversion_log is the authoritative record of which bets
+            # were live-inverted (live_inversion=True). Only look at open entries —
+            # closed entries are old positions that no longer exist.
+            _inv_market_ids: set = {
+                inv.get('market_id', '')
+                for inv in self._inversion_log
+                if inv.get('live_inversion') and inv.get('status') == 'open'
+            }
+
             # Union: start with all tickers that appear in either source
             all_tickers = set(internal_by_ticker) | set(kalshi_by_ticker)
 
@@ -6161,7 +6172,9 @@ class KalshiBattleBot:
                     'unrealized_pnl': round(unrealized, 2),
                     'unrealized_pct': round(unrealized_pct, 1),
                     'entry_time': entry_time,
-                    'ai_inverted': internal.get('ai_inverted', False),
+                    # Use stored flag OR inversion-log lookup as fallback so positions
+                    # placed before the flag was added to order_data still show the badge.
+                    'ai_inverted': internal.get('ai_inverted', False) or (ticker in _inv_market_ids),
                 })
 
             positions_detail.sort(key=lambda p: p['unrealized_pnl'])
