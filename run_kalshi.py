@@ -456,6 +456,7 @@ class KalshiBattleBot:
                         'has_intel': order.get('has_intel', False),
                         'news_count': order.get('news_count', 0),
                         'category': order.get('category', 'unknown'),
+                        'ai_inverted': order.get('ai_inverted', False),
                     }
                     self._positions[pos_id] = pos
                     self._pending_orders.pop(order_id)
@@ -471,24 +472,25 @@ class KalshiBattleBot:
                         actual_size = startup_partial * fill_price
                         pos_id = order.get('id', f"pos_{order_id}")
                         pos = {
-                            'id': pos_id,
-                            'order_id': order_id,
-                            'market_id': order['market_id'],
-                            'question': order.get('question', ''),
-                            'side': order['side'],
-                            'size': actual_size,
-                            'entry_price': fill_price,
+                            'id':           pos_id,
+                            'order_id':     order_id,
+                            'market_id':    order['market_id'],
+                            'question':     order.get('question', ''),
+                            'side':         order['side'],
+                            'size':         actual_size,
+                            'entry_price':  fill_price,
                             'current_price': fill_price,
-                            'contracts': startup_partial,
+                            'contracts':    startup_partial,
                             'ai_probability': order.get('ai_probability', 0.5),
-                            'edge': order.get('edge', 0),
-                            'confidence': order.get('confidence', 0),
-                            'entry_time': order.get('placed_time', datetime.utcnow().isoformat()),
+                            'edge':         order.get('edge', 0),
+                            'confidence':   order.get('confidence', 0),
+                            'entry_time':   order.get('placed_time', datetime.utcnow().isoformat()),
                             'unrealized_pnl': 0.0,
-                            'end_date': order.get('end_date'),
-                            'has_intel': order.get('has_intel', False),
-                            'news_count': order.get('news_count', 0),
-                            'category': order.get('category', 'unknown'),
+                            'end_date':     order.get('end_date'),
+                            'has_intel':    order.get('has_intel', False),
+                            'news_count':   order.get('news_count', 0),
+                            'category':     order.get('category', 'unknown'),
+                            'ai_inverted':  order.get('ai_inverted', False),
                         }
                         self._positions[pos_id] = pos
                         filled += 1
@@ -4346,9 +4348,16 @@ class KalshiBattleBot:
             _is_btc_eth = any(_market_id_upper.startswith(p) for p in _BTC_ETH_PREFIXES)
             if _is_btc_eth:
                 _MAX_BTC_ETH_POSITIONS = int(os.getenv('MAX_BTC_ETH_POSITIONS', '3'))
+                # Count BOTH filled positions AND pending orders — pending orders are real
+                # capital commitments and correlated just as much as filled ones.
+                # Without this, 3 BTC/ETH orders placed in one loop pass (before any fill)
+                # would all see 0 open positions and all pass the cap.
                 _btc_eth_open = sum(
                     1 for _p in self._positions.values()
                     if any(_p.get('market_id', '').upper().startswith(px) for px in _BTC_ETH_PREFIXES)
+                ) + sum(
+                    1 for _o in self._pending_orders.values()
+                    if any(_o.get('market_id', '').upper().startswith(px) for px in _BTC_ETH_PREFIXES)
                 )
                 if _btc_eth_open >= _MAX_BTC_ETH_POSITIONS:
                     print(
@@ -5798,6 +5807,7 @@ class KalshiBattleBot:
                         'has_intel': order.get('has_intel', False),  # Preserve for effectiveness tracking
                         'news_count': order.get('news_count', 0),  # Preserve for effectiveness tracking
                         'category': order.get('category', 'unknown'),  # Preserve for learning
+                        'ai_inverted': order.get('ai_inverted', False),  # Preserve for dashboard badge
                     }
                     self._positions[pos_id] = pos
                     
