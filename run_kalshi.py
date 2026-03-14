@@ -217,6 +217,11 @@ class KalshiBattleBot:
         # Contrarian timing: disabled by default — no empirical evidence it works (0% WR),
         # and the edge-boost mechanism was forcing bad bets past the edge filter.
         self._use_contrarian = os.getenv('USE_CONTRARIAN_TIMING', 'false').lower() == 'true'
+        # AI Inversion: bet the OPPOSITE side of what the AI recommends.
+        # Empirical data shows the AI has been consistently wrong. When enabled,
+        # every AI-driven bet is flipped. Does NOT affect BTC/ETH quant (already
+        # inverted) or longshot (stat-based). Default: false until data confirms.
+        self._use_ai_inversion = os.getenv('USE_AI_INVERSION', 'false').lower() == 'true'
         
         # Inefficiency threshold: prefer markets with score > this
         self._min_inefficiency_score = float(os.getenv('MIN_INEFFICIENCY_SCORE', '0.1'))
@@ -3373,6 +3378,7 @@ class KalshiBattleBot:
         _quant_result: CryptoEdgeResult = None
         _quant_override_prob: float = None
         _invert_crypto_range: bool = False  # True when we flip BTC/ETH signal to opposite side
+        _ai_inverted: bool = False          # True when USE_AI_INVERSION flips the AI's side
 
         # Block DOGE/XRP/SOL/BCH range bets — no live vol model, historical defaults only
         if _is_alt_range:
@@ -3832,6 +3838,46 @@ class KalshiBattleBot:
                 f"empirical_prob=80% no_fill={no_fill:.2f} edge={edge:+.1%}"
             )
 
+        # ── AI INVERSION ─────────────────────────────────────────────────────
+        # Empirical record (closed positions): AI has been wrong on direction
+        # far more often than right. When USE_AI_INVERSION=true we bet the
+        # OPPOSITE side of whatever the AI recommends.
+        #
+        # Does NOT apply to:
+        #   • BTC/ETH range bets  — already inverted above (_invert_crypto_range)
+        #   • Longshot bias bets  — stat-based, returns before reaching this code
+        #
+        # We do NOT use 1-AI_prob as the inverted probability (that would give
+        # very negative edge, blocking the bet). Instead we use a fixed empirical
+        # win rate (default 70%, configurable via INVERSION_WIN_RATE). The edge
+        # check below naturally filters expensive inversions:
+        #   AI YES @ 80¢ → invert NO @ 20¢, fill≈24¢, edge=70%-24%=+46% ✓
+        #   AI YES @ 50¢ → invert NO @ 50¢, fill≈55¢, edge=70%-55%=+15% ✓
+        #   AI YES @ 36¢ → invert NO @ 64¢, fill≈69¢, edge=70%-69%=+1%  — skip
+        if self._use_ai_inversion and not _invert_crypto_range:
+            _pre_inv_side = side
+            _inv_emp_prob = float(os.getenv('INVERSION_WIN_RATE', '0.70'))
+            _inv_min_edge = float(os.getenv('INVERSION_MIN_EDGE', '0.05'))
+            # Flip direction and recalculate fill price for the new side
+            side        = 'NO' if _pre_inv_side == 'YES' else 'YES'
+            trade_price = no_fill if side == 'NO' else yes_fill
+            trade_prob  = _inv_emp_prob
+            edge        = trade_prob - trade_price
+            _ai_inverted = True
+            print(
+                f"[Inversion] AI {_pre_inv_side}→{side} | "
+                f"emp_prob={_inv_emp_prob:.0%} fill={trade_price:.2f} "
+                f"edge={edge:+.1%} | {market_id[:35]}"
+            )
+            if edge < _inv_min_edge:
+                # Inverted side is too expensive — skip rather than force a bad bet.
+                print(
+                    f"[Inversion] SKIP {market_id[:35]} — inverted side too expensive "
+                    f"(edge={edge:+.1%} < min={_inv_min_edge:.0%})"
+                )
+                return
+        # ── END AI INVERSION ─────────────────────────────────────────────────
+
         # Step 5: Apply contrarian edge adjustment
         contrarian_multiplier = 1.0
         if self._use_contrarian and intel and intel.overreaction_detected:
@@ -3864,6 +3910,7 @@ class KalshiBattleBot:
             'latency_ms': result.latency_ms,
             'calibration_method': calibration_method,
             'model': ('haiku' if not (_is_econ_market or bool(_commodity_price_ctx)) and not _is_crypto_range_q else 'sonnet'),
+            'ai_inverted': _ai_inverted,
         }
         
         # Add intelligence data if available
@@ -3892,6 +3939,7 @@ class KalshiBattleBot:
             'timestamp': datetime.utcnow().isoformat(),
             'outcome': None,  # To be filled when market settles
             'outcome_checked': False,
+            'ai_inverted': _ai_inverted,
         }
         self._signal_log.append(signal_entry)
         
@@ -3931,18 +3979,19 @@ class KalshiBattleBot:
             reasons.append('DOGE_BLOCKED_0PCT_WIN_RATE')
 
         # Global edge floor — applies to all markets not already blocked above.
-        # Inverted BTC/ETH range bets use an empirical 80% win rate, not a model probability.
-        # Their edge guard is the `edge < 0` check in the inversion block above — we don't
-        # apply the standard 12% min_edge here because the formula measures different things.
+        # BTC/ETH inversion and AI inversion bets are exempt: they already passed
+        # their own edge gates above (empirical-prob based, not model-prob based).
+        # Applying the standard 12% floor on top would double-count the check.
         #
         # SCALED EDGE FLOOR for expensive bets (>55¢):
         # At 75¢ entry you risk 75¢ to win 25¢ (3:1 against). A 12% edge at that price is
         # marginal — calibration error easily erases it. Require 20%+ edge for any bet
-        # where the fill price exceeds 55¢. Inversion bets are exempt (empirical 80% WR).
+        # where the fill price exceeds 55¢. Inversion bets are exempt (empirical win rate).
+        _inv_exempt = _invert_crypto_range or _ai_inverted
         _min_edge_required = self.min_edge
-        if trade_price > 0.55 and not _invert_crypto_range:
+        if trade_price > 0.55 and not _inv_exempt:
             _min_edge_required = max(self.min_edge, 0.20)
-        if edge < _min_edge_required and not _is_doge_market and not _invert_crypto_range:
+        if edge < _min_edge_required and not _is_doge_market and not _inv_exempt:
             should_trade = False
             reasons.append('LOW_EDGE' if trade_price <= 0.55 else f'LOW_EDGE_EXPENSIVE_BET_{trade_price*100:.0f}c')
 
@@ -3950,7 +3999,8 @@ class KalshiBattleBot:
         # High-edge bypass: if edge is very strong (>= 2x min_edge), allow confidence
         # down to 0.65. A 20%+ edge with 65% confidence is statistically more valuable
         # than a 12% edge with 80% confidence.
-        # Inverted bets use a fixed synthetic confidence (0.85) which always passes.
+        # AI inversion and BTC/ETH inversion use empirical win rate; skip this check
+        # for them — the signal's confidence is irrelevant when we're ignoring the signal direction.
         # High-edge relaxed floor: if edge is 2× the minimum, accept slightly lower confidence.
         # Set to 0.45 (was 0.65) — recalibrated prompt honestly outputs 0.35-0.60, so 0.65
         # was still blocking strong-edge trades just as badly as the 0.72 main floor.
@@ -3958,7 +4008,7 @@ class KalshiBattleBot:
         # Persist effective threshold so the dashboard shows the right "need X%" label.
         if self._analyses:
             self._analyses[0]['conf_threshold_effective'] = round(_conf_floor, 4)
-        if signal.confidence < _conf_floor and not _invert_crypto_range:
+        if signal.confidence < _conf_floor and not _inv_exempt:
             should_trade = False
             reasons.append('LOW_CONFIDENCE')
 
@@ -3973,7 +4023,7 @@ class KalshiBattleBot:
             self._PRICE_THRESHOLD_RE.search(market.get('question', ''))
             and any(kw in _full_q_lower for kw in self._COMMODITY_PRICE_QUERIES)
         )
-        if _is_real_asset_thresh and not _is_crypto_range_q:
+        if _is_real_asset_thresh and not _is_crypto_range_q and not _ai_inverted:
             _yes_market_price = 1.0 - current_price if side == 'NO' else current_price
             if signal.raw_prob < 0.15 and _yes_market_price > 0.55:
                 should_trade = False
@@ -3991,7 +4041,7 @@ class KalshiBattleBot:
         # YES on "above 2.6%" — that is betting directly against every published forecast.
         # Professional traders price these markets using Bloomberg consensus; Claude's
         # priors about inflation/growth are unreliable against hard published forecasts.
-        if _is_econ_market and not _is_crypto_range_q and intel and intel.news_items:
+        if _is_econ_market and not _is_crypto_range_q and intel and intel.news_items and not _ai_inverted:
             _econ_block, _econ_reason = self._extract_economic_consensus(
                 market.get('question', ''), intel.news_items, side
             )
@@ -4008,7 +4058,7 @@ class KalshiBattleBot:
         # Must adjust both for the bet side before comparing.
         _full_q_lower_econ = market.get('question', '').lower()
         _is_econ_market = any(kw in _full_q_lower_econ for kw in self._ECON_DATA_KEYWORDS)
-        if _is_econ_market and not _is_crypto_range_q:
+        if _is_econ_market and not _is_crypto_range_q and not _ai_inverted:
             _our_side_mkt_price = current_price if side == 'YES' else (1.0 - current_price)
             _our_side_ai_prob = signal.raw_prob if side == 'YES' else (1.0 - signal.raw_prob)
             if _our_side_mkt_price < 0.20 and _our_side_ai_prob > 0.55:
@@ -4035,7 +4085,9 @@ class KalshiBattleBot:
         # our side at <35% (market "strongly disagrees"), block the trade.
         # The 35% threshold (vs. 20% above) is tighter because for UNRELEASED
         # data the market is the only reliable forward-looking signal we have.
-        if _is_econ_market and not _is_crypto_range_q:
+        # Exempt AI-inverted bets: the whole point of inversion is to bet against
+        # the AI/consensus signal, so consensus-based guards are counterproductive.
+        if _is_econ_market and not _is_crypto_range_q and not _ai_inverted:
             _is_fwd_econ, _fwd_econ_tag = self._check_temporal_data_availability(
                 market.get('question', ''), market.get('end_date') or market.get('close_time')
             )
@@ -4190,12 +4242,16 @@ class KalshiBattleBot:
             # used only for the consensus deviation penalty (fill includes spread/slippage,
             # which would understate how far the AI has deviated from market consensus).
             _side_mid_price = current_price if side == 'YES' else (1.0 - current_price)
-            print(f"[Debug] Calculating size: prob={trade_prob:.2f}, fill={trade_price:.2f}, mid={_side_mid_price:.2f}, edge={edge:.2f}, conf={signal.confidence:.2f}")
+            # For inverted bets, use at least 0.62 confidence (empirical win rate).
+            # The AI confidence reflects the AI's certainty in the WRONG direction —
+            # using it raw for sizing would penalise high-edge inversions with low AI conf.
+            _size_confidence = max(signal.confidence, 0.62) if _ai_inverted else signal.confidence
+            print(f"[Debug] Calculating size: prob={trade_prob:.2f}, fill={trade_price:.2f}, mid={_side_mid_price:.2f}, edge={edge:.2f}, conf={_size_confidence:.2f}")
             position_size = await self._risk_engine.calculate_position_size(
                 adjusted_prob=trade_prob,
                 market_price=trade_price,
                 edge=edge,
-                confidence=signal.confidence,
+                confidence=_size_confidence,
                 market_id=market_id,
                 market_mid=_side_mid_price,
             )
@@ -4279,8 +4335,12 @@ class KalshiBattleBot:
 
             if position_size > 0:
                 try:
-                    await self._enter_position(market, side, position_size, adjusted_prob, edge, signal.confidence)
-                    print(f"[AI] {question}... | ✓ TRADE | Edge: +{edge*100:.1f}% | Conf: {signal.confidence*100:.0f}%")
+                    # Use trade_prob (may be empirical inversion rate) not raw adjusted_prob.
+                    _entry_prob = trade_prob if _ai_inverted else adjusted_prob
+                    _entry_conf = signal.confidence if not _ai_inverted else max(signal.confidence, 0.62)
+                    await self._enter_position(market, side, position_size, _entry_prob, edge, _entry_conf)
+                    _inv_tag = ' [INVERTED]' if _ai_inverted else ''
+                    print(f"[AI]{_inv_tag} {question}... | ✓ TRADE | Edge: +{edge*100:.1f}% | Conf: {_entry_conf*100:.0f}%")
                 finally:
                     # Remove placeholder — real order (if placed) is now in _pending_orders under its order_id
                     self._pending_orders.pop(_placeholder_key, None)
