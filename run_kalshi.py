@@ -4532,6 +4532,7 @@ class KalshiBattleBot:
             'placed_time': datetime.utcnow().isoformat(),
             'end_date': market.get('end_date'),  # Store for time horizon calc
             'category': market.get('category', 'unknown'),  # Store for learning
+            'ai_inverted': ai_inverted,  # Flag so dashboard can show INVERTED badge
         }
         
         # In dry run mode, immediately treat as filled position
@@ -7575,7 +7576,10 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                 <div class="position">
                     <div class="position-header">
                         <div class="position-title">${esc(displayQ)}</div>
-                        <span class="position-side ${p.side.toLowerCase()}">${p.side}</span>
+                        <div style="display:flex;align-items:center;gap:6px;">
+                            ${p.ai_inverted ? '<span style="font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;background:#7c3aed;color:#fff;letter-spacing:.5px;">⟳ INVERTED</span>' : ''}
+                            <span class="position-side ${p.side.toLowerCase()}">${p.side}</span>
+                        </div>
                     </div>
                     <div class="position-details">
                         <div><div class="position-detail-label">ENTRY</div><div class="position-detail-value">${(p.entry_price*100).toFixed(0)}¢</div></div>
