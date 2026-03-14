@@ -6142,6 +6142,7 @@ class KalshiBattleBot:
                     'unrealized_pnl': round(unrealized, 2),
                     'unrealized_pct': round(unrealized_pct, 1),
                     'entry_time': entry_time,
+                    'ai_inverted': internal.get('ai_inverted', False),
                 })
 
             positions_detail.sort(key=lambda p: p['unrealized_pnl'])
@@ -8194,12 +8195,13 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                         const entryDate = p.entry_time ? new Date(p.entry_time).toLocaleDateString('en-US', {month:'short', day:'numeric'}) : '—';
                         // Always show something in the question cell — fall back to ticker if empty
                         const displayQuestion = p.question || p.ticker;
+                        const invBadge = p.ai_inverted ? '<span style="font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px;background:#7c3aed;color:#fff;letter-spacing:.4px;margin-left:4px;vertical-align:middle;">⟳ INV</span>' : '';
                         return `<tr>
                             <td class="pos-question">
                                 <div>${displayQuestion}</div>
                                 <div class="pos-ticker">${tickerShort} · entered ${entryDate}</div>
                             </td>
-                            <td><span class="side-badge ${p.side}">${p.side}</span></td>
+                            <td><span class="side-badge ${p.side}">${p.side}</span>${invBadge}</td>
                             <td>${p.contracts}</td>
                             <td>${fmtCents(p.entry_price)}</td>
                             <td>${fmtCents(p.current_price)}</td>
