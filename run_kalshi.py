@@ -437,6 +437,13 @@ class KalshiBattleBot:
                     actual_size = fill_count * fill_price  # true dollar cost at fill price
                     
                     pos_id = order.get('id', f"pos_{order_id}")
+                    # Duplicate guard: skip if a position for this market_id already exists
+                    _startup_mids = {p.get('market_id') for p in self._positions.values()}
+                    if order['market_id'] in _startup_mids:
+                        print(f"[Startup] Order {order_id[:8]}... DUPLICATE market_id {order['market_id'][:30]} — skipping to prevent double position")
+                        self._pending_orders.pop(order_id)
+                        canceled += 1
+                        continue
                     pos = {
                         'id': pos_id,
                         'order_id': order_id,
@@ -471,6 +478,13 @@ class KalshiBattleBot:
                         fill_price = order_data.get('average_fill_price', order['entry_price'] * 100) / 100
                         actual_size = startup_partial * fill_price
                         pos_id = order.get('id', f"pos_{order_id}")
+                        # Duplicate guard: skip if a position for this market_id already exists
+                        _startup_mids = {p.get('market_id') for p in self._positions.values()}
+                        if order['market_id'] in _startup_mids:
+                            print(f"[Startup] Order {order_id[:8]}... PARTIAL+CANCELED but DUPLICATE market_id {order['market_id'][:30]} — skipping")
+                            self._pending_orders.pop(order_id)
+                            canceled += 1
+                            continue
                         pos = {
                             'id':           pos_id,
                             'order_id':     order_id,
@@ -4177,10 +4191,12 @@ class KalshiBattleBot:
         _pending_market_ids = {o.get('market_id') for o in self._pending_orders.values()}
         # Also deduplicate by question text — two different Kalshi market IDs can have
         # identical question text (e.g. multiple CPI series). Don't hold both.
+        # Include pending orders in question check — question is stored in order_data.
         _held_questions = {p.get('question', '').strip().lower() for p in self._positions.values()}
+        _held_questions |= {o.get('question', '').strip().lower() for o in self._pending_orders.values() if o.get('question')}
         _this_question = market.get('question', '').strip().lower()
         if (market_id in _held_market_ids or market_id in _pending_market_ids
-                or _this_question in _held_questions):
+                or (_this_question and _this_question in _held_questions)):
             should_trade = False
             reasons.append('ALREADY_IN_POSITION')
         
@@ -4260,12 +4276,14 @@ class KalshiBattleBot:
                 _held_now = {p.get('market_id') for p in self._positions.values()}
                 _pending_now = {o.get('market_id') for o in self._pending_orders.values()}
                 _questions_now = {p.get('question', '').strip().lower() for p in self._positions.values()}
+                # Include pending orders in question dedup — catches same-question different-ticker race
+                _questions_now |= {o.get('question', '').strip().lower() for o in self._pending_orders.values() if o.get('question')}
                 if (market_id in _held_now or market_id in _pending_now
-                        or _this_question in _questions_now):
+                        or (_this_question and _this_question in _questions_now)):
                     print(f"[EntryLock] {market_id[:35]} — skipped, another task already entered")
                     return
-                # Plant placeholder so any concurrent task sees this market as reserved
-                self._pending_orders[_placeholder_key] = {'market_id': market_id, 'size': 0, 'placeholder': True}
+                # Plant placeholder with question so question-based dedup works for concurrent tasks
+                self._pending_orders[_placeholder_key] = {'market_id': market_id, 'question': _this_question, 'size': 0, 'placeholder': True}
             # Lock released — placeholder now blocks other tasks without holding lock during API call
 
             # Sync total + per-market exposure so both global and per-market limits fire.
